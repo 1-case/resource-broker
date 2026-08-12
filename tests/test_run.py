@@ -35,6 +35,8 @@ def rb_run(tmp_path: Path, *command: str, res: str = "GPU0", **flags: str) -> in
         flags.get("job", "検証ジョブ"),
         "--observed",
         flags.get("observed", "調べた"),
+        "--eta",
+        flags.get("eta", "10m"),
         "--found",
         flags.get("found", "free"),
     ]
@@ -143,7 +145,7 @@ def test_run_records_its_own_pid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
 def test_run_is_blocked_by_a_live_declaration(tmp_path: Path) -> None:
     """他者が宣言中なら、コマンドを実行せずに 1 を返す。"""
-    run(tmp_path, "claim", "GPU0", "--job", "先客", "--observed", "調べた")
+    run(tmp_path, "claim", "GPU0", "--job", "先客", "--observed", "調べた", "--eta", "1h")
     marker = tmp_path / "実行された.txt"
 
     code = rb_run(tmp_path, sys.executable, "-c", f"open(r'{marker}', 'w').close()")
@@ -155,8 +157,9 @@ def test_run_is_blocked_by_a_live_declaration(tmp_path: Path) -> None:
 
 def test_run_without_command_does_not_claim(tmp_path: Path) -> None:
     """`--` の後ろが空なら、宣言もしない（引数の不備として 2 を返す）。"""
-    assert run(tmp_path, "run", "--res", "GPU0", "--job", "x", "--observed", "調べた") == 2
+    argv = ["run", "--res", "GPU0", "--job", "x", "--observed", "調べた", "--eta", "5m"]
 
+    assert run(tmp_path, *argv) == 2
     assert entries(tmp_path) == []
 
 

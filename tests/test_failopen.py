@@ -125,6 +125,8 @@ def test_claim_proceeds_when_the_session_could_not_investigate(tmp_path: Path) -
             "学習",
             "--observed",
             "nvidia-smi が応答しない",
+            "--eta",
+            "30m",
             "--found",
             "unknown",
         ]
@@ -155,6 +157,8 @@ def test_claim_proceeds_when_the_board_directory_is_unwritable(
             "学習",
             "--observed",
             "compute apps なし",
+            "--eta",
+            "30m",
             "--found",
             "free",
         ]

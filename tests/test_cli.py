@@ -23,8 +23,19 @@ def run(tmp_path: Path, *args: str) -> int:
 
 
 def claim(tmp_path: Path, resource: str, job: str, *extra: str) -> int:
-    """必須項目を埋めた claim。``--observed`` は省略できない。"""
-    return run(tmp_path, "claim", resource, "--job", job, "--observed", "調べた", *extra)
+    """必須項目を埋めた claim。``--observed`` と ``--eta`` は省略できない。"""
+    return run(
+        tmp_path,
+        "claim",
+        resource,
+        "--job",
+        job,
+        "--observed",
+        "調べた",
+        "--eta",
+        "30m",
+        *extra,
+    )
 
 
 def test_status_on_empty_board_succeeds(
@@ -74,6 +85,8 @@ def test_self_reported_busy_blocks_the_claim(
             "学習",
             "--observed",
             "nvidia-smi: compute apps 1 件",
+            "--eta",
+            "1h",
             "--found",
             "busy",
         )
@@ -171,6 +184,8 @@ def test_claim_records_the_observation_verbatim(
         "バックアップ",
         "--observed",
         "net use: 接続なし / 空き容量 2.1TB",
+        "--eta",
+        "2h",
         "--found",
         "free",
     )

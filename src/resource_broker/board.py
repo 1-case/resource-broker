@@ -23,7 +23,19 @@ SCHEMA = 1
 
 #: 読み取り時に既知として扱うキー。これ以外は extra に退避して書き戻す（前方互換）。
 _KNOWN_KEYS = frozenset(
-    {"schema", "resource", "display", "holder", "log", "since", "boot", "observed"}
+    {
+        "schema",
+        "resource",
+        "display",
+        "holder",
+        "log",
+        "since",
+        "boot",
+        "observed",
+        "eta",
+        "usage",
+        "sharing",
+    }
 )
 
 
@@ -42,6 +54,9 @@ class Entry:
     since: str = ""
     boot: str | None = None
     observed: dict[str, object] | None = None
+    eta: dict[str, object] | None = None
+    usage: dict[str, object] | None = None
+    sharing: str = ""
     extra: dict[str, object] = field(default_factory=dict)
 
     @property
@@ -80,6 +95,9 @@ class Entry:
                 "since": self.since,
                 "boot": self.boot,
                 "observed": self.observed,
+                "eta": self.eta,
+                "usage": self.usage,
+                "sharing": self.sharing,
             }
         )
         return data
@@ -98,6 +116,8 @@ class Entry:
             return None
         holder = data.get("holder")
         observed = data.get("observed")
+        eta = data.get("eta")
+        usage = data.get("usage")
         return cls(
             resource=resource,
             display=data["display"] if isinstance(data.get("display"), str) else "",
@@ -106,6 +126,9 @@ class Entry:
             since=data["since"] if isinstance(data.get("since"), str) else "",
             boot=data["boot"] if isinstance(data.get("boot"), str) else None,
             observed=observed if isinstance(observed, dict) else None,
+            eta=eta if isinstance(eta, dict) else None,
+            usage=usage if isinstance(usage, dict) else None,
+            sharing=data["sharing"] if isinstance(data.get("sharing"), str) else "",
             extra={k: v for k, v in data.items() if k not in _KNOWN_KEYS},
         )
 
@@ -218,7 +241,17 @@ class Board:
             self.remove(entry.resource, reason="書き込みに失敗したため取り消した")
             return False
 
-        self.audit("claimed", resource=entry.resource, job=entry.job, pid=entry.pid)
+        # 見積もりも残す。次に同じ資源を使うとき、前回どう見積もったかを振り返れる
+        # ようにするためである（`rb history`）。精度は回ごとに上げていくしかない。
+        self.audit(
+            "claimed",
+            resource=entry.resource,
+            job=entry.job,
+            pid=entry.pid,
+            eta=entry.eta,
+            usage=entry.usage,
+            sharing=entry.sharing or None,
+        )
         return True
 
     def remove(self, resource_id: str, *, reason: str) -> bool:
@@ -249,6 +282,10 @@ def build_entry(
     cwd: str | None = None,
     session: str | None = None,
     observed: dict[str, object] | None = None,
+    eta: str = "",
+    peak: str = "",
+    avg: str = "",
+    sharing: str = "",
 ) -> Entry:
     """宣言用の Entry を組み立てる。時刻と boot はここで機械生成する。
 
@@ -276,7 +313,32 @@ def build_entry(
         since=clock.now_iso(),
         boot=clock.to_iso(boot) if boot else None,
         observed=_stamp_observed(observed),
+        eta=_build_eta(eta),
+        usage={"peak": peak, "avg": avg} if (peak or avg) else None,
+        sharing=sharing,
     )
+
+
+def _build_eta(text: str) -> dict[str, object] | None:
+    """ETA の申告を組み立てる。**時刻の計算は機械が行う。**
+
+    申告するのはセッション（LLM）だが、「30 分後は何時か」を LLM に書かせない。
+    JST と UTC の取り違えや単純な足し算の誤りが実際に起きているためである
+    （CLAUDE.md「Time Handling」）。``30m`` のような期間表記が読めたときだけ
+    絶対時刻を機械が付ける。読めなければ申告文だけを残す。
+
+    Notes
+    -----
+    **ETA は判断に使わない。** 掲示板が持つのは観測点であり、期限を過ぎたからといって
+    宣言を退けたり、待機を打ち切ったりはしない。人間とセッションが読むための材料である。
+    """
+    if not text:
+        return None
+    duration = clock.parse_duration(text)
+    return {
+        "stated": text,
+        "at": clock.to_iso(clock.now() + duration) if duration else None,
+    }
 
 
 def _stamp_observed(observed: dict[str, object] | None) -> dict[str, object] | None:
