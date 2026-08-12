@@ -106,6 +106,19 @@ def test_notice_tells_the_session_to_investigate(tmp_path: Path) -> None:
     assert "自分で調べる" in result.stdout
 
 
+def test_usage_is_explained_here_not_every_prompt(tmp_path: Path) -> None:
+    """使い方の説明はこのフックが受け持つ。
+
+    資源の例示とコマンドの書式は、起動時に 1 回言えば足りる。毎プロンプトに入れると
+    その分だけ全ターンの文脈を食い続けるため、``UserPromptSubmit`` 側には置かない。
+    例示を複数種類そろえるのは、「GPU の話だ」と誤解させないためである。
+    """
+    text = run_hook(home=tmp_path).stdout
+
+    for word in ("COM ポート", "ネットワークドライブ", "レート制限", "--observed", "--found"):
+        assert word in text, f"{word} が起動時の説明に含まれていない"
+
+
 # --- 文字コード ------------------------------------------------------------------
 
 

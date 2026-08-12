@@ -56,7 +56,50 @@ def test_rule_is_injected_even_when_board_is_empty(tmp_path: Path) -> None:
     text = run_hook(tmp_path).decode("utf-8")
 
     assert "rb run" in text
-    assert "自分でその資源の状態を調べ" in text
+    assert "自分で状態を調べ" in text
+
+
+def test_idle_injection_stays_within_budget(tmp_path: Path) -> None:
+    """宣言が無いときの注入は短く保つ。
+
+    このフックは**全ターンの文脈に積み上がる**。1 文字の重みが他のフックと違うので、
+    使い方の説明（資源の例示・コマンドの書式）は SessionStart 側に置き、ここには入れない。
+    """
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    spec = spec_from_file_location("prompt_hook", HOOK)
+    assert spec and spec.loader
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    text = run_hook(tmp_path).decode("utf-8").strip()
+
+    assert len(text) <= module.IDLE_BUDGET_CHARS, f"{len(text)} 文字あり、長すぎる"
+
+
+def test_usage_details_are_left_to_session_start(tmp_path: Path) -> None:
+    """資源の例示とコマンドの書式は毎プロンプトには入れない。
+
+    使い方は起動時に 1 回言えば足りる。毎回言うとその分だけ文脈を食い続ける。
+    """
+    text = run_hook(tmp_path).decode("utf-8")
+
+    for word in ("COM ポート", "ネットワークドライブ", "--observed", "--found"):
+        assert word not in text, f"{word} が毎プロンプトの注入に入っている"
+
+
+def test_log_paths_are_not_repeated_every_prompt(tmp_path: Path) -> None:
+    """ログのパスは毎プロンプトには載せない。長いうえ、判断が要る場面でしか使わない。"""
+    board = Board(tmp_path)
+    assert board.try_claim(
+        build_entry(normalize("GPU0"), job="E059 eval", log="C:\\とても\\長い\\ログ\\path.log")
+    )
+
+    text = run_hook(tmp_path).decode("utf-8")
+
+    assert "GPU0" in text
+    assert "path.log" not in text
+    assert "rb status" in text  # 必要なら自分で読みに行けと伝える
 
 
 def test_declarations_are_listed(tmp_path: Path) -> None:
@@ -68,17 +111,6 @@ def test_declarations_are_listed(tmp_path: Path) -> None:
     assert "GPU0" in text
     assert "folnet" in text
     assert "E059 eval" in text
-
-
-def test_notice_is_not_resource_specific(tmp_path: Path) -> None:
-    """規約文が特定の資源に寄っていない。
-
-    GPU だけの仕組みにしないという原則を、注入文のレベルでも守る。
-    """
-    text = run_hook(tmp_path).decode("utf-8")
-
-    for word in ("COM ポート", "ローカルポート", "ネットワークドライブ", "レート制限"):
-        assert word in text, f"{word} が例示に含まれていない"
 
 
 def test_any_resource_id_is_listed(tmp_path: Path) -> None:

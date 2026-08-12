@@ -66,7 +66,8 @@ def child_environment() -> dict[str, str]:
     return env
 
 
-USAGE = """資源（GPU / COM ポート / ネットワークドライブ / ローカルポート等）を使う前に:
+USAGE = """資源（GPU / COM ポート / ネットワークドライブ / ローカルポート /
+外部 API のレート制限など）を使う前に:
   1. その資源の状態を**自分で調べる**（調べ方はあなたが決める。本ツールは資源を知らない）
   2. rb run --res <資源ID> --job "<説明>" --observed "<何を見たか>"
             --found busy|free|unknown -- <コマンド>
