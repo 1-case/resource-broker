@@ -17,7 +17,10 @@
 - **判定しない**。幽霊判定は行わず、掲示板に載っている宣言をそのまま並べる。
   毎プロンプト走るため ``rb`` の起動（実測 180ms）を避ける必要があり、
   かつ判定を再実装すれば本体と乖離した第 2 の真実ができる。**どちらも避けて「判定しない」**
-- **短く保つ**。毎回入るものなので、宣言が無いときは 1 行だけにする
+- **短く保つ**。毎回入るものなので、**使い方は書かない**。資源の例示もコマンドの書式も
+  ``SessionStart`` が 1 回だけ出す。ここが持つのは「いま誰が何を宣言しているか」と、
+  ``rb run`` を通せという一言だけである。全ターンの文脈に積み上がるため、
+  1 文字の重みが他のフックと違う
 """
 
 from __future__ import annotations
@@ -32,12 +35,11 @@ ENCODING = "utf-8"
 #: 一度に並べる宣言の上限。掲示板が荒れていても注入を膨らませない。
 MAX_ENTRIES = 8
 
-RULE = (
-    "[resource-broker] 有限資源（GPU / COM ポート / ローカルポート / ネットワークドライブ /"
-    " 外部 API のレート制限など）を使う前に、必ず自分でその資源の状態を調べ、"
-    "rb run --res <資源ID> --job <説明> --observed <何を見たか> -- <コマンド>"
-    " を通して実行すること。"
-)
+#: 毎ターン積み上がるため、宣言が無いときの注入はこの文字数を超えないようにする。
+#: 使い方の説明は SessionStart 側に置き、ここには持ち込まない。
+IDLE_BUDGET_CHARS = 60
+
+RULE = "有限資源を使う前に自分で状態を調べ、rb run 経由で実行すること。"
 
 
 def board_root() -> Path:
@@ -77,21 +79,24 @@ def read_entries(root: Path) -> list[dict[str, object]]:
 
 
 def build_notice(entries: list[dict[str, object]]) -> str:
-    """注入する本文を組み立てる。宣言が無ければ 1 行だけ。"""
-    if not entries:
-        return f"{RULE} 現在の宣言: なし。"
+    """注入する本文を組み立てる。
 
-    lines = [RULE, "現在の宣言（判定は rb status で確認すること）:"]
+    宣言が無ければ 1 行。あれば「誰が何を」だけを並べる。
+    ログのパスや観測メモは載せない（長いうえ、判断が要る場面でしか使わない）。
+    必要になった側が ``rb status`` を叩けば全部読める。
+    """
+    if not entries:
+        return f"[rb] 宣言なし。{RULE}"
+
+    lines = ["[rb] 宣言中の資源:"]
     for entry in entries:
         holder = entry.get("holder")
         holder = holder if isinstance(holder, dict) else {}
         display = entry.get("display") or entry.get("resource")
         session = holder.get("session", "?")
         job = holder.get("job") or "(ジョブ未記入)"
-        since = entry.get("since", "?")
-        lines.append(f"  {display}  <- {session} / {job}  (since {since})")
-        if entry.get("log"):
-            lines.append(f"      log {entry['log']}")
+        lines.append(f"  {display} <- {session} / {job} (since {entry.get('since', '?')})")
+    lines.append(f"詳細は rb status。{RULE}")
     return "\n".join(lines)
 
 
