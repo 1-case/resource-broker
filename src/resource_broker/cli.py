@@ -276,15 +276,26 @@ def acquire(
     notices: list[str] = []
 
     def under_lock(lock: LockState) -> Acquisition:
-        """ロックを保持したまま行う判断。**正しさはロックではなく CAS に乗る。**"""
-        # **インフラの故障と資源の競合を混同しない**（CLAUDE.md「Fail-Open」）。
-        # 諦めてよいのは競合（他セッションが保持していた）のときだけである。
-        # ロックの仕組みそのものが使えないのは本ツール側の故障であり、そこで止めると
-        # 掲示板が壊れた瞬間に全セッションの取得が止まる。
+        """ロックを保持したまま行う判断。**正しさはロックではなく CAS に乗る。**
+
+        **ロックが取れないことを理由に諦めない。** どちらの取れなさも、資源が使用中で
+        あるという証拠を 1 バイトも含んでいない（掲示板をまだ読んでいない）。ここで
+        ``EXIT_BUSY`` を返すと 2 つの嘘をつくことになる。他セッションが ``release``
+        の最中でもロックは握られるので**資源が今まさに空こうとしている瞬間に「使用中」**
+        と答え、ロックを持ったままプロセスが死ねば ``LOCK_STALE_S`` のあいだ
+        **全セッションの取得が「使用中」で止まる**。本ツールの故障を資源の競合として
+        報告することは CLAUDE.md「Fail-Open」が名指しで禁じている。
+
+        続行しても安全性は落ちない。正しさは nonce の CAS と ``try_claim`` の
+        ``O_EXCL`` が担保しており、本当に競っていれば ``try_claim`` が負けて
+        **真の busy** が返る。
+        """
         if lock is LockState.CONTENDED:
-            notices.append("他のセッションが同じ資源を操作中です。少し待って再試行してください")
-            return Acquisition(None, EXIT_BUSY)
-        if lock is LockState.UNAVAILABLE:
+            notices.append(
+                "[rb] 他のセッションが同じ資源を操作中です。排他を弱めて続行します"
+                "（監査ログを参照）"
+            )
+        elif lock is LockState.UNAVAILABLE:
             notices.append("[rb] ロックが使えないため排他を弱めて続行します（監査ログを参照）")
 
         verdict, entry = assess(board, resource_id, observation)
@@ -359,11 +370,15 @@ def acquire(
 
         return Acquisition(new_entry, EXIT_OK, declared=True)
 
-    with board.locked(resource_id) as lock:
-        result = under_lock(lock)
-
-    for line in notices:
-        print(line, file=sys.stderr)
+    # **溜めた説明は例外が飛んでも出す。** 途中で落ちたときこそ「相乗りが N 件ある」
+    # 「排他を弱めて続行した」は読む側に必要な材料であり、そこで消えると
+    # 何も起きなかったように見える。
+    try:
+        with board.locked(resource_id) as lock:
+            result = under_lock(lock)
+    finally:
+        for line in notices:
+            print(line, file=sys.stderr)
     return result
 
 
@@ -751,16 +766,17 @@ def _update_locked(board: Board, resource_id: str, args: argparse.Namespace) -> 
 def _warn_if_unlocked(board: Board, resource_id: str, lock: LockState, *, event: str) -> None:
     """ロック無しで続行することを監査ログに残す。
 
-    解放と更新では、ロックが取れないことを理由に**やめない**。宣言を残したまま
-    終わるほうが有害（幽霊が資源を占有し続ける）であり、所有者照合という主防御は
-    失われないためである。取得（``acquire``）だけは競合で諦める。
+    ロックが取れないことを理由に**やめない**。解放と更新では、宣言を残したまま終わるほうが
+    有害（幽霊が資源を占有し続ける）であり、CAS と所有者照合という主防御は失われないためである。
+    取得（``acquire``）も同じく続行する。**ロックが取れないことは、資源が使用中である
+    証拠を含まない**（:class:`LockState` 参照）。
     """
     if lock is not LockState.ACQUIRED:
         board.audit(event, resource=resource_id, lock=str(lock))
 
 
 def _cmd_release(args: argparse.Namespace) -> int:
-    """自分の宣言を取り下げる。相乗りしていればそちらを先に外す。"""
+    """自分の宣言を取り下げる。主宣言が自分のものならそれを、無ければ相乗りを外す。"""
     board = Board(args.home)
     resource_id = naming.normalize(args.resource)
 
@@ -814,32 +830,80 @@ def _release_forced(board: Board, resource_id: str) -> int:
 
 
 def _release_own(board: Board, resource_id: str) -> int:
-    """自分の宣言だけを取り下げる。相乗りしていればそちらを先に外す。"""
-    if board.remove_own_join(resource_id, os.getcwd(), reason="release コマンド"):
+    """自分の宣言だけを取り下げる。**主宣言を先に見て、無ければ相乗りを外す。**
+
+    順序が逆だと、自分は相乗りしていないのに**祖先から出された他人の相乗り**が
+    ``owns`` を通り（このマシンでは全プロジェクトが 1 つのルートの下にある）、
+    それを消して早期 return する。結果として**他人の申告だけが消え、呼び出し側自身の
+    主宣言は解放されないまま残る**。``rb join`` は主宣言があることを前提とするので
+    「自分が主宣言者かつ相乗り者」は起こり得ず、順序を入れ替えて失うものは無い。
+    """
+    cwd = os.getcwd()
+    entry = board.read(resource_id)
+    if entry is not None and board.owns(entry, cwd=cwd):
+        return _release_own_primary(board, resource_id, entry)
+
+    join = board.remove_own_join(resource_id, cwd, reason="release コマンド")
+    if join is not None:
         print(f"相乗りを取り下げました: {naming.display_default(resource_id)}")
+        declared = str(join.holder.get("cwd") or "")
+        if declared and os.path.normcase(declared) != os.path.normcase(cwd):
+            # 完全一致ではなく祖先フォールバックで選んだ。**誤爆が目視できるように**
+            # 申告元を出す。出さなければ、他人の申告を消したことに気づく手段が無い。
+            print(f"  申告元: {declared}（自分の場所から出した申告ではありません）")
         return EXIT_OK
 
-    entry = board.read(resource_id)
     if entry is None:
         print("宣言は見つかりませんでした（既に解放済みです）")
         return EXIT_OK
 
     # **他人の宣言は消さない。** 掲示板の唯一の強制点は先着排他であり、最も打ちやすい
     # コマンドでそれを無効化できてはならない。claim が --force を要求するのと対称にする。
-    if not board.owns(entry, cwd=os.getcwd()):
-        print("他セッションの宣言は解放できません（--force で強制解放できます）", file=sys.stderr)
-        print(f"  宣言者: {entry.session} / {entry.job}", file=sys.stderr)
-        print(f"  since : {entry.since}", file=sys.stderr)
-        return EXIT_BUSY
+    print("他セッションの宣言は解放できません（--force で強制解放できます）", file=sys.stderr)
+    print(f"  宣言者: {entry.session} / {entry.job}", file=sys.stderr)
+    print(f"  since : {entry.since}", file=sys.stderr)
+    return EXIT_BUSY
 
-    result = board.remove_detailed(resource_id, reason="release コマンド")
+
+def _release_own_primary(board: Board, resource_id: str, entry: Entry) -> int:
+    """自分の主宣言を取り下げる。**読んだ宣言と一致するときだけ消す（CAS）。**
+
+    無条件の削除は、掲示板の書き換えの中でここだけが CAS に乗らないという穴になる。
+    解放はロックが取れなくても続行する（``_warn_if_unlocked``）ので、次が成立する。
+    他セッションが ``claim --force`` で取り直した直後にここへ来ると、``read`` が拾うのは
+    **相手の新しい宣言**であり、cwd が同じ（または相手の cwd が自分の祖先）なら
+    ``owns`` を通る。**他人の生きた宣言を消して掲示板だけが空になり、資源は掴まれたまま**
+    という最も検出しにくい不整合ができる。同一プロジェクトで 2 セッションが動くのは
+    日常なので、この条件は容易に成立する。
+
+    :meth:`Board.remove_if_owned` は使わない。呼び出し側（``_cmd_release``）が既に
+    ロックを保持しているため、内部の ``locked()`` が**自分のロック**に 2 秒ぶつかって
+    無駄な監査イベントを出すだけになる。
+    """
+    if entry.nonce:
+        result = board.remove_if_nonce(
+            resource_id, expect_nonce=entry.nonce, reason="release コマンド"
+        )
+    else:
+        # nonce を持たない古いエントリ。照合できる値が無いので従来どおり消す。
+        result = board.remove_detailed(resource_id, reason="release コマンド")
+
     if result is RemovalResult.REMOVED:
         print(f"解放しました: {naming.display_default(resource_id)}")
-    elif result is RemovalResult.ABSENT:
+        return EXIT_OK
+    if result is RemovalResult.ABSENT:
         print("宣言は見つかりませんでした（既に解放済みです）")
-    else:
-        # 削除できなかった。**「無かった」と混ぜない**（掲示板には残っている）。
-        print("解放に失敗しました（掲示板に宣言が残っています。監査ログを参照）", file=sys.stderr)
+        return EXIT_OK
+    if result is RemovalResult.NOT_OWNED:
+        # **「消さなかった」を「消せなかった」と混ぜない。** ここは掲示板が正常に読めた
+        # 上で「他者の生きた宣言である」と判定できた場合なので、使用中として 1 を返す。
+        print(
+            "解放をやめました: 宣言が入れ替わりました（他セッションが取り直した可能性）",
+            file=sys.stderr,
+        )
+        return EXIT_BUSY
+    # 削除できなかった。**「無かった」と混ぜない**（掲示板には残っている）。
+    print("解放に失敗しました（掲示板に宣言が残っています。監査ログを参照）", file=sys.stderr)
     return EXIT_OK
 
 

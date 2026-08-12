@@ -307,22 +307,29 @@ def test_unlink_is_retried_before_giving_up(
 # --- 二重取得が起きないこと -----------------------------------------------------
 
 
-def test_lock_blocks_a_second_acquisition(
+def test_a_contended_lock_is_not_reported_as_a_busy_resource(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """取得の排他区間が守られている。
+    """ロックを取れなかったことを「使用中」と報告しない。
 
-    ``O_EXCL`` が守るのは作成だけで、「読んで、幽霊なら消して、作る」の途中は無防備だった。
-    2 つのセッションが同じ幽霊を見て、両方とも `remove` → `try_claim` に成功しうる。
-    ロックが取れないときは**取得を諦める**（通すと二重取得になる）。
+    ``CONTENDED`` は他セッションが掲示板を**操作中**というだけで、資源が使用中である
+    証拠を 1 バイトも含まない（この時点で掲示板をまだ読んでいない）。ここで 1 を返すと
+    2 つの嘘をつく。他セッションが ``release`` している最中——**資源が今まさに空こうとして
+    いる瞬間**に「使用中」と答え、ロックを持ったままプロセスが死ねば ``LOCK_STALE_S``
+    のあいだ**全セッションの取得が「使用中」で止まる**。本ツールの故障を資源の競合として
+    報告する形であり、CLAUDE.md「Fail-Open」が名指しで禁じている。
+
+    排他は落ちない。正しさは nonce の CAS と ``try_claim`` の ``O_EXCL`` が担保しており、
+    本当に競っていれば ``try_claim`` が負けて**真の busy** が返る
+    （``test_two_sessions_seeing_one_ghost_do_not_both_acquire``）。
     """
     board = Board(tmp_path)
     board.entries_dir.mkdir(parents=True, exist_ok=True)
     board.lock_path(RESOURCE).write_text("99999", encoding="utf-8")  # 他セッションが保持中
 
-    assert claim(tmp_path) == 1
-    assert "操作中" in capsys.readouterr().err
-    assert board.read(RESOURCE) is None
+    assert claim(tmp_path) == 0
+    assert "排他を弱めて続行" in capsys.readouterr().err
+    assert board.read(RESOURCE) is not None
 
 
 def test_stale_lock_is_stolen(tmp_path: Path) -> None:
@@ -625,6 +632,63 @@ def test_conditional_removal_restores_what_it_captured(
     current = board.read(RESOURCE)
     assert current is not None
     assert current.job == "他人のジョブ"  # 戻っている
+
+
+def test_release_does_not_remove_a_declaration_reclaimed_mid_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``release`` の最中に他セッションが取り直しても、**新しい宣言を消さない。**
+
+    掲示板の書き換えは全て CAS に乗せる。手で最もよく打つ ``rb release`` だけが
+    「読む → ``owns`` → 無条件 ``unlink``」だと次が成立する。T が ``claim --force`` で
+    自分の宣言を作り、S の ``release`` はロックが取れなくても続行して**T の新しい宣言**を
+    読む。S と T の cwd が同じなら（同一プロジェクトで 2 セッションが動くのは日常である）
+    ``owns`` を通り、**S が T の生きた宣言を消す**。掲示板は空・資源は掴まれたままという、
+    最も検出しにくい不整合になる。
+    """
+    board = Board(tmp_path)
+    assert claim(tmp_path) == 0
+
+    @contextmanager
+    def unavailable(*_args: object, **_kwargs: object) -> Iterator[LockState]:
+        yield LockState.UNAVAILABLE
+
+    monkeypatch.setattr(Board, "locked", unavailable)
+
+    original = Board.remove_if_nonce
+    state = {"nested": False}
+
+    def interleave(
+        self: Board, resource_id: str, *, expect_nonce: str, reason: str
+    ) -> RemovalResult:
+        if not state["nested"]:
+            state["nested"] = True
+            # S が読んだ後・消す前に、T が割り込んで取り直す
+            assert (
+                run(
+                    tmp_path,
+                    "claim",
+                    "GPU0",
+                    "--job",
+                    "T のジョブ",
+                    "--observed",
+                    "調べた",
+                    "--eta",
+                    "30m",
+                    "--force",
+                )
+                == 0
+            )
+        return original(self, resource_id, expect_nonce=expect_nonce, reason=reason)
+
+    monkeypatch.setattr(Board, "remove_if_nonce", interleave)
+    capsys.readouterr()
+
+    assert run(tmp_path, "release", "GPU0") == 1
+    assert "宣言が入れ替わりました" in capsys.readouterr().err
+    current = board.read(RESOURCE)
+    assert current is not None
+    assert current.job == "T のジョブ"  # T の宣言が生き残っている
 
 
 # --- 作成の原子性 ---------------------------------------------------------------
@@ -1066,6 +1130,29 @@ def test_release_picks_the_nearest_ancestor_join(
     monkeypatch.setattr(os, "getcwd", lambda: near + "\\runs\\e008")
 
     assert run(tmp_path, "release", "GPU0") == 0
+    assert [join.job for join in board.list_joins(RESOURCE)] == ["ハブの相乗り"]
+
+
+def test_release_keeps_an_ancestors_join_when_i_have_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """自分が相乗りしていないなら、祖先から出された**他人の**相乗りは外さない。
+
+    相乗りを先に見ると、ハブのルートから出された申告が ``owns`` の祖先規則を通り、
+    配下のセッションの ``rb release`` がそれを選んで消す。しかも早期 return するため、
+    **他人の申告だけが消え、呼び出し側自身の主宣言は解放されないまま残る**という
+    二重の誤りになる。主宣言を先に見れば、どちらも起きない。
+    """
+    board = Board(tmp_path)
+    mine = "C:\\works\\assets\\foo"
+    hub = "C:\\works"
+    monkeypatch.setattr(os, "getcwd", lambda: mine)
+    assert claim(tmp_path) == 0  # 主宣言は自分のもの
+    assert board.add_join(build_entry(RESOURCE, job="ハブの相乗り", cwd=hub), hub)
+
+    assert run(tmp_path, "release", "GPU0") == 0
+
+    assert board.read(RESOURCE) is None  # 自分の主宣言が解放されている
     assert [join.job for join in board.list_joins(RESOURCE)] == ["ハブの相乗り"]
 
 
