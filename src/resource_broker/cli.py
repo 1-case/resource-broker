@@ -1,7 +1,7 @@
 """コマンドラインインタフェース（``resource-broker`` / ``rb``）。
 
-Phase 1 で提供するのは ``status`` / ``claim`` / ``release`` の 3 つ。
-ラッパー（``run``）とフックは Phase 2 以降で追加する。
+提供するのは ``status`` / ``claim`` / ``release``（Phase 1）と
+ラッパー ``run``（Phase 2）。フックは Phase 3 で追加する。
 
 **本ツールは資源を調べない。** 調べるのはセッション（Claude Code）の仕事であり、
 本ツールがやるのは「調べたことを申告させ、掲示板に残し、他セッションから見えるようにする」
@@ -17,18 +17,29 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
-from . import clock, liveness, naming, platform_info
+from . import clock, liveness, naming, platform_info, runner
 from .board import Board, Entry, build_entry
 from .liveness import Observation, Verdict
 
 EXIT_OK = 0
 EXIT_BUSY = 1
 
+#: 引数の不備。argparse と同じ値にそろえる。
+EXIT_USAGE = 2
+
+#: Ctrl+C で中断されたときの終了コード（シェルの慣習に合わせる）。
+EXIT_INTERRUPTED = 130
+
 #: ``--found`` の受け付ける値と、それが表す実測の結論。
 FOUND_CHOICES: dict[str, bool | None] = {"busy": True, "free": False, "unknown": None}
+
+#: 子プロセスの起動。テストで差し替える（実プロセスを起動しないため）。
+SPAWN: runner.Spawn = runner.default_spawn
 
 
 def assess(
@@ -109,44 +120,140 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _cmd_claim(args: argparse.Namespace) -> int:
-    board = Board(args.home)
-    resource_id = naming.normalize(args.resource)
-    observation = Observation(busy=FOUND_CHOICES.get(args.found), note=args.observed)
+def acquire(
+    board: Board,
+    resource_id: str,
+    observation: Observation,
+    *,
+    job: str,
+    found: str,
+    display: str = "",
+    log: str | None = None,
+    force: bool = False,
+    pid: int | None = None,
+) -> tuple[Entry | None, int]:
+    """宣言を取得する。``claim`` と ``run`` で共通の判断である。
+
+    Parameters
+    ----------
+    pid : int, optional
+        宣言者として記録する PID。**手動の ``claim`` では渡さない**。
+        渡してよいのはラッパー（``run``）だけで、そこではラッパー自身が
+        ジョブと同じ寿命を持つため生存確認が意味を持つ。
+
+    Returns
+    -------
+    tuple of (Entry or None, int)
+        取得できたエントリと終了コード。取得できなければ ``(None, EXIT_BUSY)``。
+    """
     verdict, entry = assess(board, resource_id, observation)
 
     # 自分で調べて使用中だったのなら、掲示板に何が書いてあろうと宣言してはならない。
     if observation.busy is True:
         print("自分の調査で使用中と分かっているため宣言できません", file=sys.stderr)
         print(f"  観測  : {observation.note}", file=sys.stderr)
-        return EXIT_BUSY
+        return None, EXIT_BUSY
 
-    if entry is not None and not liveness.is_free(verdict) and not args.force:
+    if entry is not None and not liveness.is_free(verdict) and not force:
         print(f"使用中のため宣言できません: {liveness.explain(verdict)}", file=sys.stderr)
         print(f"  宣言者: {entry.session} / {entry.job}", file=sys.stderr)
         print(f"  since : {entry.since}", file=sys.stderr)
         if entry.log:
             print(f"  log   : {entry.log}", file=sys.stderr)
-        return EXIT_BUSY
+        return None, EXIT_BUSY
 
     if entry is not None:
-        reason = "強制取得" if args.force else f"幽霊と判定した（{liveness.explain(verdict)}）"
+        reason = "強制取得" if force else f"幽霊と判定した（{liveness.explain(verdict)}）"
         board.remove(resource_id, reason=reason)
 
     new_entry = build_entry(
         resource_id,
-        job=args.job,
-        display=args.display or "",
-        log=args.log,
-        observed={"note": observation.note, "found": args.found},
+        job=job,
+        display=display,
+        log=log,
+        pid=pid,
+        observed={"note": observation.note, "found": found},
     )
     if not board.try_claim(new_entry):
         # ここに来るのは、判定してから作成するまでの間に他セッションが取った場合。
         print("他のセッションが先に宣言しました", file=sys.stderr)
-        return EXIT_BUSY
+        return None, EXIT_BUSY
 
-    print(f"宣言しました: {new_entry.display} / {new_entry.job}")
+    return new_entry, EXIT_OK
+
+
+def _cmd_claim(args: argparse.Namespace) -> int:
+    board = Board(args.home)
+    resource_id = naming.normalize(args.resource)
+    observation = Observation(busy=FOUND_CHOICES.get(args.found), note=args.observed)
+
+    # 手動の claim では PID を記録しない（CLI プロセスは即座に終了するため）。
+    entry, code = acquire(
+        board,
+        resource_id,
+        observation,
+        job=args.job,
+        found=args.found,
+        display=args.display or "",
+        log=args.log,
+        force=args.force,
+    )
+    if entry is None:
+        return code
+
+    print(f"宣言しました: {entry.display} / {entry.job}")
     return EXIT_OK
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    """資源を宣言してからコマンドを実行し、終わったら必ず解放する。
+
+    ``finally`` で解放するため、子プロセスが異常終了しても、例外が飛んでも、
+    Ctrl+C で中断しても宣言は残らない。**ラッパーごと強制終了された場合だけ**
+    エントリが残るが、そこは PID を記録してあるため幽霊判定が拾える。
+
+    終了コードは**子プロセスのものをそのまま返す**。資源を取得できずに
+    実行しなかった場合だけ ``EXIT_BUSY`` を返し、その旨を stderr に出す。
+    """
+    if not args.trailing:
+        print("実行するコマンドを `--` の後ろに指定してください", file=sys.stderr)
+        print(
+            '  例: rb run --res GPU0 --job "学習" --observed "..." -- python train.py',
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+
+    board = Board(args.home)
+    resource_id = naming.normalize(args.res)
+    observation = Observation(busy=FOUND_CHOICES.get(args.found), note=args.observed)
+    log_path = Path(args.log) if args.log else runner.build_log_path(board.root, resource_id)
+
+    # ラッパーはジョブと同じ寿命を持つ。ここでだけ PID を記録する。
+    entry, code = acquire(
+        board,
+        resource_id,
+        observation,
+        job=args.job,
+        found=args.found,
+        display=args.display or "",
+        log=str(log_path),
+        force=args.force,
+        pid=os.getpid(),
+    )
+    if entry is None:
+        print("資源を取得できなかったため、コマンドを実行していません", file=sys.stderr)
+        return code
+
+    print(f"宣言しました: {entry.display} / {entry.job}")
+    print(f"ログ: {log_path}")
+    try:
+        return runner.execute(list(args.trailing), log_path, spawn=SPAWN)
+    except KeyboardInterrupt:
+        print("中断されました", file=sys.stderr)
+        return EXIT_INTERRUPTED
+    finally:
+        board.remove(resource_id, reason="rb run の終了")
+        print(f"解放しました: {entry.display}")
 
 
 def _cmd_release(args: argparse.Namespace) -> int:
@@ -207,7 +314,53 @@ def build_parser() -> argparse.ArgumentParser:
     release.add_argument("resource", help="資源 ID")
     release.set_defaults(func=_cmd_release)
 
+    run = sub.add_parser(
+        "run",
+        help="資源を宣言してコマンドを実行し、終了時に必ず解放する",
+        description=(
+            "宣言・ログ出力・解放を機械的に行う。解放は finally で行うため、"
+            "異常終了でも中断でもエントリは残らない。"
+            "終了コードは子プロセスのものをそのまま返す。"
+        ),
+    )
+    run.add_argument("--res", required=True, help="資源 ID")
+    run.add_argument("--job", required=True, help="何をするか（1 行）")
+    run.add_argument(
+        "--observed",
+        required=True,
+        help="自分で調べて何を見たか（例: 'nvidia-smi: compute apps なし'）",
+    )
+    run.add_argument(
+        "--found",
+        choices=sorted(FOUND_CHOICES),
+        default="unknown",
+        help="調べた結論。既定は unknown（分からなかった）",
+    )
+    run.add_argument("--log", default=None, help="ログの出力先（既定は掲示板ルートの logs/）")
+    run.add_argument("--display", default=None, help="表示名")
+    run.add_argument("--force", action="store_true", help="他者の宣言を退けて強制的に取得する")
+    run.set_defaults(func=_cmd_run)
+
     return parser
+
+
+def split_trailing(argv: Sequence[str]) -> tuple[list[str], list[str]]:
+    """``--`` の前後で引数を分ける。
+
+    外部コマンドを引数に取る ``run`` のために、argparse へ渡す前に切り離す。
+    argparse に解釈させると、実行したいコマンド側の ``--epochs 10`` のような
+    引数を本ツールのオプションと取り違える。
+
+    Returns
+    -------
+    tuple of (list of str, list of str)
+        ``--`` より前と後。``--`` が無ければ後ろは空リスト。
+    """
+    argv = list(argv)
+    if "--" not in argv:
+        return argv, []
+    index = argv.index("--")
+    return argv[:index], argv[index + 1 :]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -216,11 +369,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     内部エラーは 0 を返して通す（fail-open）。本ツールの不具合で
     ユーザーの作業を止めないことを、コード上でも保証する。
     """
+    head, trailing = split_trailing(sys.argv[1:] if argv is None else argv)
+
     parser = build_parser()
     try:
-        args = parser.parse_args(argv)
+        args = parser.parse_args(head)
     except SystemExit as exc:  # --help や引数不備。argparse の意図どおりに返す
         return int(exc.code or 0)
+    args.trailing = trailing
 
     try:
         return int(args.func(args))

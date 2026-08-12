@@ -12,7 +12,7 @@
 - **テスト**: `uv run pytest`
 - **Lint**: `uv run ruff check .` / `uv run ruff format --check .`
 - **実行**: `rb status` / `rb claim <resource> --job "..." --observed "..."` / `rb release <resource>` /
-  `rb run --res <resource> -- <command>`
+  `rb run --res <resource> --job "..." --observed "..." -- <command>`
 
 ## Overview
 
@@ -75,6 +75,7 @@ resource-broker/
 │   ├── liveness.py       幽霊判定（boot time / PID / 申告された実測）と Observation
 │   ├── audit.py          監査ログの追記（掲示板から共用）
 │   ├── platform_info.py  boot time / PID 生存 / ホスト名（OS 依存をここに隔離）
+│   ├── runner.py         子プロセスの起動とログの強制（spawn は注入可能）
 │   └── cli.py            status / claim / release / run
 ├── hooks/
 │   ├── sessionstart_notice.py   掲示板の現状をコンテキストへ注入
@@ -115,6 +116,10 @@ uv run ruff format --check .
 uv run rb status
 uv run rb claim GPU0 --job "E009 学習" --observed "nvidia-smi: compute apps なし" --found free
 uv run rb release GPU0
+
+# 宣言・ログ・解放をまとめて機械化する（推奨）
+uv run rb run --res GPU0 --job "E009 学習" --observed "nvidia-smi: compute apps なし" --found free `
+  -- uv run python scripts/train.py
 ```
 
 ## Design Decisions
@@ -276,14 +281,30 @@ rb claim GPU0 --job "E009 学習" --observed "nvidia-smi: compute apps なし" -
 LLM が忘れても成立させることが目的である。
 
 1. 掲示板のエントリを作成する（時刻・PID・boot はすべて自動生成）
-2. **ログ出力を強制する**。Python なら `-u` を付与し、stdout/stderr をログファイルへリダイレクトし、
-   そのパスを掲示板に登録する
+2. **ログ出力を強制する**。stdout/stderr をログファイルへ落とし、そのパスを掲示板に登録する
 3. 子プロセスを起動して待つ
-4. `finally` でエントリを削除する（正常終了・異常終了・シグナルのいずれでも）
+4. `finally` でエントリを削除する（正常終了・異常終了・中断のいずれでも）
 
 `--observed` は `claim` と同じく**必須**とする。ラッパーも資源を調べない。
 調べるのは `rb run` を書くセッションであり、ラッパーが自動化するのは
 「宣言を残し、ログを強制し、確実に解放する」ところだけである。
+
+| 項目 | 決定 |
+|---|---|
+| PID | **ラッパー自身の PID** を記録する。ラッパーはジョブと同じ寿命を持つため生存確認が意味を持つ |
+| ログの場所 | 既定は `%LOCALAPPDATA%\resource-broker\logs\<safe-name>-<時刻>.log`。`--log` で上書き可 |
+| バッファリング | 子の環境に `PYTHONUNBUFFERED=1` を入れる。**コマンド行は解釈しない** |
+| 終了コード | 子のものをそのまま返す |
+
+- ログを掲示板と同じルートに置くのは、**他セッションが読めることが要件**だからである。
+  プロジェクト配下に置くと、掲示板の `log` を辿った先が読めない場合がある
+- `python` を探して `-u` を挿す実装にはしない。`uv run python` や `py -3` を取りこぼすうえ、
+  コマンドの種類を知ることになる。環境変数なら解釈が要らない
+- **終了コードで嘘をつかない。** 起動できなかった場合は 127（コマンドが無い）/ 126（起動不能）、
+  中断は 130、資源を取得できず実行しなかった場合は 1 を返す。
+  fail-open は「資源アクセスを止めない」原則であって、「走らなかったジョブを成功と報告してよい」ではない
+- **ラッパーごと強制終了された場合だけ**エントリが残る（`TerminateProcess` に `finally` は無い）。
+  そこは PID を記録してあるため幽霊判定の条件 2 が拾う。ラッパーと幽霊判定はこの一点で噛み合う
 
 ### Hook Spec
 
@@ -322,7 +343,7 @@ Phase 1〜3 では監視を前提にしない。掲示板の参照は「セッ�
 | Phase | 内容 | 完了条件 |
 |---|---|---|
 | **1** | 掲示板コア + CLI（`status` / `claim` / `release`）+ 申告の強制。**フックは入れない** | 手動運用で 1 週間、掲示板の内容が実態と一致し続ける。fail-open のテストが全て通る |
-| **2** | ラッパー `rb run`（ログ強制・自動解放） | 実際の学習ジョブを `rb run` 経由で完走させ、異常終了時にもエントリが残らないことを確認 |
+| **2** | ラッパー `rb run`（ログ強制・自動解放・PID 記録） | 実際の学習ジョブを `rb run` 経由で完走させ、異常終了時にもエントリが残らないことを確認 |
 | **3** | user スコープフック。**`SessionStart` を先に入れ、`PreToolUse` は後** | 全セッション再起動後、通常作業が阻害されないこと。誤 deny がゼロであること |
 | **4** | 予約（待機列）と監視 | 監視の維持機構が設計できてから着手する |
 | **5** | 資源種別の拡張（COM / USB / ネットワークドライブ / レート制限） | 実際に困った資源から順に追加する |
