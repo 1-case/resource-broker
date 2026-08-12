@@ -21,11 +21,50 @@ deny に至らない、というのがこのフックの狙いである。
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 
 #: ``rb status`` の待ち時間。超えたら黙って諦める。
 TIMEOUT_S = 5.0
+
+#: 文字コードは**環境に委ねず UTF-8 に固定する**。
+#:
+#: Windows では ``sys.stdout.encoding`` がコンソールでもパイプでも cp932 になる。
+#: そのまま書くと cp932 のバイト列が出て、UTF-8 として読む側で判読不能になる。
+#: 導入直後のセッションで実際に起きた（注入された全文が化けた）。
+#: 同じ理由で、``rb`` を呼ぶときも子の出力を UTF-8 に強制する。
+ENCODING = "utf-8"
+
+
+def emit(text: str) -> None:
+    """UTF-8 のバイト列として書き出す。
+
+    テキスト層を通さずに ``sys.stdout.buffer`` へ書く。ロケールの影響を受けないためである。
+    ``buffer`` が使えない環境ではテキスト層へ退避する（出さないよりはよい）。
+    """
+    data = (text + "\n").encode(ENCODING, errors="replace")
+    try:
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+    except (AttributeError, ValueError, OSError):
+        try:
+            sys.stdout.write(text + "\n")
+        except Exception:  # noqa: BLE001 - fail-open
+            pass
+
+
+def child_environment() -> dict[str, str]:
+    """``rb`` に UTF-8 で出力させるための環境変数を作る。
+
+    ``rb`` も Windows では既定で cp932 を使う。UTF-8 として復号するには、
+    子にも UTF-8 で書かせる必要がある（片方だけ直しても文字化けは残る）。
+    """
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = ENCODING
+    env["PYTHONUTF8"] = "1"
+    return env
+
 
 USAGE = """資源（GPU / COM ポート / ネットワークドライブ / ローカルポート等）を使う前に:
   1. その資源の状態を**自分で調べる**（調べ方はあなたが決める。本ツールは資源を知らない）
@@ -41,10 +80,11 @@ def fetch_status() -> list[dict[str, object]] | None:
             ["rb", "status", "--json"],
             capture_output=True,
             text=True,
-            encoding="utf-8",
+            encoding=ENCODING,
             errors="replace",
             timeout=TIMEOUT_S,
             check=False,
+            env=child_environment(),
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -106,7 +146,7 @@ def main() -> int:
         resources = fetch_status()
         if resources is None:
             return 0  # rb が無い・壊れている。黙って通す
-        sys.stdout.write(build_notice(resources) + "\n")
+        emit(build_notice(resources))
     except Exception:  # noqa: BLE001 - fail-open。起動を妨げない
         return 0
     return 0
