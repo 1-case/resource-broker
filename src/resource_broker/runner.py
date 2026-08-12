@@ -113,6 +113,16 @@ def child_environment(base: Mapping[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+def prune_own_logs(root: Path, *, max_age_days: float = LOG_RETENTION_DAYS) -> int:
+    """**本ツールが作ったログ置き場だけ**を掃除する。
+
+    掲示板のルート直下の ``logs/`` に限る。``--log`` で指定された場所は触らない。
+    そこは利用者のディレクトリであり、本ツールが作っていない ``*.log`` が同居しうる。
+    掃除の対象を「書き込み先」にすると、掲示板を守るための掃除が**管理外のファイルを消す**。
+    """
+    return prune_old_logs(Path(root) / LOG_DIR, max_age_days=max_age_days)
+
+
 def prune_old_logs(directory: Path, *, max_age_days: float = LOG_RETENTION_DAYS) -> int:
     """古いログを掃除する。消せた件数を返す。
 
@@ -197,8 +207,10 @@ def default_spawn(argv: list[str], log_path: Path, env: Mapping[str, str]) -> in
     int
         子プロセスの終了コード。
     """
+    # **ここで掃除をしない。** ``--log`` で場所を指定できるので、掃除を「書き込み先の
+    # ディレクトリ」に対して行うと、利用者のプロジェクト配下にある**無関係な `*.log` を消す**。
+    # 掃除の対象は本ツールが作った置き場に限る（呼び出し側が `prune_old_logs` を呼ぶ）。
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    prune_old_logs(log_path.parent)
     header = f"=== {clock.now_iso()} rb run: {subprocess.list2cmdline(argv)}\n"
 
     with log_path.open("ab") as stream:
