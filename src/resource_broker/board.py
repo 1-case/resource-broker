@@ -80,7 +80,11 @@ class LockState(StrEnum):
     """取れた。排他区間に入ってよい。"""
 
     CONTENDED = "contended"
-    """他セッションが保持していて時間内に取れなかった。**取得は諦める**。"""
+    """他セッションが保持していて時間内に取れなかった。**排他を弱めて続行する**。
+
+    「掲示板を操作中の者がいる」であって、**資源が使用中である証拠は 1 バイトも無い**
+    （この時点で掲示板を読んでいない）。ここで諦めると、他セッションが ``release``
+    している最中——資源が今まさに空こうとしている瞬間に「使用中」と答えることになる。"""
 
     UNAVAILABLE = "unavailable"
     """ロックの仕組みそのものが使えない（作れない・権限が無い・ディスクが一杯）。
@@ -386,9 +390,10 @@ class Board:
         最悪の相関を抱えることになる。
 
         結果は 3 値で渡す（:class:`LockState`）。**インフラの故障と資源の競合を
-        混同しない**（CLAUDE.md「Fail-Open」）。呼び出し側が取得を諦めてよいのは
-        ``CONTENDED``（他セッションが保持していた）のときだけで、``UNAVAILABLE``
-        （ロックの仕組みが使えない）ではロック無しで続行すること。
+        混同しない**（CLAUDE.md「Fail-Open」）。ただし**どの値でも呼び出し側は止まらない**。
+        ロックが取れなかったことは、``CONTENDED`` でも ``UNAVAILABLE`` でも、
+        資源が使用中である証拠を含まないからである。3 値に分けるのは、
+        どちらの理由で排他が弱まったかを監査ログと説明文で区別するためである。
 
         放置されたロックは奪う。ロックを持ったままプロセスが死んで掲示板が永久に固まるのは、
         本ツールの故障でユーザーの作業を止めることに等しい。
@@ -586,6 +591,15 @@ class Board:
         -------
         RemovalResult
             消した / 無かった / 別物だった / 消せなかった。
+
+        Notes
+        -----
+        **幽霊の退去は読み手の圧力で失敗しうる。** 2 段目の ``os.rename`` は、
+        Windows では他プロセスが読んでいる最中のファイルに対して ``PermissionError``
+        になる（Python の ``open()`` は ``FILE_SHARE_DELETE`` を付けないため）。
+        フックが全セッションの全プロンプトで掲示板を読むので、これは例外的な事態ではない。
+        数回やり直して吸収し、吸収できなければ ``FAILED`` を返して**保守的に諦める**
+        （消せていないのに消えたと答えるより、退けられなかったと答えるほうが安全である）。
         """
         path = self.path_for(resource_id)
 
@@ -628,20 +642,51 @@ class Board:
         を使うのは、宛先があるときに**必ず失敗する**からである（``os.rename`` は
         POSIX では黙って上書きする）。既に新しい宣言があるなら、捕まえた側は
         既に退けられた古い宣言なので破棄してよい。
+
+        Notes
+        -----
+        二重に失敗したときの結末を**事象名で分ける**。「宛先に新しい宣言がある」は
+        捕まえた側が用済みというだけで害が無いが、「戻せなかった」は
+        **他人の生きた宣言が掲示板から消え、資源が空きに見える**唯一の状態である。
+        後者だけを ``declaration_lost`` という専用の名前で残す。この状態では、
+        監査ログから grep 一発で見つかることが回復手段そのものだからである。
         """
         try:
             os.link(tombstone, path)
         except FileExistsError:
-            self.audit("restore_dropped", resource=resource_id, reason="新しい宣言が既にある")
-            _unlink_with_retry(tombstone)
+            self._drop_captured(tombstone, resource_id)
             return
         except OSError:
             # ハードリンクが使えないファイルシステム。上書きの危険を承知で戻す
             # （戻さなければ宣言が消えたままになり、そちらのほうが有害である）。
             moved, error = _rename_with_retry(tombstone, path)
-            if moved is not MoveResult.MOVED:
-                self.audit("restore_failed", resource=resource_id, error=error)
+            if moved is MoveResult.MOVED:
+                return
+            if moved is MoveResult.BLOCKED:
+                # 宛先に既に新しい宣言がある。``FileExistsError`` 側と同じ結末なので、
+                # tombstone の始末も同じ経路へ寄せる（片方だけ残す非対称を作らない）。
+                self._drop_captured(tombstone, resource_id)
+                return
+            # 戻す先も戻す手段も無い。**宣言は掲示板から消えたままである。**
+            captured = _read_entry_at(tombstone)
+            self.audit(
+                "declaration_lost",
+                resource=resource_id,
+                job=captured.job if captured is not None else None,
+                tombstone=str(tombstone),
+                path=str(path),
+                error=error or str(moved),
+            )
             return
+        _unlink_with_retry(tombstone)
+
+    def _drop_captured(self, tombstone: Path, resource_id: str) -> None:
+        """捕まえたものを破棄する。既に新しい宣言があるときの後始末。
+
+        捕まえたのは**既に退けられた古い宣言**なので、戻す先が無くても失うものは無い。
+        残骸を消しておかないと、捕獲直後に死ななくても tombstone が溜まっていく。
+        """
+        self.audit("restore_dropped", resource=resource_id, reason="新しい宣言が既にある")
         _unlink_with_retry(tombstone)
 
     def remove_if_owned(
@@ -877,7 +922,7 @@ class Board:
         self.audit("join_removed", resource=resource_id, cwd=cwd, reason=reason)
         return True
 
-    def remove_own_join(self, resource_id: str, cwd: str, *, reason: str) -> bool:
+    def remove_own_join(self, resource_id: str, cwd: str, *, reason: str) -> Entry | None:
         """自分の相乗り申告を取り下げる。
 
         照合は主宣言（:meth:`owns`）と**同じ規則**にする。パスの完全一致だけにすると、
@@ -890,6 +935,14 @@ class Board:
         相乗りを配下の全セッションが外せてしまう。祖先候補が複数あるときは
         ``declared_cwd`` が最長（＝最も自分に近い）ものを選ぶ。同じ理由で、
         自分がまさにその場所から出した申告があるなら、それ以外を選ぶ理由は無い。
+
+        Returns
+        -------
+        Entry or None
+            取り下げた申告。外せるものが無ければ None。**bool ではなく申告そのものを返す**
+            のは、呼び出し側が「どの場所から出された申告を消したか」を表示できるように
+            するためである。祖先フォールバックで他人の申告を消したとき、誤爆が
+            目視できなければ気づく手段が無い。
         """
         exact = self.join_path(resource_id, cwd)
         candidates = [
@@ -897,28 +950,26 @@ class Board:
             for path, entry in self._load_joins()
             if entry.resource == resource_id and self.owns(entry, cwd=cwd)
         ]
-        chosen: Path | None = None
-        for path, _entry in candidates:
+        chosen: tuple[Path, Entry] | None = None
+        for path, entry in candidates:
             if path == exact:
-                chosen = path
+                chosen = (path, entry)
                 break
         if chosen is None and candidates:
             # 最も近い祖先を選ぶ。declared_cwd が長いほど自分に近い。
-            path, _entry = max(
-                candidates, key=lambda item: len(str(item[1].holder.get("cwd") or ""))
-            )
-            chosen = path
+            chosen = max(candidates, key=lambda item: len(str(item[1].holder.get("cwd") or "")))
         if chosen is None:
-            return False
+            return None
 
-        result, error = _unlink_with_retry(chosen)
+        path, entry = chosen
+        result, error = _unlink_with_retry(path)
         if result is RemovalResult.FAILED:
             self.audit("join_remove_failed", resource=resource_id, error=error)
-            return False
+            return None
         if result is RemovalResult.REMOVED:
             self.audit("join_removed", resource=resource_id, cwd=cwd, reason=reason)
-            return True
-        return False
+            return entry
+        return None
 
     def remove_joins(self, resource_id: str, *, reason: str) -> int:
         """その資源の相乗り申告を**全て**取り下げる。消せた件数を返す。
@@ -970,6 +1021,12 @@ class Board:
         所有権の移動ではないため、失うものの大きさが釣り合わない。
         したがってここは「読んで確かめてから原子的に置く」に留め、読みと置きの間の
         極小の窓は既知の残余として受け入れる。
+
+        その窓には**「蘇生」の向きもある**。``os.replace`` は宛先が無ければ作るため、
+        読んでから書くまでの間に宣言が**正当に消えていた**場合（当人の ``release`` や
+        ``rb run`` の後始末）、ここが**死んだ宣言を書き戻す**。蘇生した宣言は
+        nonce の持ち主が既にいないので、``rb release --force`` でしか消せない。
+        照合が防ぐのは「古い内容で新しい宣言を潰す」向きだけであり、この向きは防げない。
         """
         if expect_nonce is not None:
             current = self.read(entry.resource)
