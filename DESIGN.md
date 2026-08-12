@@ -78,8 +78,8 @@ resource-broker/
 │   ├── runner.py         子プロセスの起動とログの強制（spawn は注入可能）
 │   └── cli.py            status / claim / release / run
 ├── hooks/
-│   ├── sessionstart_notice.py   掲示板の現状をコンテキストへ注入
-│   └── pretooluse_guard.py      未宣言の資源使用を deny（Phase 3）
+│   ├── sessionstart_notice.py   掲示板の現状をコンテキストへ注入（stdlib のみ・常に exit 0）
+│   └── pretooluse_guard.py      未宣言の資源使用を deny（未着手）
 ├── tests/
 ├── tools/speak.py
 └── pyproject.toml
@@ -311,10 +311,10 @@ LLM が忘れても成立させることが目的である。
 `~/.claude/settings.json`（user スコープ）に登録することで、以降このマシンで起動する
 **全セッションに自動適用**される。プロジェクトごとの設定は不要。
 
-| フック | matcher | 役割 |
-|---|---|---|
-| `SessionStart` | - | 掲示板の現状をコンテキストへ注入する。最初から知っていれば deny に至らない |
-| `PreToolUse` | `Bash` | 資源を使うコマンドが未宣言なら deny。理由文に掲示板の現状を載せる |
+| フック | matcher | 役割 | 状態 |
+|---|---|---|---|
+| `SessionStart` | - | 掲示板の現状をコンテキストへ注入する。最初から知っていれば deny に至らない | **導入済み** |
+| `PreToolUse` | `Bash` | 資源を使うコマンドが未宣言なら deny。理由文に掲示板の現状を載せる | 未着手 |
 
 - **判定のみ。待機しない**。該当しなければ即 exit する
 - **必ず exit 0 で fail-open**。内部エラー・掲示板の破損のいずれでも通す
@@ -330,6 +330,33 @@ LLM が忘れても成立させることが目的である。
 既に起動しているセッションには反映されない（フック設定は起動時のスナップショット）。
 導入時に一度、全セッションの再起動が必要である。
 
+`SessionStart` は**判定を再実装せず `rb status --json` を呼ぶ**。ここで自前の幽霊判定を
+書けば、本体と乖離した第 2 の真実ができる。実測した応答時間は約 180ms で、
+1 セッションに 1 回なら許容できる。**`PreToolUse` では同じ手が使えない**
+（50ms 以内という要件に対して 3 倍以上かかる）。そちらは掲示板を直接読む必要がある。
+
+### Deployment
+
+他セッションから使えるようにするには 2 つが要る。掲示板自体はマシン全体で 1 箇所にあるため、
+**共有の仕組みは最初から出来ている**。足りないのは「呼べること」と「気づくこと」である。
+
+```powershell
+# 1. rb を PATH に載せる（他セッションが宣言できるようにする）
+uv tool install --editable %USERPROFILE%\works\assets\resource-broker
+#    -> %USERPROFILE%\.local\bin\rb.exe（--editable なのでリポジトリの変更が即反映される）
+
+# 2. SessionStart フックを user スコープへ **マージ** 登録する
+#    ~/.claude/settings.json の hooks.SessionStart に追記する。既存の hooks を上書きしない
+#    command: python "%USERPROFILE%\works\assets\resource-broker\hooks\sessionstart_notice.py"
+
+# 3. 全セッションを再起動する（フック設定は起動時のスナップショット）
+```
+
+- **`rb` の PATH 登録が無くてもフックは動く**（フックは掲示板を読むだけ）。ただし deny された側が
+  `rb claim` を打てないと詰むため、`PreToolUse` を入れる前には必須である
+- user スコープの設定を書き換える前に**必ずバックアップを取る**。稼働中の他のフックを壊すと
+  全セッションに影響が出る
+
 ### Watching (Undecided)
 
 「空いたら起きる」は `Monitor` または background Bash の `until` ループで実現できることを確認済み。
@@ -344,7 +371,7 @@ Phase 1〜3 では監視を前提にしない。掲示板の参照は「セッ�
 |---|---|---|
 | **1** | 掲示板コア + CLI（`status` / `claim` / `release`）+ 申告の強制。**フックは入れない** | 手動運用で 1 週間、掲示板の内容が実態と一致し続ける。fail-open のテストが全て通る |
 | **2** | ラッパー `rb run`（ログ強制・自動解放・PID 記録） | **実際に排他資源を掴む実ジョブ**を `rb run` 経由で完走させ、異常終了時にもエントリが残らないことを確認 |
-| **3** | user スコープフック。**`SessionStart` を先に入れ、`PreToolUse` は後** | 全セッション再起動後、通常作業が阻害されないこと。誤 deny がゼロであること |
+| **3** | user スコープフック。**`SessionStart` を先に入れ、`PreToolUse` は後** | 全セッション再起動後、通常作業が阻害されないこと。誤 deny がゼロであること（`SessionStart` は導入済み） |
 | **4** | 予約（待機列）と監視 | 監視の維持機構が設計できてから着手する |
 | **5** | 資源種別の拡張（COM / USB / ネットワークドライブ / レート制限） | 実際に困った資源から順に追加する |
 
