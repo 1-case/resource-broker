@@ -1,4 +1,11 @@
-"""資源が解放されるまで待つ。
+"""資源の状況が変わるまで待つ。
+
+起きるのは**宣言の集合が縮んだとき**である。誰かが解放すれば縮み、相乗りが増えれば増える。
+資源が空く方向に動いたときだけ起こしたいので、**縮んだときだけ**戻る。
+
+「どれくらい減ったか」は判定しない。使用量の単位も尺度も資源ごとに違い、それを解釈すれば
+その資源を知ることになる（CLAUDE.md「Resource Agnosticism」）。**増減だけを見れば方向は分かる**
+ので、数値を読む必要がない。入れるかどうかは起きた側が自分で調べて決める。駄目ならまた待てばよい。
 
 **待つのはコマンドの中だけである。** フックの中では絶対に待たない。フックでブロックすると
 セッションが固まり、ユーザーは Esc でも抜けられず、画面上は何も起きていないように見える
@@ -35,14 +42,24 @@ DEFAULT_INTERVAL_S = 10.0
 DEFAULT_TIMEOUT_S = 3600.0
 
 
+#: 待機が終わった理由。
+RELEASED = "released"
+"""宣言が 1 つも無くなった。"""
+
+SHRANK = "shrank"
+"""宣言の数が減った（誰かが解放した）。まだ他の宣言は残っている。"""
+
+TIMEOUT = "timeout"
+
+
 @dataclass(frozen=True)
 class WaitResult:
     """待機の結果。
 
     Attributes
     ----------
-    released : bool
-        解放されたか。タイムアウトなら False。
+    reason : str
+        終わった理由。``released`` / ``changed`` / ``timeout``。
     polls : int
         ポーリングした回数。
     waited_s : float
@@ -51,13 +68,43 @@ class WaitResult:
         最後に見えた宣言。解放されていれば None。
     """
 
-    released: bool
+    reason: str
     polls: int
     waited_s: float
     last: Entry | None
+    holders: int = 0
+
+    @property
+    def released(self) -> bool:
+        """宣言が 1 つも無くなったか。"""
+        return self.reason == RELEASED
+
+    @property
+    def worth_checking(self) -> bool:
+        """もう一度自分で調べる価値があるか。
+
+        全部無くなっても、1 つ減っただけでも「調べ直せ」であり、扱いは同じである。
+        """
+        return self.reason in (RELEASED, SHRANK)
 
 
-def wait_for_release(
+def holder_keys(board: Board, resource_id: str) -> set[str]:
+    """その資源を宣言している者の集合を返す。主宣言と相乗りの両方。
+
+    **中身は見ない。** 誰が何人いるかだけを数える。増減が分かれば資源が空く方向に
+    動いたかは判断でき、使用量の数値を解釈する必要がない。
+    """
+    keys: set[str] = set()
+    primary = board.read(resource_id)
+    if primary is not None:
+        keys.add(f"primary:{primary.since}:{primary.session}")
+    for join in board.list_joins(resource_id):
+        holder = join.holder if isinstance(join.holder, dict) else {}
+        keys.add(f"join:{holder.get('cwd', '?')}")
+    return keys
+
+
+def wait_for_room(
     board: Board,
     resource_id: str,
     *,
@@ -66,7 +113,10 @@ def wait_for_release(
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], datetime] = clock.now,
 ) -> WaitResult:
-    """掲示板から宣言が消えるまで待つ。
+    """宣言している者が減るまで待つ。
+
+    完全解放だけを待つと、相乗りできる資源で機会を逃す。逆に、相乗りが**増えた**ときに
+    起こしても意味がない（資源はさらに詰まっている）。したがって**減ったときだけ**戻る。
 
     Parameters
     ----------
@@ -77,7 +127,7 @@ def wait_for_release(
     interval_s : float
         ポーリング間隔。
     timeout_s : float
-        待機の上限。超えたら ``released=False`` で戻る。
+        待機の上限。超えたら ``reason="timeout"`` で戻る。
     sleep : callable
         待機の実装。テストで差し替える（実時間を待たないため）。
     now : callable
@@ -86,7 +136,7 @@ def wait_for_release(
     Returns
     -------
     WaitResult
-        解放されたかどうかと、待った回数・秒数。
+        終わった理由と、待った回数・秒数。
 
     Notes
     -----
@@ -95,28 +145,55 @@ def wait_for_release(
     """
     started = now()
     polls = 0
+    baseline: set[str] | None = None
 
     while True:
-        entry = board.read(resource_id)
+        keys = holder_keys(board, resource_id)
         polls += 1
         elapsed = (now() - started).total_seconds()
+        if baseline is None:
+            baseline = set(keys)
+
+        gone = baseline - keys
         audit.append(
             board.root,
             "wait_poll",
             resource=resource_id,
-            held=entry is not None,
+            holders=len(keys),
+            gone=len(gone),
             polls=polls,
             elapsed_s=round(elapsed, 3),
         )
 
-        if entry is None:
+        if not keys:
             audit.append(board.root, "wait_released", resource=resource_id, polls=polls)
-            return WaitResult(released=True, polls=polls, waited_s=elapsed, last=None)
+            return WaitResult(reason=RELEASED, polls=polls, waited_s=elapsed, last=None, holders=0)
+
+        if gone:
+            audit.append(
+                board.root, "wait_shrank", resource=resource_id, polls=polls, gone=len(gone)
+            )
+            return WaitResult(
+                reason=SHRANK,
+                polls=polls,
+                waited_s=elapsed,
+                last=board.read(resource_id),
+                holders=len(keys),
+            )
+
+        # 増えた分は基準に取り込む。増加では起こさないが、その後の減少は検知したい。
+        baseline |= keys
 
         if elapsed >= timeout_s:
             audit.append(
                 board.root, "wait_timeout", resource=resource_id, polls=polls, elapsed_s=elapsed
             )
-            return WaitResult(released=False, polls=polls, waited_s=elapsed, last=entry)
+            return WaitResult(
+                reason=TIMEOUT,
+                polls=polls,
+                waited_s=elapsed,
+                last=board.read(resource_id),
+                holders=len(keys),
+            )
 
         sleep(min(interval_s, max(0.0, timeout_s - elapsed)))

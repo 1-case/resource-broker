@@ -254,6 +254,136 @@ class Board:
         )
         return True
 
+    @property
+    def joins_dir(self) -> Path:
+        """相乗りの申告を置くディレクトリ。
+
+        主宣言（``board/*.json``）とは**別の場所**に置く。同じ場所に混ぜると
+        ``list_all`` が相乗りを主宣言として拾い、資源が二重に載って見える。
+        """
+        return self.entries_dir / "joins"
+
+    def join_path(self, resource_id: str, cwd: str) -> Path:
+        """相乗り申告のパス。作業ディレクトリごとに 1 つ。"""
+        key = naming.safe_filename(f"{resource_id}|{os.path.normcase(cwd)}")
+        return self.joins_dir / f"{key}.json"
+
+    def add_join(self, entry: Entry, cwd: str) -> bool:
+        """相乗りを申告する。同じ作業ディレクトリから二重に申告はできない。
+
+        Notes
+        -----
+        **相乗りしてよいかは判定しない。** 保持者が ``sharing`` に何を書いていようと、
+        本ツールは可否を決めない。可否は当事者の合意事項であり、ここでやるのは
+        「入ったことを見えるようにする」ことだけである。黙って入られるより遥かによい。
+        """
+        path = self.join_path(entry.resource, cwd)
+        try:
+            self.joins_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.audit("join_mkdir_failed", resource=entry.resource, error=str(exc))
+            return False
+
+        payload = json.dumps(entry.to_dict(), ensure_ascii=False, indent=2)
+        try:
+            handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return False
+        except OSError as exc:
+            self.audit("join_failed", resource=entry.resource, error=str(exc))
+            return False
+
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(payload + "\n")
+        except OSError as exc:
+            self.audit("join_write_failed", resource=entry.resource, error=str(exc))
+            self.remove_join(entry.resource, cwd, reason="書き込みに失敗したため取り消した")
+            return False
+
+        self.audit("joined", resource=entry.resource, job=entry.job, cwd=cwd)
+        return True
+
+    def list_joins(self, resource_id: str) -> list[Entry]:
+        """その資源への相乗り申告を読む。読めなかったものは飛ばす。"""
+        try:
+            paths = sorted(self.joins_dir.glob("*.json"))
+        except OSError:
+            return []
+
+        entries: list[Entry] = []
+        for path in paths:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+            entry = Entry.from_dict(data)
+            if entry is not None and entry.resource == resource_id:
+                entries.append(entry)
+        return entries
+
+    def list_all_joins(self) -> list[Entry]:
+        """全ての相乗り申告を読む。資源の一覧を作るときに使う。"""
+        try:
+            paths = sorted(self.joins_dir.glob("*.json"))
+        except OSError:
+            return []
+
+        entries: list[Entry] = []
+        for path in paths:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+            entry = Entry.from_dict(data)
+            if entry is not None:
+                entries.append(entry)
+        return entries
+
+    def remove_join(self, resource_id: str, cwd: str, *, reason: str) -> bool:
+        """自分の相乗り申告を取り下げる。"""
+        try:
+            self.join_path(resource_id, cwd).unlink()
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            self.audit("join_remove_failed", resource=resource_id, error=str(exc))
+            return False
+        self.audit("join_removed", resource=resource_id, cwd=cwd, reason=reason)
+        return True
+
+    def replace(self, entry: Entry, *, reason: str) -> bool:
+        """既存のエントリを差し替える。取得ではなく**更新**である。
+
+        ``try_claim`` と違い ``O_EXCL`` は使わない。ここは資源の取得ではなく、
+        既に持っている宣言の書き換えだからである。取り違えないよう、
+        **資源の取得は ``try_claim`` だけ**が担う。
+
+        書き込み中に他セッションが読んでも壊れた JSON を見ないよう、一時ファイル経由で置換する。
+        """
+        path = self.path_for(entry.resource)
+        try:
+            self.entries_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.audit("update_mkdir_failed", resource=entry.resource, error=str(exc))
+            return False
+
+        payload = json.dumps(entry.to_dict(), ensure_ascii=False, indent=2)
+        temporary = path.with_suffix(f".{os.getpid()}.tmp")
+        try:
+            temporary.write_text(payload + "\n", encoding="utf-8")
+            os.replace(temporary, path)
+        except OSError as exc:
+            self.audit("update_failed", resource=entry.resource, error=str(exc))
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+            return False
+
+        self.audit("updated", resource=entry.resource, reason=reason)
+        return True
+
     def remove(self, resource_id: str, *, reason: str) -> bool:
         """エントリを削除する。存在しなければ False。理由は監査ログに残す。"""
         path = self.path_for(resource_id)
@@ -313,13 +443,13 @@ def build_entry(
         since=clock.now_iso(),
         boot=clock.to_iso(boot) if boot else None,
         observed=_stamp_observed(observed),
-        eta=_build_eta(eta),
+        eta=build_eta(eta),
         usage={"peak": peak, "avg": avg} if (peak or avg) else None,
         sharing=sharing,
     )
 
 
-def _build_eta(text: str) -> dict[str, object] | None:
+def build_eta(text: str) -> dict[str, object] | None:
     """ETA の申告を組み立てる。**時刻の計算は機械が行う。**
 
     申告するのはセッション（LLM）だが、「30 分後は何時か」を LLM に書かせない。

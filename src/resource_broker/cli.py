@@ -23,7 +23,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from . import clock, liveness, naming, platform_info, runner, waiting
-from .board import Board, Entry, build_entry
+from .board import Board, Entry, build_entry, build_eta
 from .liveness import Observation, Verdict
 
 EXIT_OK = 0
@@ -69,19 +69,49 @@ def assess(
     return verdict, entry
 
 
+def _known_resources(board: Board) -> list[str]:
+    """掲示板に載っている資源を列挙する。
+
+    主宣言だけでなく**相乗りだけが残っている資源**も拾う。主宣言が先に解放されて
+    相乗りが残る場合があり、そこを取りこぼすと「誰も使っていない」に見えてしまう。
+    """
+    resources = [entry.resource for entry in board.list_all()]
+    seen = set(resources)
+    for join in board.list_all_joins():
+        if join.resource not in seen:
+            seen.add(join.resource)
+            resources.append(join.resource)
+    return resources
+
+
+def _describe(entry: Entry) -> dict[str, object]:
+    """1 つの宣言を機械可読な形にする。相乗りも同じ形で並べる。"""
+    return {
+        "holder": entry.holder,
+        "job": entry.job,
+        "since": entry.since,
+        "log": entry.log,
+        "observed": entry.observed,
+        "eta": entry.eta,
+        "usage": entry.usage,
+        "sharing": entry.sharing or None,
+    }
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     board = Board(args.home)
     targets = (
-        [naming.normalize(r) for r in args.resource]
-        if args.resource
-        else [entry.resource for entry in board.list_all()]
+        [naming.normalize(r) for r in args.resource] if args.resource else _known_resources(board)
     )
 
     rows = []
     for resource_id in targets:
         verdict, entry = assess(board, resource_id)
+        joins = board.list_joins(resource_id)
         rows.append(
             {
+                "joins": [_describe(join) for join in joins],
+                "holders": (1 if entry else 0) + len(joins),
                 "resource": resource_id,
                 "display": (entry.display if entry else "") or naming.display_default(resource_id),
                 "verdict": str(verdict),
@@ -132,6 +162,27 @@ def _cmd_status(args: argparse.Namespace) -> int:
         if observed.get("note"):
             print(f"{'':<24} 観測   {observed['note']}")
             print(f"{'':<24}        （{observed.get('at', '時刻不明')} 時点の申告）")
+
+        for index, join in enumerate(row["joins"], start=1):
+            holder = join["holder"] or {}
+            print(f"{'':<24} 相乗り{index} {holder.get('session', '?')} / {join['job']}")
+            print(f"{'':<24}        since {join['since']}")
+            join_eta = join["eta"] or {}
+            if join_eta.get("stated"):
+                print(f"{'':<24}        ETA {join_eta['stated']}")
+            join_usage = join["usage"] or {}
+            if join_usage.get("peak") or join_usage.get("avg"):
+                print(
+                    f"{'':<24}        見積 瞬時最大 {join_usage.get('peak') or '-'}"
+                    f" / 平均 {join_usage.get('avg') or '-'}"
+                )
+            if join["log"]:
+                print(f"{'':<24}        log {join['log']}")
+
+        if row["holders"] > 1:
+            print(
+                f"{'':<24} 合計   {row['holders']} 件の宣言（主 1 + 相乗り {row['holders'] - 1}）"
+            )
     return EXIT_OK
 
 
@@ -312,16 +363,24 @@ def _cmd_wait(args: argparse.Namespace) -> int:
     print(f"  {args.interval:g} 秒ごとに確認、上限 {args.timeout:g} 秒。Ctrl+C で中断できます")
 
     try:
-        result = waiting.wait_for_release(
+        result = waiting.wait_for_room(
             board, resource_id, interval_s=args.interval, timeout_s=args.timeout
         )
     except KeyboardInterrupt:
         print("中断しました（宣言はそのままです）", file=sys.stderr)
         return EXIT_INTERRUPTED
 
-    if result.released:
-        print(f"解放されました（{result.polls} 回確認 / {result.waited_s:.0f} 秒）")
+    if result.reason == waiting.RELEASED:
+        print(f"全ての宣言が消えました（{result.polls} 回確認 / {result.waited_s:.0f} 秒）")
         print("使う前にもう一度自分で状態を調べること（解放＝空きとは限らない）")
+        return EXIT_OK
+
+    if result.reason == waiting.SHRANK:
+        print(
+            f"宣言が減りました（残り {result.holders} 件"
+            f" / {result.polls} 回確認 / {result.waited_s:.0f} 秒）"
+        )
+        print("入れるかどうかは自分で調べて判断すること。駄目ならもう一度 rb wait すればよい")
         return EXIT_OK
 
     print(
@@ -386,9 +445,110 @@ def _cmd_history(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _cmd_release(args: argparse.Namespace) -> int:
+def _cmd_join(args: argparse.Namespace) -> int:
+    """相乗りを申告する。
+
+    **相乗りしてよいかは本ツールが決めない。** 保持者が ``--sharing`` に何を書いていようと、
+    可否は当事者の合意事項である。ここでやるのは「入ったことを見えるようにする」ことだけで、
+    黙って入られるより遥かによい。
+
+    保持者の宣言（相乗り可否・見積もり・ログ）を読んだうえで判断すること。
+    """
+    board = Board(args.home)
+    resource_id = naming.normalize(args.res)
+    primary = board.read(resource_id)
+
+    if primary is None:
+        print("その資源に宣言がありません。相乗りではなく rb claim / rb run を使ってください")
+        return EXIT_USAGE
+
+    # claim と違い、`--found busy` でも止めない。相乗りは「使われている」ことが前提だからである。
+
+    cwd = os.getcwd()
+    entry = build_entry(
+        resource_id,
+        job=args.job,
+        display=args.display or "",
+        log=args.log,
+        observed={"note": args.observed, "found": args.found},
+        eta=args.eta,
+        peak=args.peak or "",
+        avg=args.avg or "",
+        sharing=args.sharing or "",
+    )
+    if not board.add_join(entry, cwd):
+        print("既に相乗りを申告しています（同じ作業ディレクトリから二重には申告できません）")
+        return EXIT_OK
+
+    print(f"相乗りを申告しました: {entry.display} / {entry.job}")
+    print(f"  主宣言: {primary.session} / {primary.job}")
+    if primary.sharing:
+        print(f"  保持者の相乗り方針: {primary.sharing}")
+    else:
+        print("  保持者は相乗り可否を書いていません。合意が取れているか確認すること")
+    return EXIT_OK
+
+
+def _cmd_update(args: argparse.Namespace) -> int:
+    """自分の宣言の申告値を書き換える。
+
+    ジョブが進めば見積もりも ETA も変わる。掲示板を実態へ寄せられないと、
+    古い申告が残って他セッションの判断を誤らせる。
+
+    **他者の宣言は書き換えない**（``--force`` を除く）。掲示板は各自の申告の集まりであり、
+    人の申告を勝手に直せると、誰の言葉なのか分からなくなる。
+    """
     board = Board(args.home)
     resource_id = naming.normalize(args.resource)
+    entry = board.read(resource_id)
+
+    if entry is None:
+        print("宣言が見つかりませんでした", file=sys.stderr)
+        return EXIT_USAGE
+
+    holder_cwd = str(entry.holder.get("cwd", "")) if isinstance(entry.holder, dict) else ""
+    if not args.force and os.path.normcase(
+        os.path.normpath(holder_cwd or "?")
+    ) != os.path.normcase(os.path.normpath(os.getcwd())):
+        print(
+            "他セッションの宣言は書き換えられません（--force で上書きできます）", file=sys.stderr
+        )
+        print(f"  宣言者: {entry.session} / {entry.job}", file=sys.stderr)
+        return EXIT_BUSY
+
+    if args.job is not None:
+        entry.holder["job"] = args.job
+    if args.log is not None:
+        entry.log = args.log
+    if args.eta is not None:
+        entry.eta = build_eta(args.eta)
+    if args.peak is not None or args.avg is not None:
+        usage = dict(entry.usage or {})
+        if args.peak is not None:
+            usage["peak"] = args.peak
+        if args.avg is not None:
+            usage["avg"] = args.avg
+        entry.usage = usage
+    if args.sharing is not None:
+        entry.sharing = args.sharing
+
+    if not board.replace(entry, reason="update コマンド"):
+        print("更新に失敗しました（監査ログを参照）", file=sys.stderr)
+        return EXIT_OK
+
+    print(f"更新しました: {entry.display} / {entry.job}")
+    return EXIT_OK
+
+
+def _cmd_release(args: argparse.Namespace) -> int:
+    """自分の宣言を取り下げる。相乗りしていればそちらを先に外す。"""
+    board = Board(args.home)
+    resource_id = naming.normalize(args.resource)
+
+    if board.remove_join(resource_id, os.getcwd(), reason="release コマンド"):
+        print(f"相乗りを取り下げました: {naming.display_default(resource_id)}")
+        return EXIT_OK
+
     if board.remove(resource_id, reason="release コマンド"):
         print(f"解放しました: {naming.display_default(resource_id)}")
     else:
@@ -484,13 +644,44 @@ def build_parser() -> argparse.ArgumentParser:
     _add_declaration_options(run)
     run.set_defaults(func=_cmd_run)
 
+    join = sub.add_parser(
+        "join",
+        help="他者が宣言している資源に相乗りすることを申告する",
+        description=(
+            "既に宣言のある資源へ相乗りすることを掲示板に載せる。"
+            "**相乗りしてよいかは本ツールが決めない**。保持者の相乗り方針を読み、"
+            "合意のうえで使うこと。ここでやるのは「入ったことを見えるようにする」ことだけである。"
+        ),
+    )
+    join.add_argument("--res", required=True, help="資源 ID")
+    _add_declaration_options(join)
+    join.set_defaults(func=_cmd_join)
+
+    update = sub.add_parser(
+        "update",
+        help="自分の宣言を書き換える（見積もりや ETA を実態に合わせる）",
+        description=(
+            "既に出している宣言の申告値を更新する。ジョブが進んで使用量が変わったときに、"
+            "掲示板を実態へ寄せるために使う。"
+        ),
+    )
+    update.add_argument("resource", help="資源 ID")
+    update.add_argument("--job", default=None, help="何をするか（1 行）")
+    update.add_argument("--eta", default=None, help="終わるまでの見込み")
+    update.add_argument("--peak", default=None, help="利用見積もりの瞬時最大")
+    update.add_argument("--avg", default=None, help="利用見積もりの平均")
+    update.add_argument("--sharing", default=None, help="相乗りの可否と条件")
+    update.add_argument("--log", default=None, help="進捗が読めるログのパス")
+    update.add_argument("--force", action="store_true", help="他者の宣言でも書き換える")
+    update.set_defaults(func=_cmd_update)
+
     wait = sub.add_parser(
         "wait",
-        help="資源が解放されるまで待つ",
+        help="資源を宣言している者が減るまで待つ",
         description=(
-            "掲示板から宣言が消えるまでブロックする。ETA では打ち切らない"
-            "（申告であって約束ではない）。打ち切るのは --timeout だけである。"
-            "毎回のポーリングは監査ログに残る。"
+            "宣言の数が減る（誰かが解放する）まで待つ。相乗りが**増えた**ときには起きない"
+            "（資源はさらに詰まっているため）。ETA では打ち切らない（申告であって約束ではない）。"
+            "打ち切るのは --timeout だけである。毎回のポーリングは監査ログに残る。"
         ),
     )
     wait.add_argument("resource", help="資源 ID")
