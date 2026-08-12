@@ -830,16 +830,31 @@ def _release_forced(board: Board, resource_id: str) -> int:
 
 
 def _release_own(board: Board, resource_id: str) -> int:
-    """自分の宣言だけを取り下げる。**主宣言を先に見て、無ければ相乗りを外す。**
+    """自分の宣言だけを取り下げる。見る順序は **完全一致の相乗り → 主宣言 → 祖先の相乗り**。
 
-    順序が逆だと、自分は相乗りしていないのに**祖先から出された他人の相乗り**が
-    ``owns`` を通り（このマシンでは全プロジェクトが 1 つのルートの下にある）、
-    それを消して早期 return する。結果として**他人の申告だけが消え、呼び出し側自身の
-    主宣言は解放されないまま残る**。``rb join`` は主宣言があることを前提とするので
-    「自分が主宣言者かつ相乗り者」は起こり得ず、順序を入れ替えて失うものは無い。
+    この順序は、逆向きの 2 つの誤りを両方避けるために決まっている。どちらも実際に踏んだ。
+
+    **相乗りを祖先まで含めて先に見ると**、自分は相乗りしていないのに祖先から出された
+    他人の申告が ``owns`` を通り（このマシンでは全プロジェクトが 1 つのルートの下にある）、
+    それを消して早期 return する。他人の申告だけが消え、呼び出し側自身の主宣言は残る。
+
+    **主宣言を先に見ると**、今度は逆に、相乗り者の cwd が主宣言者と同じ（または配下）のとき
+    ``owns`` が通り、**他人の主宣言を消してしまう**。``rb join`` は主宣言の存在しか
+    確認しないので「自分が主宣言者かつ相乗り者」は起こり得ないという前提は成立しない。
+    ジョブが走っている最中に宣言だけが消え、資源は掴まれたままになる。
+
+    **完全一致の相乗りには、その曖昧さが無い。** その場所から自分で出した申告であり、
+    かつ定義上「自分の主宣言」ではありえない。だから最初に見てよい。
     """
     cwd = os.getcwd()
     entry = board.read(resource_id)
+
+    if board.join_path(resource_id, cwd).exists():
+        exact = board.remove_own_join(resource_id, cwd, reason="release コマンド")
+        if exact is not None:
+            print(f"相乗りを取り下げました: {naming.display_default(resource_id)}")
+            return EXIT_OK
+
     if entry is not None and board.owns(entry, cwd=cwd):
         return _release_own_primary(board, resource_id, entry)
 
