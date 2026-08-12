@@ -4,6 +4,13 @@
 破損の被害を 1 資源に閉じ込めるためと、``O_EXCL`` による取得競合の解決を
 単純にするためである（DESIGN.md「Architecture」）。
 
+**正しさはロックではなく nonce の compare-and-swap（CAS）が担保する。**
+掲示板を書き換える操作は「期待する nonce と一致するときだけ消す／置く」の形にしてある。
+ロックは競り合いを減らすための性能最適化であり、取れても取れなくても正しさは変わらない
+（DESIGN.md「Per-Resource Lock」）。ロックを主防御に据えると、ロックが外れた瞬間だけ
+排他が消えるという最悪の相関を持つことになる。Windows では、競合が激しいときほど
+``O_EXCL`` が ``PermissionError`` になりやすく、この相関は現実に起こる。
+
 本モジュールの全ての公開関数は**例外を投げない**。読めない・書けない・壊れているは
 すべて「情報が無い」に畳み込み、呼び出し側が fail-open で通せるようにする。
 握りつぶした事実は監査ログに残す。
@@ -18,7 +25,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 
@@ -48,6 +55,14 @@ LOCK_STALE_S = 30.0
 UNLINK_ATTEMPTS = 4
 UNLINK_DELAY_S = 0.05
 
+#: 相乗りを「再起動をまたいだ幽霊」とみなすときの余裕（秒）。
+#:
+#: 判定は ``since < boot - この余裕`` で行う。``boot`` は起動からの経過時間から
+#: 逆算した値なので、NTP が時計を**前方**へ飛ばすと、直前に出したばかりの相乗りが
+#: 起動時刻より前に見えることがある。余裕を取っておけばその窓がゼロになる。
+#: コストは「再起動直後の 1 分間だけ掃除が遅れる」ことだけである。
+JOIN_BOOT_MARGIN_S = 60.0
+
 
 class LockState(StrEnum):
     """ロックの取得結果。
@@ -56,6 +71,9 @@ class LockState(StrEnum):
     （CLAUDE.md「Fail-Open」）。2 値にすると「ロックのディレクトリが作れない」
     という本ツール側の故障が「他セッションが使用中」に化け、掲示板が壊れた瞬間に
     全セッションの取得が止まる。
+
+    どの値が返っても**正しさは変わらない**。書き換えは nonce の CAS で守ってあり、
+    ロックは競り合いを減らすだけだからである。
     """
 
     ACQUIRED = "acquired"
@@ -83,6 +101,32 @@ class RemovalResult(StrEnum):
     FAILED = "failed"
 
 
+class UpdateResult(StrEnum):
+    """置換の結果。
+
+    **競合（nonce 不一致）と I/O 失敗を分ける。** 畳むと「読んでから書くまでに宣言が
+    変わった可能性」という説明が共有違反にも付き、**I/O の失敗を競合として説明する**
+    ことになる。本コードベースが他所で戒めているのと同じ誤りである。
+    """
+
+    REPLACED = "replaced"
+    CONFLICT = "conflict"
+    FAILED = "failed"
+
+
+class MoveResult(StrEnum):
+    """ファイル移動の結果。CAS の「捕まえる」「戻す」で使う。"""
+
+    MOVED = "moved"
+    ABSENT = "absent"
+    """元のファイルが無い。**他の誰かが先に動かした**（＝競争に負けた）。"""
+
+    BLOCKED = "blocked"
+    """宛先が既にある。"""
+
+    FAILED = "failed"
+
+
 def _unlink_with_retry(path: Path) -> tuple[RemovalResult, str]:
     """ファイルを消す。共有違反は数回やり直す。
 
@@ -103,6 +147,62 @@ def _unlink_with_retry(path: Path) -> tuple[RemovalResult, str]:
             continue
         return RemovalResult.REMOVED, ""
     return RemovalResult.FAILED, "削除を諦めた"
+
+
+def _rename_with_retry(source: Path, target: Path) -> tuple[MoveResult, str]:
+    """ファイルの名前を変える。共有違反は数回やり直す。
+
+    ``os.rename`` は**元のファイルを 1 人だけが取れる**（成功した瞬間に元の名前は
+    消えるので、同時に走った他方は ``FileNotFoundError`` になる）。CAS の「捕まえる」
+    段階はこの性質だけで成立し、ロックを必要としない。
+
+    Returns
+    -------
+    tuple of (MoveResult, str)
+        結果と、失敗したときの理由。
+    """
+    for attempt in range(UNLINK_ATTEMPTS):
+        try:
+            os.rename(source, target)
+        except FileNotFoundError:
+            return MoveResult.ABSENT, ""
+        except FileExistsError:
+            return MoveResult.BLOCKED, ""
+        except OSError as exc:
+            if attempt == UNLINK_ATTEMPTS - 1:
+                return MoveResult.FAILED, str(exc)
+            time.sleep(UNLINK_DELAY_S)
+            continue
+        return MoveResult.MOVED, ""
+    return MoveResult.FAILED, "移動を諦めた"
+
+
+def _replace_with_retry(source: Path, target: Path) -> tuple[bool, str]:
+    """一時ファイルを本体へ置き換える。共有違反は数回やり直す。
+
+    ``unlink`` と同じ理由でやり直す。フックが**全セッションの全プロンプト**で掲示板を
+    読むため、Windows では置換が共有違反で失敗しうる。1 回で諦めると、更新が
+    「読んでから書くまでに宣言が変わった」という**事実と違う説明**で落ちる。
+    """
+    for attempt in range(UNLINK_ATTEMPTS):
+        try:
+            os.replace(source, target)
+        except OSError as exc:
+            if attempt == UNLINK_ATTEMPTS - 1:
+                return False, str(exc)
+            time.sleep(UNLINK_DELAY_S)
+            continue
+        return True, ""
+    return False, "置換を諦めた"
+
+
+def _read_entry_at(path: Path) -> Entry | None:
+    """パスを指定して Entry を読む。読めない・壊れていれば None。"""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    return Entry.from_dict(data)
 
 
 #: 読み取り時に既知として扱うキー。これ以外は extra に退避して書き戻す（前方互換）。
@@ -275,11 +375,15 @@ class Board:
 
     @contextmanager
     def locked(self, resource_id: str, *, wait_s: float = LOCK_WAIT_S) -> Iterator[LockState]:
-        """取得の排他区間を守る。
+        """書き換えの区間を囲う。**これは性能最適化であって、安全性の主防御ではない。**
 
-        ``O_EXCL`` が守るのは**ファイルの作成**だけである。「読んで、幽霊なら消して、作る」
-        という手順の途中は無防備で、2 つのセッションが同じ幽霊を見て両方とも成功しうる。
-        これは本ツールが防ぐと宣言している事故そのものなので、区間ごと囲う。
+        「読んで、幽霊なら退けて、作る」の途中は ``O_EXCL`` では守れない。囲えば
+        同じ幽霊を 2 人が見る場面自体が減るので、無駄な往復が減る。しかし
+        **囲えなくても正しさは変わらない**。掲示板の書き換えは nonce の CAS
+        （:meth:`remove_if_nonce` / :meth:`replace`）で守ってあり、ロックが外れた瞬間だけ
+        排他が消えるということは無い。ロックを主防御に据えると、Windows で
+        「競合が激しいときほど ``O_EXCL`` が ``PermissionError`` になる」という
+        最悪の相関を抱えることになる。
 
         結果は 3 値で渡す（:class:`LockState`）。**インフラの故障と資源の競合を
         混同しない**（CLAUDE.md「Fail-Open」）。呼び出し側が取得を諦めてよいのは
@@ -325,8 +429,21 @@ class Board:
                     break
                 time.sleep(UNLINK_DELAY_S)
                 continue
+            except PermissionError as exc:
+                # **共有違反を即座に「ロックが使えない」に落とさない。** Windows では、
+                # 削除待ち（delete-pending）のファイルや、他プロセス（AV スキャナを含む）が
+                # 掴んでいるファイルへの O_EXCL が FileExistsError ではなく
+                # PermissionError になる。これは競合が激しいときほど起きやすいため、
+                # 即座に諦めると**最も競り合っている瞬間にロックが外れる**。
+                # deadline まではやり直し、時間切れになって初めて使えないとみなす。
+                if time.monotonic() >= deadline:
+                    self.audit("lock_failed", resource=resource_id, error=str(exc))
+                    state = LockState.UNAVAILABLE
+                    break
+                time.sleep(UNLINK_DELAY_S)
+                continue
             except OSError as exc:
-                # 権限・ディスク一杯・共有違反。**これは競合ではない**。
+                # ディスク一杯・パスが作れない等。やり直しても結果は変わらない。
                 self.audit("lock_failed", resource=resource_id, error=str(exc))
                 state = LockState.UNAVAILABLE
                 break
@@ -379,16 +496,21 @@ class Board:
         return True
 
     def _release_lock(self, path: Path, token: str, resource_id: str) -> None:
-        """自分が取ったロックだけを返す。
+        """自分が取ったロックだけを返す。**自分が書いたトークンと一致するときだけ**消す。
 
         保持が ``LOCK_STALE_S`` を超えると他プロセスに奪われる。奪われたあとに無条件で
-        ``unlink`` すると、**他人のロックを消す**ことになる。トークンが一致するときだけ消す。
-        中身が空のときは自分が作って書けなかった場合なので、自分のものとして扱う。
+        ``unlink`` すると、**他人のロックを消す**ことになる。
+
+        **空は「自分のものではない」に倒す。** ``locked`` は ``os.open`` と
+        ``os.write(token)`` の間、ロックファイルが空である。奪われた旧保持者がその窓で
+        ここへ来ると、空を自分のものとみなして**新しい保持者のロックを消す**。
+        自分が書けなかったロックは 30 秒後に steal で回収されるので、失うもの
+        （30 秒だけ残る）より守るもの（他人のロックを消さない）が大きい。
         """
         current = self._read_lock_token(path)
         if current is None:
             return  # 既に無い、または読めない。触らない
-        if current not in ("", token):
+        if current != token:
             self.audit("lock_release_skipped", resource=resource_id)
             return
         _unlink_with_retry(path)
@@ -443,17 +565,97 @@ class Board:
             return _is_within(cwd, declared)
         return False
 
+    def remove_if_nonce(
+        self, resource_id: str, *, expect_nonce: str, reason: str
+    ) -> RemovalResult:
+        """**期待する nonce と一致するときだけ**消す（compare-and-swap）。
+
+        無条件の ``unlink`` は、読んだエントリと消すエントリが同じである保証を持たない。
+        A と B が同じ幽霊を見て、A が「消して取る」に成功した直後に B が消すと、
+        **B は A の生きた宣言を消して**自分も取得に成功する。掲示板が防ぐと宣言している
+        二重取得そのものである。ロックで囲っても、ロックが外れた瞬間だけこの穴が開く。
+
+        そこで削除を条件付きにする。手順は 3 段で、正しさは 2 段目の**原子性**に乗る。
+
+        1. 安く先読みして、明らかに別物なら何も動かさずに諦める
+        2. ``os.rename`` で一時名へ**捕まえる**。成功できるのは 1 人だけである
+           （成功した瞬間に元の名前は消えるので、同時に走った他方は「無い」になる）
+        3. 捕まえた中身の nonce を確かめ、一致すれば消す。違えば**元へ戻す**
+
+        Returns
+        -------
+        RemovalResult
+            消した / 無かった / 別物だった / 消せなかった。
+        """
+        path = self.path_for(resource_id)
+
+        # 1. 先読み。ここで弾ければファイルを動かさずに済み、戻す処理も走らない。
+        current = self.read(resource_id)
+        if current is None:
+            return RemovalResult.ABSENT
+        if current.nonce != expect_nonce:
+            self.audit("remove_refused", resource=resource_id, reason="nonce が一致しない")
+            return RemovalResult.NOT_OWNED
+
+        # 2. 捕まえる。ここだけが排他の根拠であり、ロックの有無に依存しない。
+        tombstone = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.taken")
+        moved, error = _rename_with_retry(path, tombstone)
+        if moved is MoveResult.ABSENT:
+            return RemovalResult.ABSENT
+        if moved is not MoveResult.MOVED:
+            self.audit("remove_failed", resource=resource_id, error=error)
+            return RemovalResult.FAILED
+
+        # 3. 捕まえた中身を確かめる。先読みとの間に入れ替わっていたら戻す。
+        captured = _read_entry_at(tombstone)
+        if captured is None or captured.nonce != expect_nonce:
+            self._restore(tombstone, path, resource_id)
+            self.audit("remove_refused", resource=resource_id, reason="捕まえた宣言が別物だった")
+            return RemovalResult.NOT_OWNED
+
+        result, error = _unlink_with_retry(tombstone)
+        if result is RemovalResult.FAILED:
+            # 掲示板からは既に消えている（名前を外した）。残骸は掲示板に載らない名前なので
+            # 実害は無いが、消せなかった事実は残す。
+            self.audit("tombstone_left", resource=resource_id, error=error)
+        self.audit("removed", resource=resource_id, reason=reason)
+        return RemovalResult.REMOVED
+
+    def _restore(self, tombstone: Path, path: Path, resource_id: str) -> None:
+        """捕まえたエントリを元の名前へ戻す。
+
+        戻せるのは、その間に誰も新しい宣言を作っていないときだけである。``os.link``
+        を使うのは、宛先があるときに**必ず失敗する**からである（``os.rename`` は
+        POSIX では黙って上書きする）。既に新しい宣言があるなら、捕まえた側は
+        既に退けられた古い宣言なので破棄してよい。
+        """
+        try:
+            os.link(tombstone, path)
+        except FileExistsError:
+            self.audit("restore_dropped", resource=resource_id, reason="新しい宣言が既にある")
+            _unlink_with_retry(tombstone)
+            return
+        except OSError:
+            # ハードリンクが使えないファイルシステム。上書きの危険を承知で戻す
+            # （戻さなければ宣言が消えたままになり、そちらのほうが有害である）。
+            moved, error = _rename_with_retry(tombstone, path)
+            if moved is not MoveResult.MOVED:
+                self.audit("restore_failed", resource=resource_id, error=error)
+            return
+        _unlink_with_retry(tombstone)
+
     def remove_if_owned(
         self, resource_id: str, *, reason: str, nonce: str | None = None, cwd: str | None = None
     ) -> RemovalResult:
         """自分の宣言であるときだけ削除する。
 
-        「読んで、所有を確かめて、消す」までが 1 つの操作である。nonce の照合は
-        **読んだ瞬間の話**でしかないため、途中で他セッションが ``claim --force`` で
-        取り直すと新しい宣言を消しうる。区間ごとロックで囲う。
+        「読んで、所有を確かめて、消す」までが 1 つの操作である。nonce を持つ宣言は
+        :meth:`remove_if_nonce` の CAS で消すため、読んでから消すまでに他セッションが
+        ``claim --force`` で取り直しても**新しい宣言を消さない**。ロックは競り合いを
+        減らすために掛けるだけで、取れなくても正しさは変わらない。
 
         ロックが取れないときは**囲わずに続行する**。解放できずに宣言を残すほうが有害
-        （幽霊が資源を占有し続ける）であり、所有者照合という主防御は失われないためである。
+        （幽霊が資源を占有し続ける）であり、CAS という主防御は失われないためである。
         ロック無しで消したことは監査ログに残す。
 
         Returns
@@ -471,6 +673,9 @@ class Board:
             if not self.owns(entry, nonce=nonce, cwd=cwd):
                 self.audit("remove_refused", resource=resource_id, reason="他者の宣言のため")
                 return RemovalResult.NOT_OWNED
+            if entry.nonce:
+                return self.remove_if_nonce(resource_id, expect_nonce=entry.nonce, reason=reason)
+            # nonce を持たない古いエントリ。照合できる値が無いので従来どおり消す。
             return self.remove_detailed(resource_id, reason=reason)
 
     def list_all(self) -> list[Entry]:
@@ -633,6 +838,10 @@ class Board:
             return []
 
         boot = platform_info.boot_time()
+        # **境界に余裕を持たせる。** boot は起動からの経過時間から逆算した値なので、
+        # NTP が時計を前方へ飛ばすと、直前に出したばかりの相乗りが起動より前に見える。
+        # 1 分引いておけばその窓がゼロになる。失うのは再起動直後の掃除の遅れだけである。
+        cutoff = boot - timedelta(seconds=JOIN_BOOT_MARGIN_S) if boot is not None else None
         loaded: list[tuple[Path, Entry]] = []
         for path in paths:
             try:
@@ -643,7 +852,7 @@ class Board:
             if entry is None:
                 continue
             since = entry.since_dt
-            if boot is not None and since is not None and since < boot:
+            if cutoff is not None and since is not None and since < cutoff:
                 self.audit("join_stale_removed", resource=entry.resource, since=entry.since)
                 _unlink_with_retry(path)
                 continue
@@ -671,21 +880,44 @@ class Board:
     def remove_own_join(self, resource_id: str, cwd: str, *, reason: str) -> bool:
         """自分の相乗り申告を取り下げる。
 
-        照合は主宣言（:meth:`owns`）と**同じ規則**にする。パスの完全一致にすると、
+        照合は主宣言（:meth:`owns`）と**同じ規則**にする。パスの完全一致だけにすると、
         申告したときと違うディレクトリから ``release`` したときに
         ``join_path`` のキーが変わって自分の申告を外せない。主宣言は祖先関係を
         許すのに相乗りだけ完全一致、という非対称は使う側から見て説明できない。
+
+        ただし**完全一致を先に試す**。祖先関係だけで選ぶと、宣言者の cwd が自分の
+        祖先でありさえすればどれでも一致するため、ハブのルートから出された**他人の**
+        相乗りを配下の全セッションが外せてしまう。祖先候補が複数あるときは
+        ``declared_cwd`` が最長（＝最も自分に近い）ものを選ぶ。同じ理由で、
+        自分がまさにその場所から出した申告があるなら、それ以外を選ぶ理由は無い。
         """
-        for path, entry in self._load_joins():
-            if entry.resource != resource_id or not self.owns(entry, cwd=cwd):
-                continue
-            result, error = _unlink_with_retry(path)
-            if result is RemovalResult.FAILED:
-                self.audit("join_remove_failed", resource=resource_id, error=error)
-                return False
-            if result is RemovalResult.REMOVED:
-                self.audit("join_removed", resource=resource_id, cwd=cwd, reason=reason)
-                return True
+        exact = self.join_path(resource_id, cwd)
+        candidates = [
+            (path, entry)
+            for path, entry in self._load_joins()
+            if entry.resource == resource_id and self.owns(entry, cwd=cwd)
+        ]
+        chosen: Path | None = None
+        for path, _entry in candidates:
+            if path == exact:
+                chosen = path
+                break
+        if chosen is None and candidates:
+            # 最も近い祖先を選ぶ。declared_cwd が長いほど自分に近い。
+            path, _entry = max(
+                candidates, key=lambda item: len(str(item[1].holder.get("cwd") or ""))
+            )
+            chosen = path
+        if chosen is None:
+            return False
+
+        result, error = _unlink_with_retry(chosen)
+        if result is RemovalResult.FAILED:
+            self.audit("join_remove_failed", resource=resource_id, error=error)
+            return False
+        if result is RemovalResult.REMOVED:
+            self.audit("join_removed", resource=resource_id, cwd=cwd, reason=reason)
+            return True
         return False
 
     def remove_joins(self, resource_id: str, *, reason: str) -> int:
@@ -706,7 +938,9 @@ class Board:
                 self.audit("join_remove_failed", resource=resource_id, error=error)
         return removed
 
-    def replace(self, entry: Entry, *, reason: str, expect_nonce: str | None = None) -> bool:
+    def replace(
+        self, entry: Entry, *, reason: str, expect_nonce: str | None = None
+    ) -> UpdateResult:
         """既存のエントリを差し替える。取得ではなく**更新**である。
 
         ``try_claim`` と違い ``O_EXCL`` は使わない。ここは資源の取得ではなく、
@@ -722,36 +956,52 @@ class Board:
             ``since`` では照合しない。秒精度なので、同じ秒に解放と再取得が起きると
             別の宣言を同じものと誤認する（テストで実際に踏んだ）。
 
-        書き込み中に他セッションが読んでも壊れた JSON を見ないよう、一時ファイル経由で置換する。
+        Returns
+        -------
+        UpdateResult
+            置いた / nonce が一致しなかった / 書けなかった。**競合と I/O 失敗を畳まない。**
+            畳むと共有違反にまで「宣言が変わった可能性」という説明が付く。
+
+        Notes
+        -----
+        削除（:meth:`remove_if_nonce`）と違い、ここでは「捕まえてから確かめる」形を採らない。
+        捕まえた直後にプロセスが死ぬと**宣言そのものが消える**からである。宣言が消えれば
+        資源は空きに見え、他セッションが取りにくる。更新が守るのは自分の申告値であって
+        所有権の移動ではないため、失うものの大きさが釣り合わない。
+        したがってここは「読んで確かめてから原子的に置く」に留め、読みと置きの間の
+        極小の窓は既知の残余として受け入れる。
         """
         if expect_nonce is not None:
             current = self.read(entry.resource)
             if current is None or current.nonce != expect_nonce:
                 self.audit("update_conflict", resource=entry.resource, expected=expect_nonce)
-                return False
+                return UpdateResult.CONFLICT
 
         path = self.path_for(entry.resource)
         try:
             self.entries_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             self.audit("update_mkdir_failed", resource=entry.resource, error=str(exc))
-            return False
+            return UpdateResult.FAILED
 
+        # 書き込み中に他セッションが読んでも壊れた JSON を見ないよう、一時ファイル経由で置換する。
         payload = json.dumps(entry.to_dict(), ensure_ascii=False, indent=2)
         temporary = path.with_suffix(f".{os.getpid()}.tmp")
         try:
             temporary.write_text(payload + "\n", encoding="utf-8")
-            os.replace(temporary, path)
         except OSError as exc:
-            self.audit("update_failed", resource=entry.resource, error=str(exc))
-            try:
-                temporary.unlink()
-            except OSError:
-                pass
-            return False
+            self.audit("update_write_failed", resource=entry.resource, error=str(exc))
+            _unlink_with_retry(temporary)
+            return UpdateResult.FAILED
+
+        replaced, error = _replace_with_retry(temporary, path)
+        if not replaced:
+            self.audit("update_failed", resource=entry.resource, error=error)
+            _unlink_with_retry(temporary)
+            return UpdateResult.FAILED
 
         self.audit("updated", resource=entry.resource, reason=reason)
-        return True
+        return UpdateResult.REPLACED
 
     def remove(self, resource_id: str, *, reason: str) -> bool:
         """エントリを削除する。消せたときだけ True。理由は監査ログに残す。

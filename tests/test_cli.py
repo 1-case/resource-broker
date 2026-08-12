@@ -213,3 +213,54 @@ def test_status_without_arguments_lists_only_declared_resources(
     resources = json.loads(capsys.readouterr().out)["resources"]
 
     assert [row["display"] for row in resources] == ["COM3"]
+
+
+def test_wait_does_not_report_release_when_only_joins_remain(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """相乗りだけが残った資源で「既に解放されています」と答えない。
+
+    入口の判定が主宣言しか見ていないと、**実際に使っている者がいるのに解放と報告する**。
+    本体（``wait_for_room``）は主宣言と相乗りの両方を数えているので、入口だけが古い基準だった。
+    """
+    from resource_broker.board import Board, build_entry
+    from resource_broker.naming import normalize
+
+    board = Board(tmp_path)
+    resource = normalize("GPU0")
+    place = "C:\\works\\theirs"
+    assert board.add_join(build_entry(resource, job="相乗りのジョブ", cwd=place), place)
+    capsys.readouterr()
+
+    code = run(tmp_path, "wait", "GPU0", "--interval", "0", "--timeout", "0")
+    captured = capsys.readouterr()
+
+    assert code == 1  # まだ使用中である
+    assert "既に解放されています" not in captured.out
+    assert "待機します" in captured.out
+
+
+def test_wait_returns_when_nothing_holds_the_resource(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """主宣言も相乗りも無ければ即座に戻る。"""
+    assert run(tmp_path, "wait", "GPU0") == 0
+    assert "既に解放されています" in capsys.readouterr().out
+
+
+def test_an_interrupted_command_is_not_reported_as_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Ctrl+C を「使用中」と区別できる終了コードで返す。
+
+    ``EXIT_BUSY`` は 1 なので、traceback で 1 が返ると呼び出し側から資源の競合と
+    区別できない。シェルの慣習どおり 130 を返す。
+    """
+
+    def interrupt(*_args: object, **_kwargs: object) -> int:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("resource_broker.cli._cmd_claim", interrupt)
+
+    assert claim(tmp_path, "GPU0", "学習") == 130
+    assert "中断しました" in capsys.readouterr().err

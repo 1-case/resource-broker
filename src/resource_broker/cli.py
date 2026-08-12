@@ -24,7 +24,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import clock, liveness, naming, platform_info, runner, waiting
-from .board import Board, Entry, LockState, RemovalResult, build_entry, build_eta
+from .board import (
+    Board,
+    Entry,
+    LockState,
+    RemovalResult,
+    UpdateResult,
+    build_entry,
+    build_eta,
+)
 from .liveness import Observation, Verdict
 
 EXIT_OK = 0
@@ -263,33 +271,30 @@ def acquire(
         print(f"  観測  : {observation.note}", file=sys.stderr)
         return Acquisition(None, EXIT_BUSY)
 
-    # 「読んで、幽霊なら退けて、作る」を排他区間にする。O_EXCL が守るのは作成だけで、
-    # この手順の途中は無防備である。2 つのセッションが同じ幽霊を見て両方成功しうる。
-    with board.locked(resource_id) as lock:
+    # **排他区間の中で I/O をしない。** ここで stderr へ直接書くと、パイプが詰まったときに
+    # ロックを 30 秒以上保持し、他セッションに steal される。文言は溜めて区間の外で出す。
+    notices: list[str] = []
+
+    def under_lock(lock: LockState) -> Acquisition:
+        """ロックを保持したまま行う判断。**正しさはロックではなく CAS に乗る。**"""
         # **インフラの故障と資源の競合を混同しない**（CLAUDE.md「Fail-Open」）。
         # 諦めてよいのは競合（他セッションが保持していた）のときだけである。
         # ロックの仕組みそのものが使えないのは本ツール側の故障であり、そこで止めると
-        # 掲示板が壊れた瞬間に全セッションの取得が止まる。O_EXCL 一本で続行する。
+        # 掲示板が壊れた瞬間に全セッションの取得が止まる。
         if lock is LockState.CONTENDED:
-            print(
-                "他のセッションが同じ資源を操作中です。少し待って再試行してください",
-                file=sys.stderr,
-            )
+            notices.append("他のセッションが同じ資源を操作中です。少し待って再試行してください")
             return Acquisition(None, EXIT_BUSY)
         if lock is LockState.UNAVAILABLE:
-            print(
-                "[rb] ロックが使えないため排他を弱めて続行します（監査ログを参照）",
-                file=sys.stderr,
-            )
+            notices.append("[rb] ロックが使えないため排他を弱めて続行します（監査ログを参照）")
 
         verdict, entry = assess(board, resource_id, observation)
 
         if entry is not None and not liveness.is_free(verdict) and not force:
-            print(f"使用中のため宣言できません: {liveness.explain(verdict)}", file=sys.stderr)
-            print(f"  宣言者: {entry.session} / {entry.job}", file=sys.stderr)
-            print(f"  since : {entry.since}", file=sys.stderr)
+            notices.append(f"使用中のため宣言できません: {liveness.explain(verdict)}")
+            notices.append(f"  宣言者: {entry.session} / {entry.job}")
+            notices.append(f"  since : {entry.since}")
             if entry.log:
-                print(f"  log   : {entry.log}", file=sys.stderr)
+                notices.append(f"  log   : {entry.log}")
             return Acquisition(None, EXIT_BUSY)
 
         # **相乗りがいることは知らせるが、止めない。** 主宣言の枠が空いていることと、
@@ -297,17 +302,23 @@ def acquire(
         # （CLAUDE.md「Resource Agnosticism」/ DESIGN.md「Sharing」）。
         joins = board.list_joins(resource_id)
         if joins:
-            print(
+            notices.append(
                 f"[rb] この資源には相乗りが {len(joins)} 件あります"
-                "（主宣言の枠は空いています。可否は当事者で決めること）",
-                file=sys.stderr,
+                "（主宣言の枠は空いています。可否は当事者で決めること）"
             )
-            for join in joins:
-                print(f"  相乗り: {join.session} / {join.job}", file=sys.stderr)
+            notices.extend(f"  相乗り: {join.session} / {join.job}" for join in joins)
 
         if entry is not None:
+            # **読んだ宣言と一致するときだけ消す（CAS）。** 無条件に消すと、ロックが
+            # 外れている間に A と B が同じ幽霊を見たとき、A が取り直した直後に B が
+            # **A の生きた宣言を消して**両方とも取得に成功する。二重取得そのものである。
             reason = "強制取得" if force else f"幽霊と判定した（{liveness.explain(verdict)}）"
-            board.remove(resource_id, reason=reason)
+            removal = board.remove_if_nonce(resource_id, expect_nonce=entry.nonce, reason=reason)
+            if removal not in (RemovalResult.REMOVED, RemovalResult.ABSENT):
+                # ABSENT は「読んだ直後に誰かが消した」であり、枠は空いている。
+                # 先着は次の try_claim（O_EXCL）が決めるのでそのまま進んでよい。
+                notices.append(_explain_failed_displacement(removal))
+                return Acquisition(None, EXIT_BUSY)
 
         new_entry = build_entry(
             resource_id,
@@ -325,18 +336,46 @@ def acquire(
             # 誰かが先に取ったのか、掲示板が書けないのかを見分ける。
             current = board.read(resource_id)
             if current is not None:
-                print("ほぼ同時に他セッションが宣言しました", file=sys.stderr)
-                print(f"  宣言者: {current.session} / {current.job}", file=sys.stderr)
+                notices.append("ほぼ同時に他セッションが宣言しました")
+                notices.append(f"  宣言者: {current.session} / {current.job}")
                 return Acquisition(None, EXIT_BUSY)
+            if board.path_for(resource_id).exists():
+                # ファイルはあるのに読めない = 壊れたエントリが居座っている。放っておくと
+                # status に出ず、wait は即座に解放と答え、claim は永久に失敗する。
+                # **人間がファイルを手で消すしか回復手段が無い状態を作らない。**
+                notices.append(
+                    "[rb] 壊れたエントリが居座っています（読めないファイルが掲示板にあります）"
+                )
+                notices.append(
+                    f"  掃除: rb release {resource_id} --force（そのあと改めて claim すること）"
+                )
+                return Acquisition(new_entry, EXIT_OK, declared=False)
             # 掲示板に書けない。**これは資源の競合ではない**ので通す（fail-open）。
             # ただし宣言は残っていないので、呼び出し側が嘘を言わないよう declared=False。
-            print(
-                "[rb] 宣言を掲示板に残せませんでした（監査ログを参照）。作業は止めません",
-                file=sys.stderr,
+            notices.append(
+                "[rb] 宣言を掲示板に残せませんでした（監査ログを参照）。作業は止めません"
             )
             return Acquisition(new_entry, EXIT_OK, declared=False)
 
-    return Acquisition(new_entry, EXIT_OK, declared=True)
+        return Acquisition(new_entry, EXIT_OK, declared=True)
+
+    with board.locked(resource_id) as lock:
+        result = under_lock(lock)
+
+    for line in notices:
+        print(line, file=sys.stderr)
+    return result
+
+
+def _explain_failed_displacement(removal: RemovalResult) -> str:
+    """幽霊を退けられなかった理由を 1 行で説明する。
+
+    **「消せなかった」を「他人が取った」と混ぜない。** 対処が違う（前者は掲示板の掃除、
+    後者は待機）。どちらの場合も取得は諦める。
+    """
+    if removal is RemovalResult.FAILED:
+        return "退けようとした宣言を消せませんでした（掲示板に残っています。監査ログを参照）"
+    return "退けようとした宣言が入れ替わりました（他セッションが先に取り直した可能性）"
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
@@ -474,18 +513,28 @@ def _cmd_wait(args: argparse.Namespace) -> int:
     board = Board(args.home)
     resource_id = naming.normalize(args.resource)
 
-    entry = board.read(resource_id)
-    if entry is None:
+    # **入口の基準を本体（wait_for_room）とそろえる。** 主宣言だけを見ると、
+    # 相乗りだけが残った資源で「既に解放されています」と答えてしまう。
+    # 実際に使っている者がいるのに解放と報告するのが最も危ない誤りである。
+    if not waiting.holder_keys(board, resource_id):
         print(f"既に解放されています: {naming.display_default(resource_id)}")
         return EXIT_OK
 
-    print(f"待機します: {entry.display} <- {entry.session} / {entry.job}")
-    if entry.eta:
-        stated = entry.eta.get("stated") if isinstance(entry.eta, dict) else None
-        at = entry.eta.get("at") if isinstance(entry.eta, dict) else None
-        print(f"  ETA   {stated}{f'（{at} 頃）' if at else ''}  ※申告であって約束ではない")
-    if entry.log:
-        print(f"  log   {entry.log}")
+    entry = board.read(resource_id)
+    if entry is None:
+        joins = board.list_joins(resource_id)
+        print(
+            f"待機します: {naming.display_default(resource_id)}"
+            f" <- 相乗り {len(joins)} 件（主宣言は無し）"
+        )
+    else:
+        print(f"待機します: {entry.display} <- {entry.session} / {entry.job}")
+        if entry.eta:
+            stated = entry.eta.get("stated") if isinstance(entry.eta, dict) else None
+            at = entry.eta.get("at") if isinstance(entry.eta, dict) else None
+            print(f"  ETA   {stated}{f'（{at} 頃）' if at else ''}  ※申告であって約束ではない")
+        if entry.log:
+            print(f"  log   {entry.log}")
     print(f"  {args.interval:g} 秒ごとに確認、上限 {args.timeout:g} 秒。Ctrl+C で中断できます")
 
     try:
@@ -679,9 +728,21 @@ def _update_locked(board: Board, resource_id: str, args: argparse.Namespace) -> 
     if args.sharing is not None:
         entry.sharing = args.sharing
 
-    if not board.replace(entry, reason="update コマンド", expect_nonce=expect_nonce or None):
-        print("更新に失敗しました（読んでから書くまでに宣言が変わった可能性）", file=sys.stderr)
+    # **競合と I/O 失敗を別の文言で伝える。** 畳むと、共有違反で書けなかっただけなのに
+    # 「宣言が変わった」という事実と違う説明になり、読んだ側が誤った対処をする。
+    result = board.replace(entry, reason="update コマンド", expect_nonce=expect_nonce or None)
+    if result is UpdateResult.CONFLICT:
+        print(
+            "更新をやめました: 読んでから書くまでに宣言が入れ替わりました"
+            "（他セッションが取り直した可能性）",
+            file=sys.stderr,
+        )
         return EXIT_BUSY
+    if result is UpdateResult.FAILED:
+        # 掲示板に書けないのは**インフラの故障**であり、資源の競合ではない。
+        # ここを 1 に倒すと、掲示板が壊れた瞬間に呼び出し側が「使用中」と読む。
+        print("更新できませんでした（掲示板に書けません。監査ログを参照）", file=sys.stderr)
+        return EXIT_OK
 
     print(f"更新しました: {entry.display} / {entry.job}")
     return EXIT_OK
@@ -717,31 +778,37 @@ def _release_forced(board: Board, resource_id: str) -> int:
     主宣言だけ消せても、残った相乗りが資源を「使用中」に固定し続ける。
     そうなると ``rb wait`` は二度と戻らず、フックは全セッションに出し続ける。
     強制解放は最後の掃除手段なので、掃除しきれなければ意味がない。
+
+    **読めるかどうかを削除の条件にしない。** 以前は ``read`` が None なら消さずに
+    「見つかりませんでした」と答えていたため、JSON が壊れたエントリを消せなかった。
+    壊れたファイルは ``status`` に出ず、``wait`` は即座に解放と答え、``claim`` は
+    ``O_EXCL`` で永久に失敗する。**その資源について掲示板が恒久的に機能停止し、
+    人間がファイルを手で消すしか回復手段が無くなる**。強制解放は最後の手段なので、
+    読めないものこそ消せなければならない。
     """
-    primary = (
-        board.remove_detailed(resource_id, reason="release コマンド（強制）")
-        if board.read(resource_id) is not None
-        else RemovalResult.ABSENT
-    )
+    primary = board.remove_detailed(resource_id, reason="release コマンド（強制）")
     removed_joins = board.remove_joins(resource_id, reason="release コマンド（強制）")
-    removed_primary = primary is RemovalResult.REMOVED
+    joins_note = f"相乗り {removed_joins} 件" if removed_joins else ""
 
     # **「消せなかった」を「無かった」と混ぜない。** 掲示板には残っている。
     if primary is RemovalResult.FAILED:
         print(
             "解放に失敗しました（掲示板に主宣言が残っています。監査ログを参照）", file=sys.stderr
         )
+        # 相乗りの掃除結果は主宣言の成否とは別の事実である。落とさずに報告する。
+        if joins_note:
+            print(f"  ただし{joins_note}は消しました", file=sys.stderr)
         return EXIT_OK
 
-    if not removed_primary and not removed_joins:
+    if primary is RemovalResult.ABSENT and not removed_joins:
         print("宣言は見つかりませんでした（既に解放済みです）")
         return EXIT_OK
 
     parts = []
-    if removed_primary:
+    if primary is RemovalResult.REMOVED:
         parts.append("主宣言")
-    if removed_joins:
-        parts.append(f"相乗り {removed_joins} 件")
+    if joins_note:
+        parts.append(joins_note)
     print(f"強制解放しました: {naming.display_default(resource_id)}（{' / '.join(parts)}）")
     return EXIT_OK
 
@@ -978,6 +1045,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         return int(args.func(args))
+    except KeyboardInterrupt:
+        # **中断を「使用中」に化けさせない。** EXIT_BUSY は 1 なので、traceback で 1 を
+        # 返すと呼び出し側から資源の競合と区別できない。シェルの慣習どおり 130 を返す。
+        print("中断しました", file=sys.stderr)
+        return EXIT_INTERRUPTED
     except Exception as exc:  # noqa: BLE001 - fail-open
         print(f"[resource-broker] 内部エラーのため判定を省略します: {exc}", file=sys.stderr)
         try:

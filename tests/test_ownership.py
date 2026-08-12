@@ -11,13 +11,15 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
 
 from resource_broker import clock
-from resource_broker.board import Board, LockState, RemovalResult, build_entry
+from resource_broker.board import Board, LockState, RemovalResult, UpdateResult, build_entry
 from resource_broker.cli import main
 from resource_broker.naming import normalize
 
@@ -124,10 +126,61 @@ def test_update_does_not_clobber_a_newer_declaration(tmp_path: Path) -> None:
     board.remove(RESOURCE, reason="テスト")
     plant(board, THEIRS)
 
-    assert board.replace(entry, reason="古い内容", expect_nonce=entry.nonce) is False
+    assert (
+        board.replace(entry, reason="古い内容", expect_nonce=entry.nonce) is UpdateResult.CONFLICT
+    )
     current = board.read(RESOURCE)
     assert current is not None
     assert current.job == "他人のジョブ"
+
+
+def test_replace_separates_io_failure_from_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """置換の I/O 失敗を「宣言が変わった」と説明しない。
+
+    フックが全セッションの全プロンプトで掲示板を読むため、``os.replace`` は共有違反で
+    失敗しうる。それを競合として説明するのは**事実と違う**（対処も変わる）。
+    """
+    board = Board(tmp_path)
+    entry = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine")
+    assert board.try_claim(entry)
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError("共有違反")
+
+    monkeypatch.setattr(os, "replace", refuse)
+    monkeypatch.setattr("resource_broker.board.UNLINK_DELAY_S", 0.0)
+
+    assert board.replace(entry, reason="更新", expect_nonce=entry.nonce) is UpdateResult.FAILED
+    assert board.read(RESOURCE) is not None  # 元の宣言は消えていない
+
+
+def test_replace_retries_a_sharing_violation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """置換も ``unlink`` と同じように数回やり直す。1 回で諦めると更新できない。"""
+    board = Board(tmp_path)
+    entry = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine")
+    assert board.try_claim(entry)
+
+    original = os.replace
+    attempts = {"n": 0}
+
+    def flaky(src: object, dst: object, **kwargs: object) -> None:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise PermissionError("共有違反")
+        original(src, dst)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "replace", flaky)
+    monkeypatch.setattr("resource_broker.board.UNLINK_DELAY_S", 0.0)
+
+    entry.holder["job"] = "書き換え後"
+    assert board.replace(entry, reason="更新", expect_nonce=entry.nonce) is UpdateResult.REPLACED
+    current = board.read(RESOURCE)
+    assert current is not None
+    assert current.job == "書き換え後"
 
 
 def test_an_ancestor_directory_does_not_own_the_declaration(
@@ -321,6 +374,8 @@ def test_lock_infrastructure_failure_is_not_contention(
 
     **インフラの故障と資源の競合を混同しない**（CLAUDE.md「Fail-Open」）。
     区別しないと、掲示板が壊れた瞬間に全セッションの取得が「使用中」で止まる。
+
+    共有違反は時間切れになるまでやり直すため、待ち時間を短くして呼ぶ。
     """
     board = Board(tmp_path)
     board.entries_dir.mkdir(parents=True, exist_ok=True)
@@ -329,9 +384,58 @@ def test_lock_infrastructure_failure_is_not_contention(
         raise PermissionError("ロックが作れない")
 
     monkeypatch.setattr(os, "open", refuse)
+    monkeypatch.setattr("resource_broker.board.UNLINK_DELAY_S", 0.0)
+
+    with board.locked(RESOURCE, wait_s=0.05) as lock:
+        assert lock is LockState.UNAVAILABLE
+
+
+def test_a_transient_sharing_violation_does_not_disable_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """一時的な共有違反でロックを手放さない。
+
+    Windows の ``os.open(O_CREAT|O_EXCL)`` は、対象が削除待ち（delete-pending）のときや
+    他プロセス（AV スキャナを含む）が掴んでいるとき ``FileExistsError`` ではなく
+    ``PermissionError`` を返す。これを即座に「ロックが使えない」に落とすと、
+    **競合が最も激しい瞬間にロックが外れる**という最悪の相関になる。
+    """
+    board = Board(tmp_path)
+    board.entries_dir.mkdir(parents=True, exist_ok=True)
+    original = os.open
+    attempts = {"n": 0}
+
+    def flaky(path: object, flags: int, mode: int = 0o777, **kwargs: object) -> int:
+        if str(path).endswith(".lock"):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise PermissionError("delete-pending")
+        return original(path, flags, mode, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", flaky)
+    monkeypatch.setattr("resource_broker.board.UNLINK_DELAY_S", 0.0)
+
+    with board.locked(RESOURCE, wait_s=1.0) as lock:
+        assert lock is LockState.ACQUIRED
+    assert attempts["n"] >= 3
+
+
+def test_an_empty_lock_file_is_not_treated_as_mine(tmp_path: Path) -> None:
+    """空のロックファイルを自分のものとみなさない。
+
+    ``locked`` は ``os.open`` と ``os.write(token)`` の間、ロックファイルが空である。
+    奪取された旧保持者がその窓で解放へ来ると、空を自分のものとみなして
+    **新しい保持者のロックを消す**。空は「自分のものではない」に倒す
+    （書けなかった自分のロックは 30 秒後に steal で回収される）。
+    """
+    board = Board(tmp_path)
 
     with board.locked(RESOURCE) as lock:
-        assert lock is LockState.UNAVAILABLE
+        assert lock is LockState.ACQUIRED
+        # 奪われ、新しい保持者がまだトークンを書いていない状態を作る
+        board.lock_path(RESOURCE).write_text("", encoding="utf-8")
+
+    assert board.lock_path(RESOURCE).exists()
 
 
 def test_a_stale_lock_is_not_stolen_when_it_was_replaced(
@@ -396,6 +500,226 @@ def test_lock_wait_has_an_upper_bound(tmp_path: Path) -> None:
     with board.locked(RESOURCE, wait_s=0.2) as lock:
         assert lock is LockState.CONTENDED
     assert time.monotonic() - started < 2.0
+
+
+# --- ロックが無くても二重取得が起きないこと（nonce の CAS） ---------------------
+
+
+def ghost(board: Board, monkeypatch: pytest.MonkeyPatch) -> None:
+    """再起動をまたいだ幽霊を仕込む（確定的に退かせる宣言）。"""
+    entry = build_entry(RESOURCE, job="落ちたセッション", cwd=THEIRS, session="theirs")
+    entry.since = clock.to_iso(clock.now() - timedelta(hours=2))
+    assert board.try_claim(entry)
+    monkeypatch.setattr(
+        "resource_broker.platform_info.boot_time", lambda: clock.now() - timedelta(hours=1)
+    )
+
+
+def test_two_sessions_seeing_one_ghost_do_not_both_acquire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**ロックが使えなくても二重取得は起きない。**
+
+    A と B が同じ幽霊を見て、A が「消して取る」に成功した直後に B が消すと、
+    B は**A の生きた宣言を消して**自分も取得に成功する。ロックを安全性の主防御に
+    据えている限り、ロックが外れた瞬間（Windows では競合が激しいときほど起きやすい）
+    だけこの穴が開く。
+
+    正しさをロックから外し、**削除を「期待する nonce と一致するときだけ」**にすることで、
+    ロックの有無に関係なくこの経路を塞ぐ。ここでは A の「読んだ後・消す前」に B を
+    丸ごと走らせて、その順序を再現する。
+    """
+    board = Board(tmp_path)
+    ghost(board, monkeypatch)
+
+    @contextmanager
+    def unavailable(*_args: object, **_kwargs: object) -> Iterator[LockState]:
+        yield LockState.UNAVAILABLE
+
+    monkeypatch.setattr(Board, "locked", unavailable)
+
+    original = Board.remove_if_nonce
+    state = {"nested": False}
+
+    def interleave(
+        self: Board, resource_id: str, *, expect_nonce: str, reason: str
+    ) -> RemovalResult:
+        if not state["nested"]:
+            state["nested"] = True
+            # B が最初から最後まで走り切る（幽霊を退けて宣言する）
+            assert (
+                run(
+                    tmp_path,
+                    "claim",
+                    "GPU0",
+                    "--job",
+                    "B のジョブ",
+                    "--observed",
+                    "調べた",
+                    "--eta",
+                    "30m",
+                )
+                == 0
+            )
+        return original(self, resource_id, expect_nonce=expect_nonce, reason=reason)
+
+    monkeypatch.setattr(Board, "remove_if_nonce", interleave)
+
+    assert claim(tmp_path) == 1  # A は諦める
+    current = board.read(RESOURCE)
+    assert current is not None
+    assert current.job == "B のジョブ"  # B の宣言が生き残っている
+
+
+def test_conditional_removal_refuses_a_replaced_declaration(tmp_path: Path) -> None:
+    """読んだ宣言と違うものは消さない（CAS の基本性質）。"""
+    board = Board(tmp_path)
+    mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine")
+    assert board.try_claim(mine)
+    board.remove(RESOURCE, reason="テスト")
+    plant(board, THEIRS)
+
+    result = board.remove_if_nonce(RESOURCE, expect_nonce=mine.nonce, reason="テスト")
+
+    assert result is RemovalResult.NOT_OWNED
+    current = board.read(RESOURCE)
+    assert current is not None
+    assert current.job == "他人のジョブ"
+
+
+def test_conditional_removal_removes_a_matching_declaration(tmp_path: Path) -> None:
+    """一致していれば消す。「無い」と「消した」を畳まない。"""
+    board = Board(tmp_path)
+    mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine")
+    assert board.try_claim(mine)
+
+    assert board.remove_if_nonce(RESOURCE, expect_nonce=mine.nonce, reason="テスト") is (
+        RemovalResult.REMOVED
+    )
+    assert board.read(RESOURCE) is None
+    assert board.remove_if_nonce(RESOURCE, expect_nonce=mine.nonce, reason="テスト") is (
+        RemovalResult.ABSENT
+    )
+
+
+def test_conditional_removal_restores_what_it_captured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """先読みを通り抜けた入れ替わりでも、捕まえた宣言を消さずに元へ戻す。
+
+    CAS は「捕まえてから中身を確かめる」。確かめた結果が別物だったときに戻さないと、
+    **他人の生きた宣言を消したのと同じ**ことになる。
+    """
+    board = Board(tmp_path)
+    mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine")
+    plant(board, THEIRS)  # 実体は他人のもの
+
+    # 先読みだけが自分の宣言を返す状況（読んだ直後に入れ替わった）を作る
+    monkeypatch.setattr(Board, "read", lambda self, resource_id: mine)
+
+    assert board.remove_if_nonce(RESOURCE, expect_nonce=mine.nonce, reason="テスト") is (
+        RemovalResult.NOT_OWNED
+    )
+
+    monkeypatch.undo()
+    current = board.read(RESOURCE)
+    assert current is not None
+    assert current.job == "他人のジョブ"  # 戻っている
+
+
+# --- 作成の原子性 ---------------------------------------------------------------
+
+
+def test_a_declaration_becomes_visible_only_when_it_is_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**中身の無いエントリが他プロセスから見えない。**
+
+    ``O_EXCL`` で作ってから書くと、作成と書き込みの間に読んだ側が**空のファイル**を見る。
+    取得の排他は崩れないが、フックや ``rb status`` から宣言が一瞬消える。
+    先に一時ファイルへ書いてハードリンクで名前を付ければ、名前が見えた瞬間には
+    中身が揃っている。``os.link`` を使う唯一の根拠がこれである。
+    """
+    board = Board(tmp_path)
+    original = os.link
+    seen: dict[str, object] = {}
+
+    def spy(source: object, target: object, **kwargs: object) -> None:
+        seen["before"] = Path(str(target)).exists()  # 名前を付ける前は存在しない
+        original(source, target, **kwargs)  # type: ignore[arg-type]
+        visible = board.read(RESOURCE)
+        seen["after"] = visible.job if visible is not None else None
+
+    monkeypatch.setattr(os, "link", spy)
+
+    assert board.try_claim(build_entry(RESOURCE, job="学習", cwd=MINE))
+
+    assert seen["before"] is False
+    assert seen["after"] == "学習"  # 名前が見えた瞬間には中身が揃っている
+    assert list(board.entries_dir.glob(".*")) == []  # 一時ファイルを残さない
+
+
+def test_creation_falls_back_when_hard_links_are_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ハードリンクが使えなくても、先着 1 名の性質は保つ。"""
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise OSError("ハードリンクが使えない")
+
+    monkeypatch.setattr(os, "link", refuse)
+    board = Board(tmp_path)
+
+    assert board.try_claim(build_entry(RESOURCE, job="1 本目", cwd=MINE)) is True
+    assert board.try_claim(build_entry(RESOURCE, job="2 本目", cwd=THEIRS)) is False
+    current = board.read(RESOURCE)
+    assert current is not None
+    assert current.job == "1 本目"
+
+
+# --- 壊れたエントリからの回復 ---------------------------------------------------
+
+
+def corrupt(board: Board) -> None:
+    """読めないエントリを仕込む。"""
+    board.entries_dir.mkdir(parents=True, exist_ok=True)
+    board.path_for(RESOURCE).write_text("{ これは JSON ではない", encoding="utf-8")
+
+
+def test_a_corrupt_declaration_can_be_cleaned_with_force(tmp_path: Path) -> None:
+    """壊れた主宣言を ``rb release --force`` で掃除できる。
+
+    以前は ``read`` が None なら消さずに「見つかりませんでした」と答えていた。
+    壊れたファイルは status に出ず、wait は即座に解放と答え、claim は ``O_EXCL`` で
+    永久に失敗する。**その資源について掲示板が恒久的に機能停止し、人間がファイルを
+    手で消すしか回復手段が無かった。**
+    """
+    board = Board(tmp_path)
+    corrupt(board)
+
+    assert run(tmp_path, "release", "GPU0", "--force") == 0
+    assert board.path_for(RESOURCE).exists() is False
+    assert claim(tmp_path) == 0  # 掃除したあとは普通に取れる
+
+
+def test_claim_names_the_corrupt_entry_instead_of_failing_silently(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """壊れたエントリで取得できないとき、掃除の仕方を示す。
+
+    「書けませんでした」とだけ言われると、掲示板が読めないのか壊れているのかが
+    分からない。回復手段が案内されない状態を作らない。
+    """
+    corrupt(Board(tmp_path))
+    capsys.readouterr()
+
+    code = claim(tmp_path)
+    captured = capsys.readouterr()
+
+    assert code == 0  # 判断材料が無いだけ。作業は止めない（fail-open）
+    assert "壊れたエントリ" in captured.err
+    assert "--force" in captured.err
+    assert "宣言は掲示板に残っていません" in captured.err
 
 
 # --- 幽霊判定の境界 -------------------------------------------------------------
@@ -592,13 +916,33 @@ def test_a_join_from_before_the_reboot_is_discarded(
     joiner = build_entry(RESOURCE, job="落ちたセッション", cwd=THEIRS, session="theirs")
     assert board.add_join(joiner, THEIRS)
 
-    # 起動時刻が宣言より後 = 再起動をまたいでいる
+    # 起動時刻が宣言より後 = 再起動をまたいでいる（境界の余裕より十分に大きく取る）
     monkeypatch.setattr(
-        "resource_broker.platform_info.boot_time", lambda: clock.now() + timedelta(minutes=1)
+        "resource_broker.platform_info.boot_time", lambda: clock.now() + timedelta(minutes=10)
     )
 
     assert board.list_joins(RESOURCE) == []
     assert board.join_path(RESOURCE, THEIRS).exists() is False  # 掃除まで行う
+
+
+def test_a_join_within_the_boot_margin_survives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """起動時刻を**わずかに**下回る相乗りは捨てない。
+
+    ``boot`` は起動からの経過時間から逆算した値なので、NTP が時計を前方へ飛ばすと、
+    直前に出したばかりの相乗りが起動より前に見える。境界に余裕を持たせて、
+    生きている申告を巻き込む余地をゼロにする。失うのは再起動直後の掃除の遅れだけである。
+    """
+    board = Board(tmp_path)
+    joiner = build_entry(RESOURCE, job="出したばかりの相乗り", cwd=THEIRS, session="theirs")
+    assert board.add_join(joiner, THEIRS)
+
+    monkeypatch.setattr(
+        "resource_broker.platform_info.boot_time", lambda: clock.now() + timedelta(seconds=30)
+    )
+
+    assert len(board.list_joins(RESOURCE)) == 1
 
 
 def test_a_live_join_is_not_discarded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -680,3 +1024,79 @@ def test_release_does_not_remove_another_sessions_join(
 
     assert run(tmp_path, "release", "GPU0") == 1  # 主宣言も他人のもの
     assert len(board.list_joins(RESOURCE)) == 1
+
+
+def test_release_prefers_my_own_join_over_one_declared_from_an_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """自分の場所から出した相乗りがあるなら、それを外す。
+
+    祖先関係だけで選ぶと、**宣言者の cwd が自分の祖先でありさえすればどれでも一致する**。
+    このマシンでは全プロジェクトが 1 つのルートの下にあるため、ハブのルートから出された
+    他人の相乗りを配下の全セッションが外せてしまう。完全一致を先に試して塞ぐ。
+    """
+    board = Board(tmp_path)
+    plant(board, THEIRS)
+    hub = "C:\\works"
+    mine = "C:\\works\\assets\\malm"
+    assert board.add_join(build_entry(RESOURCE, job="ハブの相乗り", cwd=hub), hub)
+    assert board.add_join(build_entry(RESOURCE, job="私の相乗り", cwd=mine), mine)
+
+    monkeypatch.setattr(os, "getcwd", lambda: mine)
+
+    assert run(tmp_path, "release", "GPU0") == 0
+    assert [join.job for join in board.list_joins(RESOURCE)] == ["ハブの相乗り"]
+
+
+def test_release_picks_the_nearest_ancestor_join(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """完全一致が無いときは**最も近い祖先**の相乗りを外す。
+
+    申告時と違うディレクトリから解放するのは普通にある。そのときに「祖先ならどれでも」
+    にすると、より浅い場所から出された他人の申告を消しうる。
+    """
+    board = Board(tmp_path)
+    plant(board, THEIRS)
+    hub = "C:\\works"
+    near = "C:\\works\\assets\\malm"
+    assert board.add_join(build_entry(RESOURCE, job="ハブの相乗り", cwd=hub), hub)
+    assert board.add_join(build_entry(RESOURCE, job="近い相乗り", cwd=near), near)
+
+    monkeypatch.setattr(os, "getcwd", lambda: near + "\\runs\\e008")
+
+    assert run(tmp_path, "release", "GPU0") == 0
+    assert [join.job for join in board.list_joins(RESOURCE)] == ["ハブの相乗り"]
+
+
+# --- 強制解放の報告 -------------------------------------------------------------
+
+
+def test_force_release_reports_the_joins_even_when_the_primary_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """主宣言を消せなくても、相乗りを消した事実は報告する。
+
+    早期 return で握りつぶすと「相乗り N 件を消した」が出力から消え、読んだ側は
+    掲示板の状態を誤って把握する。
+    """
+    board = Board(tmp_path)
+    plant(board, THEIRS)
+    assert board.add_join(build_entry(RESOURCE, job="相乗り", cwd=MINE), MINE)
+    primary_path = board.path_for(RESOURCE)
+    original = Path.unlink
+
+    def refuse_primary(self: Path, *args: object, **kwargs: object) -> None:
+        if self == primary_path:
+            raise PermissionError("共有違反")
+        original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "unlink", refuse_primary)
+    monkeypatch.setattr("resource_broker.board.UNLINK_DELAY_S", 0.0)
+    capsys.readouterr()
+
+    assert run(tmp_path, "release", "GPU0", "--force") == 0
+    captured = capsys.readouterr()
+
+    assert "解放に失敗しました" in captured.err
+    assert "相乗り 1 件" in captured.err
