@@ -140,19 +140,24 @@ def judge(
     if since is None:
         return Verdict.UNCERTAIN
 
-    # 4. 宣言直後はまだ資源を掴んでいなくて当然。猶予の間は宣言を信じる。
+    # 4. 未来の宣言時刻。時計のずれや手編集で起きる。そのまま扱うと `now - since < grace` が
+    #    常に真になり、**永久に退かせない宣言**ができる。裏が取れないものとして扱う。
+    if since > now + grace:
+        return Verdict.UNCERTAIN
+
+    # 5. 宣言直後はまだ資源を掴んでいなくて当然。猶予の間は宣言を信じる。
     if now - since < grace:
         return Verdict.HELD
 
-    # 5. 猶予を過ぎ、実測が空きで、宣言プロセスも死んでいる。三点そろって初めて幽霊とする。
+    # 6. 猶予を過ぎ、実測が空きで、宣言プロセスも死んでいる。三点そろって初めて幽霊とする。
     if observation.busy is False and pid_alive is False:
         return Verdict.STALE_PROBE
 
-    # 6. 宣言プロセスが死んでいるが、実測で裏が取れない。空きとはみなさない。
+    # 7. 宣言プロセスが死んでいるが、実測で裏が取れない。空きとはみなさない。
     if pid_alive is False:
         return Verdict.UNCERTAIN
 
-    # 7. 宣言を信じる。
+    # 8. 宣言を信じる。
     return Verdict.HELD
 
 

@@ -108,15 +108,26 @@ def _cmd_status(args: argparse.Namespace) -> int:
     for resource_id in targets:
         verdict, entry = assess(board, resource_id)
         joins = board.list_joins(resource_id)
+        # **相乗りだけが残っている資源を「空き」と言わない。** 主宣言が先に解放されて
+        # 相乗りが残る場合があり、そこを空きと報告すると、実際に使っている者がいるのに
+        # 他セッションが取りにいく。フックの表示もこの値で絞られる。
+        free = liveness.is_free(verdict) and not joins
         rows.append(
             {
                 "joins": [_describe(join) for join in joins],
                 "holders": (1 if entry else 0) + len(joins),
+                "has_primary": entry is not None,
                 "resource": resource_id,
                 "display": (entry.display if entry else "") or naming.display_default(resource_id),
                 "verdict": str(verdict),
-                "reason": liveness.explain(verdict),
-                "free": liveness.is_free(verdict),
+                "reason": (
+                    liveness.explain(verdict)
+                    if entry is not None
+                    else f"主宣言は無いが相乗りが {len(joins)} 件ある"
+                )
+                if not free
+                else liveness.explain(verdict),
+                "free": free,
                 "holder": entry.holder if entry else None,
                 "since": entry.since if entry else None,
                 "log": entry.log if entry else None,
@@ -179,9 +190,11 @@ def _cmd_status(args: argparse.Namespace) -> int:
             if join["log"]:
                 print(f"{'':<24}        log {join['log']}")
 
-        if row["holders"] > 1:
+        if row["holders"] > 1 or (row["joins"] and not row["has_primary"]):
+            primary = 1 if row["has_primary"] else 0
             print(
-                f"{'':<24} 合計   {row['holders']} 件の宣言（主 1 + 相乗り {row['holders'] - 1}）"
+                f"{'':<24} 合計   {row['holders']} 件の宣言"
+                f"（主 {primary} + 相乗り {len(row['joins'])}）"
             )
     return EXIT_OK
 
@@ -216,42 +229,52 @@ def acquire(
     tuple of (Entry or None, int)
         取得できたエントリと終了コード。取得できなければ ``(None, EXIT_BUSY)``。
     """
-    verdict, entry = assess(board, resource_id, observation)
-
-    # 自分で調べて使用中だったのなら、掲示板に何が書いてあろうと宣言してはならない。
+    # 自分で調べて使用中だったのなら、掲示板を読むまでもなく宣言してはならない。
     if observation.busy is True:
         print("自分の調査で使用中と分かっているため宣言できません", file=sys.stderr)
         print(f"  観測  : {observation.note}", file=sys.stderr)
         return None, EXIT_BUSY
 
-    if entry is not None and not liveness.is_free(verdict) and not force:
-        print(f"使用中のため宣言できません: {liveness.explain(verdict)}", file=sys.stderr)
-        print(f"  宣言者: {entry.session} / {entry.job}", file=sys.stderr)
-        print(f"  since : {entry.since}", file=sys.stderr)
-        if entry.log:
-            print(f"  log   : {entry.log}", file=sys.stderr)
-        return None, EXIT_BUSY
+    # 「読んで、幽霊なら退けて、作る」を排他区間にする。O_EXCL が守るのは作成だけで、
+    # この手順の途中は無防備である。2 つのセッションが同じ幽霊を見て両方成功しうる。
+    with board.locked(resource_id) as acquired:
+        if not acquired:
+            print(
+                "他のセッションが同じ資源を操作中です。少し待って再試行してください",
+                file=sys.stderr,
+            )
+            return None, EXIT_BUSY
 
-    if entry is not None:
-        reason = "強制取得" if force else f"幽霊と判定した（{liveness.explain(verdict)}）"
-        board.remove(resource_id, reason=reason)
+        verdict, entry = assess(board, resource_id, observation)
 
-    new_entry = build_entry(
-        resource_id,
-        job=job,
-        display=display,
-        log=log,
-        pid=pid,
-        observed={"note": observation.note, "found": found},
-        eta=eta,
-        peak=peak,
-        avg=avg,
-        sharing=sharing,
-    )
-    if not board.try_claim(new_entry):
-        # ここに来るのは、判定してから作成するまでの間に他セッションが取った場合。
-        print("他のセッションが先に宣言しました", file=sys.stderr)
-        return None, EXIT_BUSY
+        if entry is not None and not liveness.is_free(verdict) and not force:
+            print(f"使用中のため宣言できません: {liveness.explain(verdict)}", file=sys.stderr)
+            print(f"  宣言者: {entry.session} / {entry.job}", file=sys.stderr)
+            print(f"  since : {entry.since}", file=sys.stderr)
+            if entry.log:
+                print(f"  log   : {entry.log}", file=sys.stderr)
+            return None, EXIT_BUSY
+
+        if entry is not None:
+            reason = "強制取得" if force else f"幽霊と判定した（{liveness.explain(verdict)}）"
+            board.remove(resource_id, reason=reason)
+
+        new_entry = build_entry(
+            resource_id,
+            job=job,
+            display=display,
+            log=log,
+            pid=pid,
+            observed={"note": observation.note, "found": found},
+            eta=eta,
+            peak=peak,
+            avg=avg,
+            sharing=sharing,
+        )
+        if not board.try_claim(new_entry):
+            # ロックを取れているのでここには来ないはずだが、掲示板が書けない場合に落ちる。
+            print("宣言を作成できませんでした（監査ログを参照）", file=sys.stderr)
+            return None, EXIT_BUSY
 
     return new_entry, EXIT_OK
 
@@ -334,8 +357,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print("中断されました", file=sys.stderr)
         return EXIT_INTERRUPTED
     finally:
-        board.remove(resource_id, reason="rb run の終了")
-        print(f"解放しました: {entry.display}")
+        # **自分の宣言であることを確かめてから消す。** 実行中に他セッションが --force で
+        # 取り直していた場合、無条件に消すと生きた宣言を消してしまう。掲示板は空・資源は
+        # 掴まれたままという、最も検出しにくい不整合になる。
+        if board.remove_if_owned(resource_id, reason="rb run の終了", nonce=entry.nonce):
+            print(f"解放しました: {entry.display}")
+        else:
+            print(
+                "解放をやめました: 宣言が自分のものではなくなっています"
+                "（実行中に他セッションが取り直した可能性）",
+                file=sys.stderr,
+            )
 
 
 def _cmd_wait(args: argparse.Namespace) -> int:
@@ -395,12 +427,19 @@ def _cmd_history(args: argparse.Namespace) -> int:
     board = Board(args.home)
     target = naming.normalize(args.resource) if args.resource else None
 
+    # limit ≤ 0 を素通しすると `records[-0:]` が全件になる。「0 件出す」つもりの指定で
+    # 数万行が出るのは事故なので弾く。
+    limit = max(1, args.limit)
+
     records = []
     try:
         paths = sorted(board.audit_dir.glob("*.jsonl"))
     except OSError:
         paths = []
-    for path in paths:
+    # 新しい日付から遡り、必要な件数が集まったら読むのをやめる。監査ログは
+    # `wait_poll` が 10 秒ごとに 1 行足すため放っておくと膨らむ。全件読むと
+    # 数か月分を毎回舐めることになる。
+    for path in reversed(paths):
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
         except OSError:
@@ -415,8 +454,11 @@ def _cmd_history(args: argparse.Namespace) -> int:
             if target and record.get("resource") != target:
                 continue
             records.append(record)
+        # 新しい日から順に見ているので、必要数が集まったらそれ以上は遡らない
+        if len(records) >= limit:
+            break
 
-    records = records[-args.limit :]
+    records = sorted(records, key=lambda r: str(r.get("at", "")))[-limit:]
 
     if args.json:
         print(json.dumps({"claims": records}, ensure_ascii=False, indent=2))
@@ -506,15 +548,16 @@ def _cmd_update(args: argparse.Namespace) -> int:
         print("宣言が見つかりませんでした", file=sys.stderr)
         return EXIT_USAGE
 
-    holder_cwd = str(entry.holder.get("cwd", "")) if isinstance(entry.holder, dict) else ""
-    if not args.force and os.path.normcase(
-        os.path.normpath(holder_cwd or "?")
-    ) != os.path.normcase(os.path.normpath(os.getcwd())):
+    if not args.force and not board.owns(entry, cwd=os.getcwd()):
         print(
             "他セッションの宣言は書き換えられません（--force で上書きできます）", file=sys.stderr
         )
         print(f"  宣言者: {entry.session} / {entry.job}", file=sys.stderr)
         return EXIT_BUSY
+
+    # 読んでから書くまでの間に保持者が入れ替わっていたら、古い内容で潰さない。
+    # since は秒精度なので照合に使わない（同じ秒の解放と再取得を見分けられない）
+    expect_nonce = entry.nonce
 
     if args.job is not None:
         entry.holder["job"] = args.job
@@ -532,9 +575,9 @@ def _cmd_update(args: argparse.Namespace) -> int:
     if args.sharing is not None:
         entry.sharing = args.sharing
 
-    if not board.replace(entry, reason="update コマンド"):
-        print("更新に失敗しました（監査ログを参照）", file=sys.stderr)
-        return EXIT_OK
+    if not board.replace(entry, reason="update コマンド", expect_nonce=expect_nonce or None):
+        print("更新に失敗しました（読んでから書くまでに宣言が変わった可能性）", file=sys.stderr)
+        return EXIT_BUSY
 
     print(f"更新しました: {entry.display} / {entry.job}")
     return EXIT_OK
@@ -549,14 +592,28 @@ def _cmd_release(args: argparse.Namespace) -> int:
         print(f"相乗りを取り下げました: {naming.display_default(resource_id)}")
         return EXIT_OK
 
-    if board.remove(resource_id, reason="release コマンド"):
+    entry = board.read(resource_id)
+    if entry is None:
+        print("宣言は見つかりませんでした（既に解放済みです）")
+        return EXIT_OK
+
+    # **他人の宣言は消さない。** 掲示板の唯一の強制点は先着排他であり、最も打ちやすい
+    # コマンドでそれを無効化できてはならない。claim が --force を要求するのと対称にする。
+    if not args.force and not board.owns(entry, cwd=os.getcwd()):
+        print("他セッションの宣言は解放できません（--force で強制解放できます）", file=sys.stderr)
+        print(f"  宣言者: {entry.session} / {entry.job}", file=sys.stderr)
+        print(f"  since : {entry.since}", file=sys.stderr)
+        return EXIT_BUSY
+
+    reason = "release コマンド（強制）" if args.force else "release コマンド"
+    if board.remove(resource_id, reason=reason):
         print(f"解放しました: {naming.display_default(resource_id)}")
     else:
         print("宣言は見つかりませんでした（既に解放済みです）")
     return EXIT_OK
 
 
-def _add_declaration_options(parser: argparse.ArgumentParser) -> None:
+def _add_declaration_options(parser: argparse.ArgumentParser, *, with_force: bool = True) -> None:
     """宣言に必要なオプションを付ける。``claim`` と ``run`` で共通である。
 
     必須は ``--job`` ``--observed`` ``--eta`` の 3 つ。ここが本ツールの強制であり、
@@ -594,7 +651,10 @@ def _add_declaration_options(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--log", default=None, help="進捗が読めるログのパス")
     parser.add_argument("--display", default=None, help="表示名")
-    parser.add_argument("--force", action="store_true", help="他者の宣言を退けて強制的に取得する")
+    if with_force:
+        parser.add_argument(
+            "--force", action="store_true", help="他者の宣言を退けて強制的に取得する"
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -627,8 +687,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_declaration_options(claim)
     claim.set_defaults(func=_cmd_claim)
 
-    release = sub.add_parser("release", help="宣言を解放する")
+    release = sub.add_parser("release", help="宣言を解放する（自分のものだけ）")
     release.add_argument("resource", help="資源 ID")
+    release.add_argument(
+        "--force", action="store_true", help="他セッションの宣言も強制的に解放する"
+    )
     release.set_defaults(func=_cmd_release)
 
     run = sub.add_parser(
@@ -654,7 +717,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     join.add_argument("--res", required=True, help="資源 ID")
-    _add_declaration_options(join)
+    # 相乗りに --force は無い。取得の排他を破る操作ではないため、強制する対象が無い
+    _add_declaration_options(join, with_force=False)
     join.set_defaults(func=_cmd_join)
 
     update = sub.add_parser(
@@ -757,6 +821,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             Board(args.home).audit("cli_internal_error", command=args.command, error=str(exc))
         except Exception:  # noqa: BLE001
             pass
+        # **run だけは 0 を返さない。** fail-open は「資源アクセスを止めない」原則であって、
+        # 「走らなかったジョブを成功と報告してよい」ではない。ここで 0 を返すと、
+        # 引数の不備などで 1 度も起動していないのに呼び出し側が成功と読む。
+        if getattr(args, "command", None) == "run":
+            return runner.EXIT_CANNOT_EXECUTE
         return EXIT_OK
 
 

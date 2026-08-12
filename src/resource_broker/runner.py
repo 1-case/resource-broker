@@ -15,7 +15,9 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
@@ -92,11 +94,15 @@ def default_spawn(argv: list[str], log_path: Path, env: Mapping[str, str]) -> in
     with log_path.open("ab") as stream:
         stream.write(header.encode("utf-8", errors="replace"))
         stream.flush()
+        # POSIX では新しいプロセスグループにして、中断時に子孫までシグナルを届かせる。
+        # Windows は taskkill /T で木ごと落とすのでここでは何もしない。
+        extra: dict[str, object] = {} if sys.platform == "win32" else {"start_new_session": True}
         process = subprocess.Popen(
             argv,
             stdout=stream,
             stderr=subprocess.STDOUT,
             env=dict(env),
+            **extra,  # type: ignore[arg-type]
         )
         try:
             return process.wait()
@@ -106,7 +112,21 @@ def default_spawn(argv: list[str], log_path: Path, env: Mapping[str, str]) -> in
 
 
 def _stop(process: subprocess.Popen[bytes]) -> None:
-    """子プロセスを止める。応じなければ強制終了する。"""
+    """子プロセスを**その子孫ごと**止める。応じなければ強制終了する。
+
+    直接の子だけを殺しても足りない。推奨している形が
+    ``rb run ... -- uv run python scripts/train.py`` であり、直接の子は ``uv`` で、
+    資源を掴むのは孫の ``python`` である。``uv`` だけ殺すと孫が生き残り、
+    ``finally`` が掲示板から宣言を消す。**掲示板は空・資源は掴まれたまま**という
+    最も検出しにくい不整合ができる。
+    """
+    if _kill_tree(process.pid):
+        try:
+            process.wait(timeout=TERMINATE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            pass
+        return
+
     try:
         process.terminate()
         process.wait(timeout=TERMINATE_TIMEOUT_S)
@@ -118,6 +138,31 @@ def _stop(process: subprocess.Popen[bytes]) -> None:
             pass
     except OSError:
         pass
+
+
+def _kill_tree(pid: int) -> bool:
+    """プロセスツリーごと終了させる。できなければ False。
+
+    Windows は ``taskkill /T``、POSIX はプロセスグループへのシグナルで子孫まで届かせる。
+    どちらも失敗したら呼び出し側が単体終了へ退避する（何もしないよりはよい）。
+    """
+    if sys.platform == "win32":
+        try:
+            completed = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=TERMINATE_TIMEOUT_S,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return completed.returncode == 0
+
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except (OSError, AttributeError):
+        return False
+    return True
 
 
 def execute(

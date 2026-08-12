@@ -86,6 +86,41 @@ def test_entry_is_released_when_command_is_missing(tmp_path: Path) -> None:
     assert entries(tmp_path) == []
 
 
+def test_failure_before_spawn_does_not_report_success(tmp_path: Path) -> None:
+    """起動より**手前**で壊れても 0 を返さない。
+
+    `main` の catch-all は全ての内部例外を握って 0 を返す。`run` でそれをやると、
+    コマンドを 1 度も起動していないのに呼び出し側が成功と読む。
+    fail-open は「資源アクセスを止めない」原則であって、「走らなかったジョブを
+    成功と報告してよい」ではない。
+
+    再現は資源 ID を空にする経路（`naming.normalize` が例外を投げる）。
+    SPAWN を壊すだけのテストでは、この手前の経路を守護できない。
+    """
+    code = main(
+        [
+            "--home",
+            str(tmp_path),
+            "run",
+            "--res",
+            "",
+            "--job",
+            "x",
+            "--observed",
+            "調べた",
+            "--eta",
+            "10m",
+            "--",
+            sys.executable,
+            "-c",
+            "print(1)",
+        ]
+    )
+
+    assert code == runner.EXIT_CANNOT_EXECUTE
+    assert entries(tmp_path) == []
+
+
 def test_broken_wrapper_does_not_report_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

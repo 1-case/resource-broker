@@ -60,22 +60,32 @@ def board_root() -> Path:
 def read_entries(root: Path) -> list[dict[str, object]]:
     """掲示板の宣言を読む。読めないものは黙って飛ばす。
 
+    主宣言と**相乗り**の両方を読む。相乗りだけが残った資源を落とすと、実際に使っている者が
+    いるのに注入からは消える。
+
     **判定はしない。** 幽霊かどうかは読む側が `rb status` で確かめる。
     """
-    try:
-        paths = sorted((root / "board").glob("*.json"))
-    except OSError:
-        return []
-
+    board = root / "board"
     entries: list[dict[str, object]] = []
-    for path in paths[:MAX_ENTRIES]:
+
+    for directory, is_join in ((board, False), (board / "joins", True)):
         try:
-            data = json.loads(path.read_text(encoding=ENCODING))
-        except (OSError, json.JSONDecodeError, ValueError):
+            paths = sorted(directory.glob("*.json"))
+        except OSError:
             continue
-        if isinstance(data, dict) and data.get("resource"):
-            entries.append(data)
-    return entries
+        for path in paths:
+            try:
+                data = json.loads(path.read_text(encoding=ENCODING))
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(data, dict) and data.get("resource"):
+                data["_join"] = is_join
+                entries.append(data)
+
+    # **上限は読めた件数に効かせる。** パスの段階で切ると、壊れたファイルがファイル名順で
+    # 先頭に並んだときに生きた宣言が 1 件も残らない。掲示板が汚れているときに黙るのは、
+    # いちばん注入が要る場面で黙ることになる。
+    return entries[:MAX_ENTRIES]
 
 
 def build_notice(entries: list[dict[str, object]]) -> str:
@@ -95,7 +105,8 @@ def build_notice(entries: list[dict[str, object]]) -> str:
         display = entry.get("display") or entry.get("resource")
         session = holder.get("session", "?")
         job = holder.get("job") or "(ジョブ未記入)"
-        lines.append(f"  {display} <- {session} / {job} (since {entry.get('since', '?')})")
+        kind = "相乗り " if entry.get("_join") else ""
+        lines.append(f"  {kind}{display} <- {session} / {job} (since {entry.get('since', '?')})")
     lines.append(f"詳細は rb status。{RULE}")
     return "\n".join(lines)
 
