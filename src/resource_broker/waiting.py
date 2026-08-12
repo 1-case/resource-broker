@@ -93,11 +93,17 @@ def holder_keys(board: Board, resource_id: str) -> set[str]:
 
     **中身は見ない。** 誰が何人いるかだけを数える。増減が分かれば資源が空く方向に
     動いたかは判断でき、使用量の数値を解釈する必要がない。
+
+    主宣言のキーには **nonce**（宣言ごとに一意）を使う。``since`` と ``session`` で
+    作ると、保持者が別セッションへ**交代しただけ**で「1 人消えた」に見える。
+    件数は変わっていないのに ``rb wait`` が戻り、待っている側は入れないまま起こされる。
+    nonce を持たない古いエントリだけ従来のキーで代替する。
     """
     keys: set[str] = set()
     primary = board.read(resource_id)
     if primary is not None:
-        keys.add(f"primary:{primary.since}:{primary.session}")
+        identity = primary.nonce or f"{primary.since}:{primary.session}"
+        keys.add(f"primary:{identity}")
     for join in board.list_joins(resource_id):
         holder = join.holder if isinstance(join.holder, dict) else {}
         keys.add(f"join:{holder.get('cwd', '?')}")
@@ -169,7 +175,10 @@ def wait_for_room(
             audit.append(board.root, "wait_released", resource=resource_id, polls=polls)
             return WaitResult(reason=RELEASED, polls=polls, waited_s=elapsed, last=None, holders=0)
 
-        if gone:
+        # **件数が減ったときだけ戻る。** 「誰かが消えた」だけでは足りない。
+        # 保持者が交代した（1 人抜けて 1 人入った）場合、資源は空いていないのに
+        # `gone` は非空になる。空く方向に動いたかは件数でしか分からない。
+        if gone and len(keys) < len(baseline):
             audit.append(
                 board.root, "wait_shrank", resource=resource_id, polls=polls, gone=len(gone)
             )
@@ -181,8 +190,10 @@ def wait_for_room(
                 holders=len(keys),
             )
 
-        # 増えた分は基準に取り込む。増加では起こさないが、その後の減少は検知したい。
-        baseline |= keys
+        # 起こさなかった分は基準に取り込む。増加でも交代でも起こさないが、
+        # **そのあとの減少は検知したい**。和を取ると交代のたびに基準が膨らみ、
+        # 次のポーリングで「減った」に化けるので、現在の集合で置き換える。
+        baseline = set(keys)
 
         if elapsed >= timeout_s:
             audit.append(

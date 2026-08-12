@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -235,6 +236,117 @@ def test_child_environment_disables_buffering() -> None:
     バッファに溜まったまま出てこないログは、観測点として役に立たない。
     """
     assert runner.child_environment({})["PYTHONUNBUFFERED"] == "1"
+
+
+# --- 子孫まで確実に止める -------------------------------------------------------
+
+
+class FakeProcess:
+    """終了を待つ子プロセスの代役。
+
+    実プロセスを起動せずに「どの順で止めにいったか」を検証する
+    （CLAUDE.md「Testing Constraints」）。
+
+    Parameters
+    ----------
+    survives : int
+        何回目の ``wait`` までタイムアウトさせるか。SIGTERM を無視する子を模す。
+    """
+
+    def __init__(self, survives: int = 0) -> None:
+        self.pid = 4242
+        self.waits = 0
+        self.survives = survives
+        self.terminated = False
+        self.killed = False
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.waits += 1
+        if self.waits <= self.survives:
+            raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout or 0)
+        return 0
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def test_stop_escalates_when_the_child_ignores_the_first_signal() -> None:
+    """SIGTERM を無視する子は強制終了へ昇格する。
+
+    待って諦めると、掲示板から消えた資源を掴んだままのプロセスが残る。
+    **掲示板は空・資源は掴まれたまま**という最も検出しにくい不整合になる。
+    """
+    process = FakeProcess(survives=1)
+    forces: list[bool] = []
+
+    def kill_tree(pid: int, force: bool) -> bool:
+        forces.append(force)
+        return True
+
+    runner._stop(process, kill_tree=kill_tree, timeout_s=0)  # type: ignore[arg-type]
+
+    assert forces == [False, True]  # 穏当に頼んでから、強制する
+    assert process.waits == 2
+
+
+def test_stop_does_not_escalate_when_the_child_exits() -> None:
+    """素直に終わった子には強制終了を送らない。"""
+    process = FakeProcess()
+    forces: list[bool] = []
+
+    def kill_tree(pid: int, force: bool) -> bool:
+        forces.append(force)
+        return True
+
+    runner._stop(process, kill_tree=kill_tree, timeout_s=0)  # type: ignore[arg-type]
+
+    assert forces == [False]
+
+
+def test_stop_falls_back_to_single_process_termination() -> None:
+    """プロセスツリーごと止められない環境では単体終了へ退避する。
+
+    何もしないよりはよい。直接の子だけでも止まれば、多くの場合は資源が解放される。
+    """
+    process = FakeProcess(survives=1)
+
+    runner._stop(process, kill_tree=lambda _pid, _force: False, timeout_s=0)
+
+    assert process.terminated is True
+    assert process.killed is True
+
+
+def test_posix_kill_tree_escalates_the_signal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POSIX ではプロセスグループへ SIGTERM → SIGKILL の順で送る。
+
+    Windows の ``signal`` に ``SIGKILL`` が無いため、シグナル番号は import 時に
+    解決してある（この検証を Windows でも回せることが、その必要性の裏づけである）。
+    """
+    import os
+
+    sent: list[int] = []
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid, raising=False)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: sent.append(sig), raising=False)
+
+    assert runner._kill_tree_posix(4242, False) is True
+    assert runner._kill_tree_posix(4242, True) is True
+    assert sent == [runner._SIGTERM, runner._SIGKILL]
+
+
+def test_posix_kill_tree_reports_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """シグナルを送れなければ False。呼び出し側が単体終了へ退避する。"""
+    import os
+
+    def explode(*_args: object, **_kwargs: object) -> None:
+        raise ProcessLookupError("もう居ない")
+
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid, raising=False)
+    monkeypatch.setattr(os, "killpg", explode, raising=False)
+
+    assert runner._kill_tree_posix(4242, False) is False
 
 
 def test_command_line_is_not_interpreted(tmp_path: Path) -> None:

@@ -35,6 +35,16 @@ Spawn = Callable[[list[str], Path, Mapping[str, str]], int]
 #: 子プロセスが中断に応じるのを待つ秒数。過ぎたら強制終了する。
 TERMINATE_TIMEOUT_S = 10.0
 
+#: プロセスツリーを終了させるもの。``(pid, force) -> 成否``。テストで差し替える。
+KillTree = Callable[[int, bool], bool]
+
+#: シグナル番号。**モジュールの import 時に解決する**。
+#:
+#: Windows の ``signal`` には ``SIGKILL`` が無い。POSIX 側の分岐の中で参照しても、
+#: テストからその関数を直接呼んだ瞬間に ``AttributeError`` になる。
+_SIGTERM = int(getattr(signal, "SIGTERM", 15))
+_SIGKILL = int(getattr(signal, "SIGKILL", 9))
+
 #: コマンドが見つからなかった（シェルの慣習に合わせる）。
 EXIT_COMMAND_NOT_FOUND = 127
 
@@ -111,55 +121,93 @@ def default_spawn(argv: list[str], log_path: Path, env: Mapping[str, str]) -> in
             raise
 
 
-def _stop(process: subprocess.Popen[bytes]) -> None:
-    """子プロセスを**その子孫ごと**止める。応じなければ強制終了する。
+def _stop(
+    process: subprocess.Popen[bytes],
+    *,
+    kill_tree: KillTree | None = None,
+    timeout_s: float = TERMINATE_TIMEOUT_S,
+) -> None:
+    """子プロセスを**その子孫ごと**止める。応じなければ強制終了へ昇格する。
 
     直接の子だけを殺しても足りない。推奨している形が
     ``rb run ... -- uv run python scripts/train.py`` であり、直接の子は ``uv`` で、
     資源を掴むのは孫の ``python`` である。``uv`` だけ殺すと孫が生き残り、
     ``finally`` が掲示板から宣言を消す。**掲示板は空・資源は掴まれたまま**という
     最も検出しにくい不整合ができる。
+
+    **待って諦めない。** POSIX の第 1 段は ``SIGTERM`` であり、無視する子が普通にいる
+    （学習スクリプトが自前のハンドラを持っている場合など）。待ち切ったら ``SIGKILL``
+    へ昇格する。昇格しないと、掲示板から消えた資源を掴んだままのプロセスが残る。
+
+    Parameters
+    ----------
+    kill_tree : callable, optional
+        プロセスツリーを終了させるもの。テストで差し替える
+        （実プロセスを起動せずに昇格の順序を検証するため）。
     """
-    if _kill_tree(process.pid):
-        try:
-            process.wait(timeout=TERMINATE_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            pass
-        return
+    killer: KillTree = kill_tree or _kill_tree
+
+    if killer(process.pid, False):
+        if _wait_quietly(process, timeout_s):
+            return
+        # SIGTERM を無視する子が残っている。強制終了へ昇格する。
+        if killer(process.pid, True):
+            _wait_quietly(process, timeout_s)
+            return
 
     try:
         process.terminate()
-        process.wait(timeout=TERMINATE_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        try:
-            process.wait(timeout=TERMINATE_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            pass
+        if not _wait_quietly(process, timeout_s):
+            process.kill()
+            _wait_quietly(process, timeout_s)
     except OSError:
         pass
 
 
-def _kill_tree(pid: int) -> bool:
+def _wait_quietly(process: subprocess.Popen[bytes], timeout_s: float) -> bool:
+    """子の終了を待つ。時間内に終われば True。"""
+    try:
+        process.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
+def _kill_tree(pid: int, force: bool = False) -> bool:
     """プロセスツリーごと終了させる。できなければ False。
 
     Windows は ``taskkill /T``、POSIX はプロセスグループへのシグナルで子孫まで届かせる。
     どちらも失敗したら呼び出し側が単体終了へ退避する（何もしないよりはよい）。
+
+    Parameters
+    ----------
+    force : bool
+        ``True`` なら無視できないシグナルを送る。POSIX では ``SIGKILL``。
+        Windows の ``taskkill /F`` は最初から強制なので区別が無い。
     """
     if sys.platform == "win32":
-        try:
-            completed = subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                capture_output=True,
-                timeout=TERMINATE_TIMEOUT_S,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return completed.returncode == 0
+        return _kill_tree_windows(pid)
+    return _kill_tree_posix(pid, force)
 
+
+def _kill_tree_windows(pid: int) -> bool:
+    """Windows でプロセスツリーを終了させる。``/F`` は常に強制である。"""
     try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        completed = subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True,
+            timeout=TERMINATE_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
+def _kill_tree_posix(pid: int, force: bool) -> bool:
+    """POSIX でプロセスグループごと終了させる。"""
+    try:
+        os.killpg(os.getpgid(pid), _SIGKILL if force else _SIGTERM)
     except (OSError, AttributeError):
         return False
     return True

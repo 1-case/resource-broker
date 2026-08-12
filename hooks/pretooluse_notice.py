@@ -95,6 +95,30 @@ def match(command: str, patterns: list[dict[str, object]]) -> dict[str, object] 
     return None
 
 
+def bare_resource(resource_id: str) -> str:
+    """資源 ID からホスト名のプレフィックスを外す。
+
+    照合は**両側を同じ形にしてから**行う。片側だけ正規化すると、判定表に
+    ``host::GPU0`` と書いた行が掲示板の ``host::GPU0`` に一致しなくなる
+    （掲示板側だけ ``GPU0`` に落ちるため）。
+    """
+    return resource_id.split("::", 1)[-1]
+
+
+def owned_by(declared_cwd: str, cwd: str) -> bool:
+    """宣言者の場所が自分の場所と同じか、自分の祖先か。
+
+    照合の規則を**本体（``Board.owns``）とそろえる**。ここだけ完全一致にすると、
+    サブディレクトリで作業しているセッションが「自分は宣言していない」と判定され、
+    宣言済みの相手に毎回「宣言しろ」と言うことになる。
+    """
+    if not declared_cwd or not cwd:
+        return False
+    parent = os.path.normcase(os.path.normpath(declared_cwd))
+    child = os.path.normcase(os.path.normpath(cwd))
+    return child == parent or child.startswith(parent.rstrip(os.sep) + os.sep)
+
+
 def declarations_for(root: Path, resource: str | None) -> list[dict[str, object]]:
     """その資源の宣言（主宣言と相乗り）を返す。
 
@@ -121,7 +145,7 @@ def declarations_for(root: Path, resource: str | None) -> list[dict[str, object]
                 continue
             if not isinstance(entry, dict) or not entry.get("resource"):
                 continue
-            if str(entry["resource"]).split("::", 1)[-1] == resource:
+            if bare_resource(str(entry["resource"])) == bare_resource(resource):
                 entry["_join"] = is_join
                 found.append(entry)
     return found
@@ -135,10 +159,7 @@ def declared_by_me(entries: list[dict[str, object]], cwd: str) -> bool:
     for entry in entries:
         holder = entry.get("holder")
         holder = holder if isinstance(holder, dict) else {}
-        declared_cwd = str(holder.get("cwd", ""))
-        if declared_cwd and os.path.normcase(os.path.normpath(declared_cwd)) == os.path.normcase(
-            os.path.normpath(cwd)
-        ):
+        if owned_by(str(holder.get("cwd", "")), cwd):
             return True
     return False
 

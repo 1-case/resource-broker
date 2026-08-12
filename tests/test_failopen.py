@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -138,9 +139,15 @@ def test_claim_proceeds_when_the_session_could_not_investigate(tmp_path: Path) -
 def test_claim_proceeds_when_the_board_directory_is_unwritable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """掲示板が書けなくても、ユーザーの作業を止めない。
+    """掲示板が書けなくても、ユーザーの作業を止めない。**0 を返す。**
 
     宣言は残らないが、それは事故防止の失敗であって作業の停止理由ではない。
+    1 を返してよいのは「掲示板が正常に読めた上で使用中と判定できた」場合だけであり、
+    書けないことは**インフラの故障**である。ここを 1 に倒すと、掲示板が壊れた瞬間に
+    全セッションの資源アクセスが止まる（CLAUDE.md「Fail-Open」）。
+
+    ただし「宣言しました」とは言わない。残っていない宣言を成功と報告すると、
+    他セッションから見えないまま「宣言済みのつもり」の状態ができる。
     """
 
     def explode(*_args: object, **_kwargs: object) -> None:
@@ -163,6 +170,50 @@ def test_claim_proceeds_when_the_board_directory_is_unwritable(
             "free",
         ]
     )
+    captured = capsys.readouterr()
 
-    assert code in (0, 1)  # 通すか「取れなかった」と言うか。例外は外に出さない
-    capsys.readouterr()
+    assert code == 0
+    assert "宣言しました" not in captured.out
+    assert "掲示板に残っていません" in captured.err
+
+
+def test_lock_failure_does_not_look_like_contention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ロックが使えないことを「他セッションが使用中」に化けさせない。
+
+    **インフラの故障と資源の競合を混同しない。** ロックの取得失敗を一律に「使用中」と
+    扱うと、掲示板の故障で全セッションの取得が止まる。ロックが使えないときは
+    ``O_EXCL`` 一本で従来どおり続行する。
+    """
+    from contextlib import contextmanager
+
+    from resource_broker.board import Board, LockState
+
+    board = Board(tmp_path)
+
+    @contextmanager
+    def unavailable(*_args: object, **_kwargs: object) -> Iterator[LockState]:
+        yield LockState.UNAVAILABLE
+
+    monkeypatch.setattr(Board, "locked", unavailable)
+    code = main(
+        [
+            "--home",
+            str(tmp_path),
+            "claim",
+            "GPU0",
+            "--job",
+            "学習",
+            "--observed",
+            "調べた",
+            "--eta",
+            "30m",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "宣言しました" in captured.out
+    assert "排他を弱めて続行" in captured.err
+    assert board.list_all()  # 宣言は残っている（ロック無しでも取得はできる）

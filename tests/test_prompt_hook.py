@@ -147,6 +147,23 @@ def test_is_fast_enough_for_every_prompt(tmp_path: Path) -> None:
     assert elapsed < BUDGET_S, f"{elapsed:.3f}s かかった"
 
 
+def test_joins_are_not_crowded_out_by_primaries(tmp_path: Path) -> None:
+    """主宣言が上限まで並んでも、相乗りが 1 件も出ない状態にしない。
+
+    連結してから上限で切ると、主宣言が埋め尽くした時点で相乗りが消える。
+    相乗りは「主宣言だけでは見えない使用者」であり、真っ先に落としてよいものではない。
+    """
+    board = Board(tmp_path)
+    for index in range(10):
+        assert board.try_claim(build_entry(normalize(f"COM{index}"), job=f"主宣言{index}"))
+    place = "C:\\works\\malm"
+    assert board.add_join(build_entry(normalize("GPU0"), job="相乗りのジョブ", cwd=place), place)
+
+    text = run_hook(tmp_path).decode("utf-8")
+
+    assert "相乗りのジョブ" in text
+
+
 # --- fail-open ------------------------------------------------------------------
 
 

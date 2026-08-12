@@ -155,6 +155,62 @@ def test_does_not_return_when_a_joiner_is_added(tmp_path: Path) -> None:
     assert result.holders == 2
 
 
+def test_holder_replacement_is_not_a_shrink(tmp_path: Path) -> None:
+    """保持者が**交代**しただけでは戻らない。
+
+    主宣言が別セッションへ渡っても件数は変わっていない。「誰かが消えた」だけで
+    戻ると、待っている側は入れないまま起こされる。キーに nonce を使い、
+    かつ件数が減ったことを条件にする。
+    """
+    board = Board(tmp_path)
+    declare(board)
+    fake = FakeClock()
+    calls = {"n": 0}
+
+    def sleep(seconds: float) -> None:
+        calls["n"] += 1
+        fake.sleep(seconds)
+        if calls["n"] == 2:
+            board.remove(RESOURCE, reason="テストで交代")
+            assert board.try_claim(build_entry(RESOURCE, job="別のジョブ", session="malm"))
+
+    result = waiting.wait_for_room(
+        board, RESOURCE, interval_s=5, timeout_s=40, sleep=sleep, now=fake.now
+    )
+
+    assert result.reason == waiting.TIMEOUT
+    assert result.holders == 1
+
+
+def test_shrink_after_a_replacement_still_wakes(tmp_path: Path) -> None:
+    """交代のあとに解放されたら戻る。
+
+    交代を「減った」と誤認しないための基準の入れ替えが、そのあとの減少を
+    取りこぼす方向に効いてはならない。
+    """
+    board = Board(tmp_path)
+    declare(board)
+    join(board, "C:\\works\\malm")
+    fake = FakeClock()
+    calls = {"n": 0}
+
+    def sleep(seconds: float) -> None:
+        calls["n"] += 1
+        fake.sleep(seconds)
+        if calls["n"] == 1:
+            board.remove(RESOURCE, reason="テストで交代")
+            assert board.try_claim(build_entry(RESOURCE, job="別のジョブ", session="malm"))
+        if calls["n"] == 3:
+            board.remove_join(RESOURCE, "C:\\works\\malm", reason="テストで離脱")
+
+    result = waiting.wait_for_room(
+        board, RESOURCE, interval_s=5, timeout_s=1000, sleep=sleep, now=fake.now
+    )
+
+    assert result.reason == waiting.SHRANK
+    assert result.holders == 1
+
+
 def test_growth_then_shrink_still_wakes(tmp_path: Path) -> None:
     """増えたあとに減れば戻る。
 
