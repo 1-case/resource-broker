@@ -20,7 +20,16 @@ packages = ["src/resource_broker"]
 dev = ["pytest", "ruff"]
 
 [tool.ruff]
-line-length = 100
+target-version = "py313"
+line-length = 99
+# src レイアウトで `resource_broker` を first-party と認識させる（import 並び順の判定に使う）
+src = ["src"]
+# templates/shared からコピーしたバンドル（hooks / speak.py）は、共有版と同一内容を保って
+# 将来のバンドル更新を容易にするため lint / format 対象外（malm と同じ方針）
+extend-exclude = [".claude/hooks", "tools/speak.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

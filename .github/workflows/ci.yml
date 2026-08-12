@@ -1,0 +1,38 @@
+# CI: 1-case 組織の self-hosted runner（Linux ARM64 / Raspberry Pi CM5）で実行する。
+# 本ツールは Windows を第一級の対象とするが、プラットフォーム依存部分（boot time 取得・
+# nvidia-smi・デバイス列挙）は platform_info.py と probes/ に隔離してあるため、
+# 純粋なロジック（掲示板・幽霊判定・命名）は Linux 上でも検証できる。
+# 実 GPU・実 COM を要求するテストは書かない（CLAUDE.md「Testing Constraints」）。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: [self-hosted, Linux, ARM64]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # uv が runner に無ければ導入する（管理された Python も uv sync が自動取得する）
+      - name: Set up uv
+        run: |
+          if ! command -v uv >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/uv" ]; then
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+          fi
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Test
+        run: uv run pytest

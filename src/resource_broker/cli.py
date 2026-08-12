@@ -1,0 +1,212 @@
+"""コマンドラインインタフェース（``resource-broker`` / ``rb``）。
+
+Phase 1 で提供するのは ``status`` / ``claim`` / ``release`` の 3 つ。
+ラッパー（``run``）とフックは Phase 2 以降で追加する。
+
+**終了コードの方針**: 本ツール自身の内部エラーでは 0 を返す（fail-open）。
+1 を返すのは「掲示板が正常に読めた上で、使用中だと判定できた」場合だけである。
+インフラの故障と資源の競合を混同しない。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections.abc import Sequence
+
+from . import clock, liveness, naming, platform_info
+from .board import Board, Entry, build_entry
+from .liveness import Verdict
+from .probes.base import Observation, Probe, observe_safely
+from .probes.gpu import NvidiaSmiProbe
+
+EXIT_OK = 0
+EXIT_BUSY = 1
+
+
+def probe_for(resource_id: str) -> Probe | None:
+    """資源 ID に対応するプローブを返す。対応が無ければ None。
+
+    Phase 1 では GPU のみを実測する。ID に ``gpu`` を含むかどうかで判定する
+    単純な対応付けで、増える段階で表に置き換える。
+    """
+    if "gpu" in resource_id.lower():
+        return NvidiaSmiProbe()
+    return None
+
+
+def assess(board: Board, resource_id: str) -> tuple[Verdict, Entry | None, Observation]:
+    """資源の状態を判定する。掲示板・実測・OS 情報を集めて liveness に渡す。"""
+    entry = board.read(resource_id)
+    observation = observe_safely(probe_for(resource_id))
+    verdict = liveness.judge(
+        has_entry=entry is not None,
+        since=entry.since_dt if entry else None,
+        boot=platform_info.boot_time(),
+        observation=observation,
+        pid_alive=platform_info.pid_alive(entry.pid) if entry else None,
+        now=clock.now(),
+    )
+    return verdict, entry, observation
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    board = Board(args.home)
+    targets = [naming.normalize(r) for r in args.resource] if args.resource else None
+
+    rows = []
+    if targets is None:
+        entries = board.list_all()
+        seen = {entry.resource for entry in entries}
+        # エントリが無くても、実測できる資源は状態を出す
+        for candidate in _local_candidates():
+            if candidate not in seen:
+                entries.append(Entry(resource=candidate))
+        targets = [entry.resource for entry in entries]
+
+    for resource_id in targets:
+        verdict, entry, observation = assess(board, resource_id)
+        rows.append(
+            {
+                "resource": resource_id,
+                "display": (entry.display if entry else "") or naming.display_default(resource_id),
+                "verdict": str(verdict),
+                "reason": liveness.explain(verdict),
+                "free": liveness.is_free(verdict),
+                "holder": entry.holder if entry else None,
+                "since": entry.since if entry else None,
+                "log": entry.log if entry else None,
+                "observed": observation.detail if observation.known else None,
+                "probe_error": observation.error,
+            }
+        )
+
+    if args.json:
+        print(json.dumps({"resources": rows}, ensure_ascii=False, indent=2))
+        return EXIT_OK
+
+    if not rows:
+        print("掲示板は空です（誰も資源を宣言していません）")
+        return EXIT_OK
+
+    for row in rows:
+        mark = "空き" if row["free"] else "使用中"
+        print(f"{row['display']:<24} {mark:<6} {row['reason']}")
+        holder = row["holder"] or {}
+        if holder:
+            job = holder.get("job") or "(ジョブ未記入)"
+            print(f"{'':<24} 宣言   {holder.get('session', '?')} / {job}")
+            print(f"{'':<24} since  {row['since']}")
+        if row["log"]:
+            print(f"{'':<24} log    {row['log']}")
+        if row["observed"]:
+            detail = " ".join(f"{k}={v}" for k, v in row["observed"].items())
+            print(f"{'':<24} 実測   {detail}")
+        elif row["probe_error"]:
+            print(f"{'':<24} 実測   判定不能: {row['probe_error']}")
+    return EXIT_OK
+
+
+def _cmd_claim(args: argparse.Namespace) -> int:
+    board = Board(args.home)
+    resource_id = naming.normalize(args.resource)
+    verdict, entry, observation = assess(board, resource_id)
+
+    if entry is not None and not liveness.is_free(verdict) and not args.force:
+        print(f"使用中のため宣言できません: {liveness.explain(verdict)}", file=sys.stderr)
+        print(f"  宣言者: {entry.session} / {entry.job}", file=sys.stderr)
+        print(f"  since : {entry.since}", file=sys.stderr)
+        if entry.log:
+            print(f"  log   : {entry.log}", file=sys.stderr)
+        return EXIT_BUSY
+
+    if entry is not None:
+        reason = "強制取得" if args.force else f"幽霊と判定した（{liveness.explain(verdict)}）"
+        board.remove(resource_id, reason=reason)
+
+    new_entry = build_entry(
+        resource_id,
+        job=args.job,
+        display=args.display or "",
+        log=args.log,
+        observed=observation.detail if observation.known else None,
+    )
+    if not board.try_claim(new_entry):
+        # ここに来るのは、判定してから作成するまでの間に他セッションが取った場合。
+        print("他のセッションが先に宣言しました", file=sys.stderr)
+        return EXIT_BUSY
+
+    print(f"宣言しました: {new_entry.display} / {new_entry.job}")
+    return EXIT_OK
+
+
+def _cmd_release(args: argparse.Namespace) -> int:
+    board = Board(args.home)
+    resource_id = naming.normalize(args.resource)
+    if board.remove(resource_id, reason="release コマンド"):
+        print(f"解放しました: {naming.display_default(resource_id)}")
+    else:
+        print("宣言は見つかりませんでした（既に解放済みです）")
+    return EXIT_OK
+
+
+def _local_candidates() -> list[str]:
+    """このマシンで実測できる資源の ID を返す。Phase 1 では GPU のみ。"""
+    return [naming.normalize("GPU0")]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """引数パーサを組み立てる。"""
+    parser = argparse.ArgumentParser(
+        prog="resource-broker",
+        description="並行する Claude Code セッション間で有限資源の使用状況を共有する掲示板",
+    )
+    parser.add_argument("--home", default=None, help="掲示板のルート（既定は環境依存）")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    status = sub.add_parser("status", help="資源の状態を表示する")
+    status.add_argument("resource", nargs="*", help="対象の資源 ID（省略時は全件）")
+    status.add_argument("--json", action="store_true", help="JSON で出力する")
+    status.set_defaults(func=_cmd_status)
+
+    claim = sub.add_parser("claim", help="資源を宣言する")
+    claim.add_argument("resource", help="資源 ID")
+    claim.add_argument("--job", required=True, help="何をするか（1 行）")
+    claim.add_argument("--log", default=None, help="進捗が読めるログのパス")
+    claim.add_argument("--display", default=None, help="表示名")
+    claim.add_argument("--force", action="store_true", help="使用中でも強制的に取得する")
+    claim.set_defaults(func=_cmd_claim)
+
+    release = sub.add_parser("release", help="宣言を解放する")
+    release.add_argument("resource", help="資源 ID")
+    release.set_defaults(func=_cmd_release)
+
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """エントリポイント。
+
+    内部エラーは 0 を返して通す（fail-open）。本ツールの不具合で
+    ユーザーの作業を止めないことを、コード上でも保証する。
+    """
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:  # --help や引数不備。argparse の意図どおりに返す
+        return int(exc.code or 0)
+
+    try:
+        return int(args.func(args))
+    except Exception as exc:  # noqa: BLE001 - fail-open
+        print(f"[resource-broker] 内部エラーのため判定を省略します: {exc}", file=sys.stderr)
+        try:
+            Board(args.home).audit("cli_internal_error", command=args.command, error=str(exc))
+        except Exception:  # noqa: BLE001
+            pass
+        return EXIT_OK
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
