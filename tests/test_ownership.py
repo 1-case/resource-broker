@@ -1187,3 +1187,34 @@ def test_force_release_reports_the_joins_even_when_the_primary_fails(
 
     assert "解放に失敗しました" in captured.err
     assert "相乗り 1 件" in captured.err
+
+
+def test_release_by_a_joiner_sharing_my_cwd_keeps_the_primary(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """主宣言者と同じ場所から相乗りした者が release しても、主宣言は消えない（回帰テスト）。
+
+    解放の順序を「主宣言を先に見る」に変えたとき、対称な穴が空いた。``owns`` は祖先関係を
+    許すので、相乗り者の cwd が主宣言者と同じ（または配下）だと**他人の主宣言が自分のものとして
+    通る**。ジョブが走っている最中に宣言だけが消え、資源は掴まれたままになる。
+
+    ``rb join`` は主宣言の**存在**しか確認しないので、「自分が主宣言者かつ相乗り者」は
+    起こり得ないという前提は成立しない。完全一致の相乗りを最初に見ることで塞ぐ。
+    """
+    board = Board(tmp_path)
+    shared = str(tmp_path / "同じ場所")
+    os.makedirs(shared, exist_ok=True)
+
+    # S が主宣言を出す（cwd = shared）
+    assert board.try_claim(build_entry(RESOURCE, job="S のジョブ", cwd=shared, session="S"))
+    # T が同じ場所から相乗りする
+    assert board.add_join(build_entry(RESOURCE, job="T の相乗り", cwd=shared, session="T"), shared)
+
+    monkeypatch.chdir(shared)
+    assert run(tmp_path, "release", "GPU0") == 0
+    assert "相乗りを取り下げました" in capsys.readouterr().out
+
+    survivor = board.read(RESOURCE)
+    assert survivor is not None, "S の主宣言が消えている"
+    assert survivor.job == "S のジョブ"
+    assert board.list_joins(RESOURCE) == []
