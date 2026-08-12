@@ -461,6 +461,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     resource_id = naming.normalize(args.res)
     observation = Observation(busy=FOUND_CHOICES.get(args.found), note=args.observed)
     log_path = Path(args.log) if args.log else runner.build_log_path(board.root, resource_id)
+    # 掃除は**本ツールのログ置き場だけ**に対して行う。書き込み先（--log で指定されうる）を
+    # 掃除すると、利用者のプロジェクト配下にある無関係な *.log を消す。
+    runner.prune_own_logs(board.root)
 
     # ラッパーはジョブと同じ寿命を持つ。ここでだけ PID を記録する。
     result = acquire(
@@ -812,6 +815,16 @@ def _cmd_release(args: argparse.Namespace) -> int:
     board = Board(args.home)
     resource_id = naming.normalize(args.resource)
     prefer = "primary" if args.primary else ("join" if args.join else None)
+
+    # --force は「主宣言も相乗りもまとめて消す」であり、--primary / --join は「片方を狙う」。
+    # 併用を黙って前者に倒すと、相乗りだけ外すつもりで走行中の主宣言まで消える。
+    if args.force and prefer is not None:
+        print(
+            "--force と --primary / --join は同時に指定できません"
+            "（--force は主宣言と相乗りをまとめて消します）",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
 
     # 読んで、所有を確かめて、消すまでを排他区間にする（`update` と同じ理由）。
     with board.locked(resource_id) as lock:

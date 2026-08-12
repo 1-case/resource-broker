@@ -611,3 +611,37 @@ def test_command_line_is_not_interpreted(tmp_path: Path) -> None:
         cli_module.SPAWN = runner.default_spawn  # type: ignore[assignment]
 
     assert captured["argv"] == original
+
+
+def test_a_custom_log_directory_is_never_pruned(tmp_path: Path) -> None:
+    """``--log`` で指定した場所の無関係なログを消さない（回帰テスト）。
+
+    掃除を「書き込み先のディレクトリ」に対して行っていたため、
+    ``rb run --log runs/e059/train.log`` とすると **``runs/e059/`` にある 7 日より古い
+    他の `*.log`（過去の実験ログ等）が黙って消えていた**。掲示板を守るための掃除が、
+    本ツールの管理外のファイルへ波及していた。
+    """
+    mine = tmp_path / "runs" / "e059"
+    mine.mkdir(parents=True)
+    bystander = mine / "過去の実験.log"
+    bystander.write_text("消えてはいけない", encoding="utf-8")
+    old = time.time() - 30 * 86400
+    os.utime(bystander, (old, old))
+
+    rb_run(tmp_path, sys.executable, "-c", "print('ok')", log=str(mine / "job.log"))
+
+    assert bystander.exists(), "--log の指定先にある無関係なログが消えた"
+
+
+def test_our_own_log_directory_is_pruned(tmp_path: Path) -> None:
+    """本ツールのログ置き場は掃除される（掃除そのものは効いている）。"""
+    logs = tmp_path / runner.LOG_DIR
+    logs.mkdir(parents=True)
+    stale = logs / "古い.log"
+    stale.write_text("古い", encoding="utf-8")
+    old = time.time() - 30 * 86400
+    os.utime(stale, (old, old))
+
+    rb_run(tmp_path, sys.executable, "-c", "print('ok')")
+
+    assert not stale.exists(), "自分のログ置き場が掃除されていない"
