@@ -2,7 +2,7 @@
 
 掲示板は**資源ごとに 1 ファイル**の JSON である。単一ファイルに集約しないのは、
 破損の被害を 1 資源に閉じ込めるためと、``O_EXCL`` による取得競合の解決を
-単純にするためである（DESIGN.md「アーキテクチャ」）。
+単純にするためである（DESIGN.md「Architecture」）。
 
 本モジュールの全ての公開関数は**例外を投げない**。読めない・書けない・壊れているは
 すべて「情報が無い」に畳み込み、呼び出し側が fail-open で通せるようにする。
@@ -32,7 +32,7 @@ class Entry:
     """掲示板の 1 エントリ。
 
     全フィールドを機械が生成できることが要件である。人間や LLM にしか
-    書けない項目を増やしてはならない（DESIGN.md「掲示板のスキーマ」）。
+    書けない項目を増やしてはならない（DESIGN.md「Board Schema」）。
     """
 
     resource: str
@@ -283,7 +283,7 @@ def _stamp_observed(observed: dict[str, object] | None) -> dict[str, object] | N
     """実測に観測時刻を刻む。
 
     「いつ観測したか」が無いと、掲示板に残った実測値がどの時点のものか分からない。
-    時刻はここで機械生成する（DESIGN.md「掲示板のスキーマ」の ``observed.at``）。
+    時刻はここで機械生成する（DESIGN.md「Board Schema」の ``observed.at``）。
     """
     if observed is None:
         return None

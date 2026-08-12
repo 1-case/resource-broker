@@ -24,8 +24,8 @@ Copyright (c) 2026 satorunnlg. All rights reserved.
 
 第3条（生成物）
 
-本ソフトウェアが生成する掲示板の内容、資源レジストリ、監査ログその他の生成物に
-ついても、本ライセンスの条件が及ぶ。
+本ソフトウェアが生成する掲示板の内容、監査ログその他の生成物についても、
+本ライセンスの条件が及ぶ。
 
 第4条（第三者ソフトウェア）
 
@@ -33,13 +33,12 @@ Copyright (c) 2026 satorunnlg. All rights reserved.
 当該第三者ソフトウェアには、それぞれの提供者が定めるライセンスが適用され、
 本ライセンスの条件は当該第三者ソフトウェアには及ばない。
 
-利用する第三者ソフトウェアとそのライセンスは DESIGN.md「技術スタック」に記載する。
+利用する第三者ソフトウェアとそのライセンスは DESIGN.md「Tech Stack」に記載する。
 本ソフトウェアを第三者へ配布する場合は、各ライセンスが要求する著作権表示及び
 ライセンス全文を THIRD_PARTY_NOTICES.md として同梱しなければならない。
 
-本ソフトウェアが資源の実測のために起動する外部コマンドは、利用者がレジストリへ
-登録したものであり、本ソフトウェアに含まれない。当該コマンドには、それぞれの
-提供者が定める利用条件が適用される。
+本ソフトウェアは資源の実測を行わず、そのための外部コマンドを起動しない。
+資源を調べる手段の選択と実行は利用者の責任において行われる。
 
 第5条（無保証）
 
@@ -73,14 +72,14 @@ No copying, modification, redistribution, public transmission, sale, sublicensin
 reverse engineering, or creation of derivative works is permitted without the prior
 written consent of the Copyright Holder. Internal research, development, and
 evaluation use by the Copyright Holder and expressly authorized persons is permitted.
-Board contents, the resource registry, audit logs, and other artifacts produced by
-the Software are also covered by this license.
+Board contents, audit logs, and other artifacts produced by the Software are also
+covered by this license.
 
 The Software incorporates third-party open source software, which remains governed
-by its own license terms; see DESIGN.md, section "技術スタック". External commands
-invoked for resource probing are registered by the user and are not part of the
-Software. Any distribution must include THIRD_PARTY_NOTICES.md carrying the
-required notices.
+by its own license terms; see DESIGN.md, section "Tech Stack". The Software does
+not probe resources and invokes no external command for that purpose; choosing and
+running such means is the user's responsibility. Any distribution must include
+THIRD_PARTY_NOTICES.md carrying the required notices.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. THE COPYRIGHT
 HOLDER SHALL NOT BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM

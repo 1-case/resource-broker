@@ -31,7 +31,7 @@ class Observation:
     持てば「GPU なら nvidia-smi」のような資源固有の分岐が生まれる。有限資源一般を
     扱うという目的に反するし、調べ方は陳腐化する。調べるのは資源を使おうとする
     セッション（Claude Code）の仕事であり、ここにはその**結論だけ**が入る
-    （DESIGN.md「調べるのは誰か」）。
+    （DESIGN.md「Who Investigates」）。
 
     Attributes
     ----------
