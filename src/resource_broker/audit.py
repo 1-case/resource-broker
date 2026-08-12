@@ -15,9 +15,13 @@ from pathlib import Path
 
 from . import clock
 
-#: 1 行の上限。これを超えると 1 回の write で書き切れず、他プロセスと交錯しうる。
-#: 自由記述の ``observed.note`` が長くなりうるため上限を設ける。
-MAX_LINE_CHARS = 8000
+#: 1 行の上限（**エンコード後のバイト数**）。
+#:
+#: 文字数で測ってはならない。日本語は UTF-8 で 1 文字 3 バイトになるため、
+#: 8000 文字の上限は実際には 24000 バイトを許すことになる。
+#: ``O_APPEND`` の write が他プロセスと交錯しないのは、POSIX で ``PIPE_BUF``
+#: （多くの環境で 4096 バイト）以下のときだけである。ここはその内側に収める。
+MAX_LINE_BYTES = 4000
 
 
 def audit_dir(root: Path) -> Path:
@@ -43,14 +47,15 @@ def append(root: Path, event: str, **fields: object) -> None:
         directory.mkdir(parents=True, exist_ok=True)
         target = directory / f"{clock.now().strftime('%Y-%m-%d')}.jsonl"
 
-        line = json.dumps(record, ensure_ascii=False, default=str)
-        if len(line) > MAX_LINE_CHARS:
-            line = line[:MAX_LINE_CHARS] + "…[truncated]"
-        data = (line + "\n").encode("utf-8", errors="replace")
+        data = _encode(record)
 
         # マシン上の全セッションが同じファイルへ追記する。テキスト層のバッファ越しに書くと、
         # 長い行がバッファ境界で分割されて他プロセスの行と交錯しうる。O_APPEND + 1 回の
-        # write なら、行の途中に割り込まれない（「沈黙は成功ではない」の唯一の担保を守る）。
+        # write なら、POSIX では PIPE_BUF 以下の追記が分割されない。
+        #
+        # **Windows はプロセス間の追記の原子性を保証しない。** ここは「短く保てば
+        # 交錯しにくい」という緩和であって保証ではない。行が壊れうる前提で読むこと
+        # （`rb history` は壊れた行を飛ばす）。
         handle = os.open(target, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
         try:
             os.write(handle, data)
@@ -58,3 +63,22 @@ def append(root: Path, event: str, **fields: object) -> None:
             os.close(handle)
     except Exception:  # noqa: BLE001 - 監査の失敗で本処理を止めない
         return
+
+
+def _encode(record: dict[str, object]) -> bytes:
+    """1 レコードを 1 行のバイト列にする。長すぎるものは**畳んで捨てる**。
+
+    途中で切ると JSON として壊れ、その行は読む側から丸ごと消える
+    （`rb history` は壊れた行を飛ばす）。切るくらいなら、
+    「いつ・何のイベントが起きたか」だけを残した**妥当な JSON** に置き換える。
+    長さの判定は文字数ではなく**エンコード後のバイト数**で行う。
+    """
+    line = json.dumps(record, ensure_ascii=False, default=str)
+    data = (line + "\n").encode("utf-8", errors="replace")
+    if len(data) <= MAX_LINE_BYTES:
+        return data
+
+    folded = {"at": record.get("at"), "event": record.get("event"), "truncated": True}
+    return (json.dumps(folded, ensure_ascii=False, default=str) + "\n").encode(
+        "utf-8", errors="replace"
+    )

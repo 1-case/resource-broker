@@ -66,7 +66,7 @@ def read_entries(root: Path) -> list[dict[str, object]]:
     **判定はしない。** 幽霊かどうかは読む側が `rb status` で確かめる。
     """
     board = root / "board"
-    entries: list[dict[str, object]] = []
+    collected: dict[bool, list[dict[str, object]]] = {False: [], True: []}
 
     for directory, is_join in ((board, False), (board / "joins", True)):
         try:
@@ -80,12 +80,18 @@ def read_entries(root: Path) -> list[dict[str, object]]:
                 continue
             if isinstance(data, dict) and data.get("resource"):
                 data["_join"] = is_join
-                entries.append(data)
+                collected[is_join].append(data)
 
     # **上限は読めた件数に効かせる。** パスの段階で切ると、壊れたファイルがファイル名順で
     # 先頭に並んだときに生きた宣言が 1 件も残らない。掲示板が汚れているときに黙るのは、
     # いちばん注入が要る場面で黙ることになる。
-    return entries[:MAX_ENTRIES]
+    #
+    # **主宣言と相乗りで枠を分ける。** 連結してから切ると、主宣言が上限に達した時点で
+    # 相乗りが 1 件も出なくなる。相乗りは「主宣言だけでは見えない使用者」であり、
+    # 真っ先に落としてよいものではない。
+    primaries, joins = collected[False], collected[True]
+    head = primaries[: MAX_ENTRIES - min(MAX_ENTRIES // 2, len(joins))]
+    return head + joins[: MAX_ENTRIES - len(head)]
 
 
 def build_notice(entries: list[dict[str, object]]) -> str:

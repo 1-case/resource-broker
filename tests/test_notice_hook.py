@@ -156,6 +156,23 @@ def test_absence_of_declaration_is_not_reported_as_free(tmp_path: Path) -> None:
     assert "誰も使っていないとは限らない" in notice
 
 
+def test_a_fully_qualified_resource_in_the_guard_table_matches(tmp_path: Path) -> None:
+    """判定表に ``host::GPU0`` と書いても掲示板の宣言に一致する。
+
+    照合は**両側を同じ形にしてから**行う。片側だけホスト名を外すと、正規化済みの
+    ID を書いた行が永久に一致しなくなる。「その場に置いた具体的事実が出ない」形の
+    壊れ方は、書いた本人にも気づけない。
+    """
+    write_guard(tmp_path, [{"pattern": r"run_e\d+\.py", "resource": normalize("GPU0")}])
+    board = Board(tmp_path)
+    assert board.try_claim(build_entry(normalize("GPU0"), job="E059 eval", session="folnet"))
+
+    notice = notice_of(run_hook(tmp_path, bash("python scripts/run_e059.py")))
+
+    assert "folnet" in notice
+    assert "E059 eval" in notice
+
+
 # --- 黙るべきとき ---------------------------------------------------------------
 
 
@@ -185,6 +202,22 @@ def test_mentioning_is_not_running(tmp_path: Path) -> None:
     command = "python - <<'PY'\nprint('scripts/run_e059.py を実行する前に宣言する')\nPY"
 
     assert run_hook(tmp_path, bash(command)).stdout.strip() == b""
+
+
+def test_silent_when_i_declared_it_from_a_parent_directory(tmp_path: Path) -> None:
+    """自分が宣言した資源には出さない。**照合は本体と同じ規則にする。**
+
+    宣言した場所の配下でコマンドを打つのは普通にある。ここだけ完全一致にすると、
+    サブディレクトリへ降りた瞬間に「宣言しろ」と毎回言われる。ノイズは無視を招く。
+    """
+    write_guard(tmp_path, [RULE])
+    board = Board(tmp_path)
+    place = "C:\\works\\folnet"
+    assert board.try_claim(build_entry(normalize("GPU0"), job="E059 eval", cwd=place))
+
+    result = run_hook(tmp_path, bash("python scripts/run_e059.py", cwd=place + "\\runs\\e059"))
+
+    assert result.stdout.strip() == b""
 
 
 def test_other_tools_are_not_touched(tmp_path: Path) -> None:

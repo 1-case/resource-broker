@@ -20,10 +20,11 @@ import json
 import os
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import clock, liveness, naming, platform_info, runner, waiting
-from .board import Board, Entry, build_entry, build_eta
+from .board import Board, Entry, LockState, RemovalResult, build_entry, build_eta
 from .liveness import Observation, Verdict
 
 EXIT_OK = 0
@@ -84,6 +85,26 @@ def _known_resources(board: Board) -> list[str]:
     return resources
 
 
+@dataclass(frozen=True)
+class Acquisition:
+    """取得の結果。
+
+    Attributes
+    ----------
+    entry : Entry or None
+        取得した宣言。取得できなかったときは None。
+    code : int
+        終了コード。
+    declared : bool
+        掲示板に宣言を**残せた**か。掲示板が書けなかった場合、fail-open として作業は
+        通すが宣言は残っていない。これを区別しないと「宣言しました」という嘘を出す。
+    """
+
+    entry: Entry | None
+    code: int
+    declared: bool = False
+
+
 def _describe(entry: Entry) -> dict[str, object]:
     """1 つの宣言を機械可読な形にする。相乗りも同じ形で並べる。"""
     return {
@@ -108,10 +129,15 @@ def _cmd_status(args: argparse.Namespace) -> int:
     for resource_id in targets:
         verdict, entry = assess(board, resource_id)
         joins = board.list_joins(resource_id)
-        # **相乗りだけが残っている資源を「空き」と言わない。** 主宣言が先に解放されて
-        # 相乗りが残る場合があり、そこを空きと報告すると、実際に使っている者がいるのに
-        # 他セッションが取りにいく。フックの表示もこの値で絞られる。
-        free = liveness.is_free(verdict) and not joins
+        # **「空き」と「誰も使っていない」は別の問いである。** 2 つに分けて両方載せる。
+        #
+        # free     : 主宣言の枠が取れるか。相乗りは影響しない（相乗りがあっても
+        #            主宣言は取れる）。`claim` の可否と一致する
+        # occupied : 誰か 1 人でも宣言しているか（主宣言または相乗り）。表示と
+        #            フックの絞り込みはこちらを使う。相乗りだけが残った資源を
+        #            「空き」と出すと、実際に使っている者がいるのに通知から消える
+        free = liveness.is_free(verdict)
+        occupied = (not free) or bool(joins)
         rows.append(
             {
                 "joins": [_describe(join) for join in joins],
@@ -125,9 +151,10 @@ def _cmd_status(args: argparse.Namespace) -> int:
                     if entry is not None
                     else f"主宣言は無いが相乗りが {len(joins)} 件ある"
                 )
-                if not free
+                if occupied
                 else liveness.explain(verdict),
                 "free": free,
+                "occupied": occupied,
                 "holder": entry.holder if entry else None,
                 "since": entry.since if entry else None,
                 "log": entry.log if entry else None,
@@ -148,7 +175,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     for row in rows:
-        mark = "空き" if row["free"] else "使用中"
+        # 表示は occupied（誰か 1 人でも宣言しているか）で決める。
+        mark = "使用中" if row["occupied"] else "空き"
         print(f"{row['display']:<24} {mark:<6} {row['reason']}")
         holder = row["holder"] or {}
         if holder:
@@ -214,7 +242,7 @@ def acquire(
     log: str | None = None,
     force: bool = False,
     pid: int | None = None,
-) -> tuple[Entry | None, int]:
+) -> Acquisition:
     """宣言を取得する。``claim`` と ``run`` で共通の判断である。
 
     Parameters
@@ -226,24 +254,33 @@ def acquire(
 
     Returns
     -------
-    tuple of (Entry or None, int)
-        取得できたエントリと終了コード。取得できなければ ``(None, EXIT_BUSY)``。
+    Acquisition
+        取得できたエントリ・終了コード・掲示板に残せたか。
     """
     # 自分で調べて使用中だったのなら、掲示板を読むまでもなく宣言してはならない。
     if observation.busy is True:
         print("自分の調査で使用中と分かっているため宣言できません", file=sys.stderr)
         print(f"  観測  : {observation.note}", file=sys.stderr)
-        return None, EXIT_BUSY
+        return Acquisition(None, EXIT_BUSY)
 
     # 「読んで、幽霊なら退けて、作る」を排他区間にする。O_EXCL が守るのは作成だけで、
     # この手順の途中は無防備である。2 つのセッションが同じ幽霊を見て両方成功しうる。
-    with board.locked(resource_id) as acquired:
-        if not acquired:
+    with board.locked(resource_id) as lock:
+        # **インフラの故障と資源の競合を混同しない**（CLAUDE.md「Fail-Open」）。
+        # 諦めてよいのは競合（他セッションが保持していた）のときだけである。
+        # ロックの仕組みそのものが使えないのは本ツール側の故障であり、そこで止めると
+        # 掲示板が壊れた瞬間に全セッションの取得が止まる。O_EXCL 一本で続行する。
+        if lock is LockState.CONTENDED:
             print(
                 "他のセッションが同じ資源を操作中です。少し待って再試行してください",
                 file=sys.stderr,
             )
-            return None, EXIT_BUSY
+            return Acquisition(None, EXIT_BUSY)
+        if lock is LockState.UNAVAILABLE:
+            print(
+                "[rb] ロックが使えないため排他を弱めて続行します（監査ログを参照）",
+                file=sys.stderr,
+            )
 
         verdict, entry = assess(board, resource_id, observation)
 
@@ -253,7 +290,20 @@ def acquire(
             print(f"  since : {entry.since}", file=sys.stderr)
             if entry.log:
                 print(f"  log   : {entry.log}", file=sys.stderr)
-            return None, EXIT_BUSY
+            return Acquisition(None, EXIT_BUSY)
+
+        # **相乗りがいることは知らせるが、止めない。** 主宣言の枠が空いていることと、
+        # 誰も資源を使っていないことは別である。相乗りしてよいかは当事者が決める
+        # （CLAUDE.md「Resource Agnosticism」/ DESIGN.md「Sharing」）。
+        joins = board.list_joins(resource_id)
+        if joins:
+            print(
+                f"[rb] この資源には相乗りが {len(joins)} 件あります"
+                "（主宣言の枠は空いています。可否は当事者で決めること）",
+                file=sys.stderr,
+            )
+            for join in joins:
+                print(f"  相乗り: {join.session} / {join.job}", file=sys.stderr)
 
         if entry is not None:
             reason = "強制取得" if force else f"幽霊と判定した（{liveness.explain(verdict)}）"
@@ -272,11 +322,21 @@ def acquire(
             sharing=sharing,
         )
         if not board.try_claim(new_entry):
-            # ロックを取れているのでここには来ないはずだが、掲示板が書けない場合に落ちる。
-            print("宣言を作成できませんでした（監査ログを参照）", file=sys.stderr)
-            return None, EXIT_BUSY
+            # 誰かが先に取ったのか、掲示板が書けないのかを見分ける。
+            current = board.read(resource_id)
+            if current is not None:
+                print("ほぼ同時に他セッションが宣言しました", file=sys.stderr)
+                print(f"  宣言者: {current.session} / {current.job}", file=sys.stderr)
+                return Acquisition(None, EXIT_BUSY)
+            # 掲示板に書けない。**これは資源の競合ではない**ので通す（fail-open）。
+            # ただし宣言は残っていないので、呼び出し側が嘘を言わないよう declared=False。
+            print(
+                "[rb] 宣言を掲示板に残せませんでした（監査ログを参照）。作業は止めません",
+                file=sys.stderr,
+            )
+            return Acquisition(new_entry, EXIT_OK, declared=False)
 
-    return new_entry, EXIT_OK
+    return Acquisition(new_entry, EXIT_OK, declared=True)
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
@@ -285,7 +345,7 @@ def _cmd_claim(args: argparse.Namespace) -> int:
     observation = Observation(busy=FOUND_CHOICES.get(args.found), note=args.observed)
 
     # 手動の claim では PID を記録しない（CLI プロセスは即座に終了するため）。
-    entry, code = acquire(
+    result = acquire(
         board,
         resource_id,
         observation,
@@ -299,10 +359,16 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         log=args.log,
         force=args.force,
     )
-    if entry is None:
-        return code
+    if result.entry is None:
+        return result.code
 
-    print(f"宣言しました: {entry.display} / {entry.job}")
+    if not result.declared:
+        # 通したが宣言は残っていない。**成功と言わない**（掲示板に出ないため
+        # 他セッションからは見えない）。
+        print("宣言は掲示板に残っていません。他セッションからは見えません", file=sys.stderr)
+        return result.code
+
+    print(f"宣言しました: {result.entry.display} / {result.entry.job}")
     return EXIT_OK
 
 
@@ -330,7 +396,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     log_path = Path(args.log) if args.log else runner.build_log_path(board.root, resource_id)
 
     # ラッパーはジョブと同じ寿命を持つ。ここでだけ PID を記録する。
-    entry, code = acquire(
+    result = acquire(
         board,
         resource_id,
         observation,
@@ -345,29 +411,57 @@ def _cmd_run(args: argparse.Namespace) -> int:
         force=args.force,
         pid=os.getpid(),
     )
+    entry = result.entry
     if entry is None:
         print("資源を取得できなかったため、コマンドを実行していません", file=sys.stderr)
-        return code
+        return result.code
 
-    print(f"宣言しました: {entry.display} / {entry.job}")
-    print(f"ログ: {log_path}")
+    # **宣言を作ったら、次の行から try に入る。** 間に置いた print が
+    # `UnicodeEncodeError`（Windows のコンソールは cp932）や閉じたパイプの
+    # `OSError` で落ちると、宣言だけが掲示板に残る。
     try:
+        print(f"宣言しました: {entry.display} / {entry.job}")
+        print(f"ログ: {log_path}")
         return runner.execute(list(args.trailing), log_path, spawn=SPAWN)
     except KeyboardInterrupt:
         print("中断されました", file=sys.stderr)
         return EXIT_INTERRUPTED
     finally:
+        _release_after_run(board, resource_id, entry, declared=result.declared)
+
+
+def _release_after_run(board: Board, resource_id: str, entry: Entry, *, declared: bool) -> None:
+    """``rb run`` の後始末。**ここから例外を出さない。**
+
+    ``finally`` の中で例外が出ると、子プロセスが 0 で終わっていても呼び出し側には
+    ラッパーの故障（126）が返る。print 1 つで終了コードが変わってはならない。
+    """
+    try:
+        if not declared:
+            return  # そもそも掲示板に残っていない。消すものが無い
+
         # **自分の宣言であることを確かめてから消す。** 実行中に他セッションが --force で
         # 取り直していた場合、無条件に消すと生きた宣言を消してしまう。掲示板は空・資源は
         # 掴まれたままという、最も検出しにくい不整合になる。
-        if board.remove_if_owned(resource_id, reason="rb run の終了", nonce=entry.nonce):
+        result = board.remove_if_owned(resource_id, reason="rb run の終了", nonce=entry.nonce)
+        if result is RemovalResult.REMOVED:
             print(f"解放しました: {entry.display}")
-        else:
+        elif result is RemovalResult.ABSENT:
+            print(f"宣言は既に掲示板にありません: {entry.display}", file=sys.stderr)
+        elif result is RemovalResult.NOT_OWNED:
             print(
                 "解放をやめました: 宣言が自分のものではなくなっています"
                 "（実行中に他セッションが取り直した可能性）",
                 file=sys.stderr,
             )
+        else:
+            print(
+                f"解放に失敗しました: {entry.display}"
+                "（掲示板に宣言が残っています。rb release で外すこと）",
+                file=sys.stderr,
+            )
+    except Exception:  # noqa: BLE001 - 後始末の失敗で終了コードを変えない
+        pass
 
 
 def _cmd_wait(args: argparse.Namespace) -> int:
@@ -542,6 +636,16 @@ def _cmd_update(args: argparse.Namespace) -> int:
     """
     board = Board(args.home)
     resource_id = naming.normalize(args.resource)
+
+    # **読んで、所有を確かめて、書く**までを排他区間にする。この間に他セッションが
+    # `claim --force` で取り直すと、他人の宣言を自分の申告で上書きしてしまう。
+    with board.locked(resource_id) as lock:
+        _warn_if_unlocked(board, resource_id, lock, event="update_unlocked")
+        return _update_locked(board, resource_id, args)
+
+
+def _update_locked(board: Board, resource_id: str, args: argparse.Namespace) -> int:
+    """``update`` の本体。呼び出し側がロックを保持している前提である。"""
     entry = board.read(resource_id)
 
     if entry is None:
@@ -583,12 +687,68 @@ def _cmd_update(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _warn_if_unlocked(board: Board, resource_id: str, lock: LockState, *, event: str) -> None:
+    """ロック無しで続行することを監査ログに残す。
+
+    解放と更新では、ロックが取れないことを理由に**やめない**。宣言を残したまま
+    終わるほうが有害（幽霊が資源を占有し続ける）であり、所有者照合という主防御は
+    失われないためである。取得（``acquire``）だけは競合で諦める。
+    """
+    if lock is not LockState.ACQUIRED:
+        board.audit(event, resource=resource_id, lock=str(lock))
+
+
 def _cmd_release(args: argparse.Namespace) -> int:
     """自分の宣言を取り下げる。相乗りしていればそちらを先に外す。"""
     board = Board(args.home)
     resource_id = naming.normalize(args.resource)
 
-    if board.remove_join(resource_id, os.getcwd(), reason="release コマンド"):
+    # 読んで、所有を確かめて、消すまでを排他区間にする（`update` と同じ理由）。
+    with board.locked(resource_id) as lock:
+        _warn_if_unlocked(board, resource_id, lock, event="release_unlocked")
+        if args.force:
+            return _release_forced(board, resource_id)
+        return _release_own(board, resource_id)
+
+
+def _release_forced(board: Board, resource_id: str) -> int:
+    """``--force`` の解放。**相乗りも一緒に外す。**
+
+    主宣言だけ消せても、残った相乗りが資源を「使用中」に固定し続ける。
+    そうなると ``rb wait`` は二度と戻らず、フックは全セッションに出し続ける。
+    強制解放は最後の掃除手段なので、掃除しきれなければ意味がない。
+    """
+    primary = (
+        board.remove_detailed(resource_id, reason="release コマンド（強制）")
+        if board.read(resource_id) is not None
+        else RemovalResult.ABSENT
+    )
+    removed_joins = board.remove_joins(resource_id, reason="release コマンド（強制）")
+    removed_primary = primary is RemovalResult.REMOVED
+
+    # **「消せなかった」を「無かった」と混ぜない。** 掲示板には残っている。
+    if primary is RemovalResult.FAILED:
+        print(
+            "解放に失敗しました（掲示板に主宣言が残っています。監査ログを参照）", file=sys.stderr
+        )
+        return EXIT_OK
+
+    if not removed_primary and not removed_joins:
+        print("宣言は見つかりませんでした（既に解放済みです）")
+        return EXIT_OK
+
+    parts = []
+    if removed_primary:
+        parts.append("主宣言")
+    if removed_joins:
+        parts.append(f"相乗り {removed_joins} 件")
+    print(f"強制解放しました: {naming.display_default(resource_id)}（{' / '.join(parts)}）")
+    return EXIT_OK
+
+
+def _release_own(board: Board, resource_id: str) -> int:
+    """自分の宣言だけを取り下げる。相乗りしていればそちらを先に外す。"""
+    if board.remove_own_join(resource_id, os.getcwd(), reason="release コマンド"):
         print(f"相乗りを取り下げました: {naming.display_default(resource_id)}")
         return EXIT_OK
 
@@ -599,17 +759,20 @@ def _cmd_release(args: argparse.Namespace) -> int:
 
     # **他人の宣言は消さない。** 掲示板の唯一の強制点は先着排他であり、最も打ちやすい
     # コマンドでそれを無効化できてはならない。claim が --force を要求するのと対称にする。
-    if not args.force and not board.owns(entry, cwd=os.getcwd()):
+    if not board.owns(entry, cwd=os.getcwd()):
         print("他セッションの宣言は解放できません（--force で強制解放できます）", file=sys.stderr)
         print(f"  宣言者: {entry.session} / {entry.job}", file=sys.stderr)
         print(f"  since : {entry.since}", file=sys.stderr)
         return EXIT_BUSY
 
-    reason = "release コマンド（強制）" if args.force else "release コマンド"
-    if board.remove(resource_id, reason=reason):
+    result = board.remove_detailed(resource_id, reason="release コマンド")
+    if result is RemovalResult.REMOVED:
         print(f"解放しました: {naming.display_default(resource_id)}")
-    else:
+    elif result is RemovalResult.ABSENT:
         print("宣言は見つかりませんでした（既に解放済みです）")
+    else:
+        # 削除できなかった。**「無かった」と混ぜない**（掲示板には残っている）。
+        print("解放に失敗しました（掲示板に宣言が残っています。監査ログを参照）", file=sys.stderr)
     return EXIT_OK
 
 

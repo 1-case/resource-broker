@@ -120,9 +120,21 @@ def describe(resource: dict[str, object]) -> list[str]:
     return lines
 
 
+def is_occupied(resource: dict[str, object]) -> bool:
+    """誰か 1 人でも宣言しているか。
+
+    ``occupied``（主宣言または相乗りがある）で絞る。``free``（主宣言の枠が取れるか）で
+    絞ると、相乗りだけが残った資源が通知から消える。``occupied`` を持たない古い
+    ``rb`` の出力に当たったときだけ ``free`` から読み替える。
+    """
+    if "occupied" in resource:
+        return bool(resource["occupied"])
+    return not resource.get("free")
+
+
 def build_notice(resources: list[dict[str, object]]) -> str:
     """注入する本文を組み立てる。"""
-    busy = [r for r in resources if isinstance(r, dict) and not r.get("free")]
+    busy = [r for r in resources if isinstance(r, dict) and is_occupied(r)]
 
     if not busy:
         return f"[resource-broker] 掲示板は空です（誰も資源を宣言していません）。\n{USAGE}"

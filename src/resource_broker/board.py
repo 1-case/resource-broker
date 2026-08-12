@@ -15,9 +15,11 @@ import json
 import os
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 
 from . import audit, clock, naming, platform_info
@@ -37,6 +39,72 @@ LOCK_WAIT_S = 2.0
 #: 明らかに古いロックは奪う。保持時間はミリ秒単位なので、この閾値は十分に安全側である。
 LOCK_STALE_S = 30.0
 
+#: 削除をやり直す回数と間隔。
+#:
+#: Windows では、他プロセスが読んでいる最中のファイルを消すと共有違反
+#: （``PermissionError``）になる。フックが**全セッションの全プロンプト**で掲示板を
+#: 読むため、これは例外的な事態ではなく普通に起こりうる。1 回の失敗で諦めると、
+#: 解放したはずの宣言が残って資源を占有し続ける。
+UNLINK_ATTEMPTS = 4
+UNLINK_DELAY_S = 0.05
+
+
+class LockState(StrEnum):
+    """ロックの取得結果。
+
+    **3 値にするのは、インフラの故障と資源の競合を混同しないためである**
+    （CLAUDE.md「Fail-Open」）。2 値にすると「ロックのディレクトリが作れない」
+    という本ツール側の故障が「他セッションが使用中」に化け、掲示板が壊れた瞬間に
+    全セッションの取得が止まる。
+    """
+
+    ACQUIRED = "acquired"
+    """取れた。排他区間に入ってよい。"""
+
+    CONTENDED = "contended"
+    """他セッションが保持していて時間内に取れなかった。**取得は諦める**。"""
+
+    UNAVAILABLE = "unavailable"
+    """ロックの仕組みそのものが使えない（作れない・権限が無い・ディスクが一杯）。
+    これは資源の競合ではないので、**ロック無しで従来どおり続行する**。"""
+
+
+class RemovalResult(StrEnum):
+    """削除の結果。
+
+    「無い」「他人のもの」「失敗した」を区別する。全部 ``False`` に畳むと、
+    共有違反で消せなかっただけなのに「宣言が自分のものではなくなっています」という
+    **事実と違う説明**を出すことになる。
+    """
+
+    REMOVED = "removed"
+    ABSENT = "absent"
+    NOT_OWNED = "not_owned"
+    FAILED = "failed"
+
+
+def _unlink_with_retry(path: Path) -> tuple[RemovalResult, str]:
+    """ファイルを消す。共有違反は数回やり直す。
+
+    Returns
+    -------
+    tuple of (RemovalResult, str)
+        結果と、失敗したときの理由。
+    """
+    for attempt in range(UNLINK_ATTEMPTS):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return RemovalResult.ABSENT, ""
+        except OSError as exc:
+            if attempt == UNLINK_ATTEMPTS - 1:
+                return RemovalResult.FAILED, str(exc)
+            time.sleep(UNLINK_DELAY_S)
+            continue
+        return RemovalResult.REMOVED, ""
+    return RemovalResult.FAILED, "削除を諦めた"
+
+
 #: 読み取り時に既知として扱うキー。これ以外は extra に退避して書き戻す（前方互換）。
 _KNOWN_KEYS = frozenset(
     {
@@ -55,14 +123,17 @@ _KNOWN_KEYS = frozenset(
 )
 
 
-def _related_paths(left: str, right: str) -> bool:
-    """2 つのパスが同じ場所か、一方が他方の配下か。"""
-    a = os.path.normcase(os.path.normpath(left))
-    b = os.path.normcase(os.path.normpath(right))
-    if a == b:
-        return True
-    sep = os.sep
-    return a.startswith(b + sep) or b.startswith(a + sep)
+def _is_within(child: str, parent: str) -> bool:
+    """``child`` が ``parent`` と同じ場所か、その**配下**か。
+
+    **方向を一方向に限る。** 以前は逆方向（親が子の宣言を所有する）も認めていたが、
+    このマシンでは全プロジェクトが 1 つのルートの下にあるため、ハブのルートで動く
+    セッションが**全アセットの宣言を ``--force`` 無しで解放・更新できた**。
+    「自分の場所の外にある宣言は自分のものではない」という線をここで引く。
+    """
+    a = os.path.normcase(os.path.normpath(child))
+    b = os.path.normcase(os.path.normpath(parent))
+    return a == b or a.startswith(b.rstrip(os.sep) + os.sep)
 
 
 @dataclass
@@ -203,49 +274,66 @@ class Board:
         return self.entries_dir / f"{naming.safe_filename(resource_id)}.lock"
 
     @contextmanager
-    def locked(self, resource_id: str, *, wait_s: float = LOCK_WAIT_S):  # noqa: ANN201
+    def locked(self, resource_id: str, *, wait_s: float = LOCK_WAIT_S) -> Iterator[LockState]:
         """取得の排他区間を守る。
 
         ``O_EXCL`` が守るのは**ファイルの作成**だけである。「読んで、幽霊なら消して、作る」
         という手順の途中は無防備で、2 つのセッションが同じ幽霊を見て両方とも成功しうる。
         これは本ツールが防ぐと宣言している事故そのものなので、区間ごと囲う。
 
-        取れなければ ``False`` を渡す。呼び出し側は**取得を諦める**こと。ロックの保持は
-        ミリ秒単位なので、待って取れないのは他セッションが同時に取りにきたときだけであり、
-        そこで通すと二重取得になる。
+        結果は 3 値で渡す（:class:`LockState`）。**インフラの故障と資源の競合を
+        混同しない**（CLAUDE.md「Fail-Open」）。呼び出し側が取得を諦めてよいのは
+        ``CONTENDED``（他セッションが保持していた）のときだけで、``UNAVAILABLE``
+        （ロックの仕組みが使えない）ではロック無しで続行すること。
 
         放置されたロックは奪う。ロックを持ったままプロセスが死んで掲示板が永久に固まるのは、
         本ツールの故障でユーザーの作業を止めることに等しい。
+
+        Yields
+        ------
+        LockState
+            取得の結果。
         """
         path = self.lock_path(resource_id)
-        acquired = False
+        # 取得ごとに一意なトークン。奪うとき・返すときに「これは自分（または自分が
+        # 見た）ロックか」を確かめるために使う。PID では再利用があるため足りない。
+        token = uuid.uuid4().hex
+        state = LockState.CONTENDED
         deadline = time.monotonic() + wait_s
+        stolen = False
 
         try:
             self.entries_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             self.audit("lock_mkdir_failed", resource=resource_id, error=str(exc))
-            yield False
+            yield LockState.UNAVAILABLE
             return
 
         while True:
             try:
                 handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             except FileExistsError:
-                if self._steal_stale_lock(path, resource_id):
-                    continue
+                # **奪うのは 1 回だけ**。奪っても取れないなら、それは放置ではなく
+                # 競合である（奪った直後に別のセッションが取っている）。
+                if not stolen:
+                    stolen = self._steal_stale_lock(path, resource_id)
+                # 奪えたかどうかに関わらず deadline を評価する。ここを飛ばすと
+                # 待ち時間の上限が効かなくなる。
                 if time.monotonic() >= deadline:
                     self.audit("lock_timeout", resource=resource_id)
+                    state = LockState.CONTENDED
                     break
-                time.sleep(0.05)
+                time.sleep(UNLINK_DELAY_S)
                 continue
             except OSError as exc:
+                # 権限・ディスク一杯・共有違反。**これは競合ではない**。
                 self.audit("lock_failed", resource=resource_id, error=str(exc))
+                state = LockState.UNAVAILABLE
                 break
 
-            acquired = True
+            state = LockState.ACQUIRED
             try:
-                os.write(handle, str(os.getpid()).encode("ascii"))
+                os.write(handle, token.encode("ascii"))
             except OSError:
                 pass
             finally:
@@ -253,28 +341,57 @@ class Board:
             break
 
         try:
-            yield acquired
+            yield state
         finally:
-            if acquired:
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
+            if state is LockState.ACQUIRED:
+                self._release_lock(path, token, resource_id)
+
+    def _read_lock_token(self, path: Path) -> str | None:
+        """ロックファイルの中身を読む。読めなければ None。"""
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
 
     def _steal_stale_lock(self, path: Path, resource_id: str) -> bool:
-        """放置されたロックを奪う。奪ったら True。"""
+        """放置されたロックを奪う。奪ったら True。
+
+        **他人の新しいロックを消さない。** 年齢を見てから ``unlink`` するまでの間に、
+        別プロセスが古いロックを消して自分のロックを作ることがある。その隙に消すと、
+        生きているロックを消して排他が崩れる。ロックファイルには取得ごとに一意な
+        トークンが入っているので、**読んだときと同じ内容である**ことを確かめてから消す。
+        """
+        first = self._read_lock_token(path)
+        if first is None:
+            return False
         try:
             age = time.time() - path.stat().st_mtime
         except OSError:
             return False
         if age < LOCK_STALE_S:
             return False
-        try:
-            path.unlink()
-        except OSError:
+        if self._read_lock_token(path) != first:
+            return False  # 入れ替わっている。他人の新しいロックである
+        result, _ = _unlink_with_retry(path)
+        if result is not RemovalResult.REMOVED:
             return False
         self.audit("lock_stolen", resource=resource_id, age_s=round(age, 1))
         return True
+
+    def _release_lock(self, path: Path, token: str, resource_id: str) -> None:
+        """自分が取ったロックだけを返す。
+
+        保持が ``LOCK_STALE_S`` を超えると他プロセスに奪われる。奪われたあとに無条件で
+        ``unlink`` すると、**他人のロックを消す**ことになる。トークンが一致するときだけ消す。
+        中身が空のときは自分が作って書けなかった場合なので、自分のものとして扱う。
+        """
+        current = self._read_lock_token(path)
+        if current is None:
+            return  # 既に無い、または読めない。触らない
+        if current not in ("", token):
+            self.audit("lock_release_skipped", resource=resource_id)
+            return
+        _unlink_with_retry(path)
 
     def read(self, resource_id: str) -> Entry | None:
         """エントリを読む。存在しない・壊れている場合は None。
@@ -308,10 +425,12 @@ class Board:
         nonce が一致すれば確実に自分のものである（宣言ごとに一意）。nonce を持たない
         古いエントリのために cwd での照合も残す。
 
-        cwd の照合は**同一か、一方が他方の配下**なら自分のものとみなす。宣言したときと
-        解放するときで作業ディレクトリが違うことは普通にある（サブディレクトリへ降りた等）。
-        そこで弾くと、自分の資源を自分で解放できないという最悪の使い勝手になる。
-        別プロジェクトの宣言はパスが分かれるので、守りたい線は保たれる。
+        cwd の照合は**宣言者の場所が自分の場所と同じか、自分の祖先のとき**だけ自分のものと
+        みなす。宣言したときと解放するときで作業ディレクトリが違うことは普通にある
+        （サブディレクトリへ降りた等）ので、そこで弾くと自分の資源を自分で解放できない。
+        逆方向（自分が宣言者の祖先）は**認めない**。このマシンでは全プロジェクトが 1 つの
+        ルートの下にあるため、認めるとハブのルートで動くセッションが全アセットの宣言を
+        ``--force`` 無しで解放・更新できてしまう。
 
         **所有者を確かめずに消してはならない。** 他セッションの生きた宣言を消すと、
         掲示板は空・資源は掴まれたままという最も検出しにくい不整合ができる。
@@ -321,20 +440,38 @@ class Board:
             return str(holder["nonce"]) == nonce
         declared = str(holder.get("cwd") or "")
         if cwd and declared:
-            return _related_paths(declared, cwd)
+            return _is_within(cwd, declared)
         return False
 
     def remove_if_owned(
         self, resource_id: str, *, reason: str, nonce: str | None = None, cwd: str | None = None
-    ) -> bool:
-        """自分の宣言であるときだけ削除する。"""
-        entry = self.read(resource_id)
-        if entry is None:
-            return False
-        if not self.owns(entry, nonce=nonce, cwd=cwd):
-            self.audit("remove_refused", resource=resource_id, reason="他者の宣言のため")
-            return False
-        return self.remove(resource_id, reason=reason)
+    ) -> RemovalResult:
+        """自分の宣言であるときだけ削除する。
+
+        「読んで、所有を確かめて、消す」までが 1 つの操作である。nonce の照合は
+        **読んだ瞬間の話**でしかないため、途中で他セッションが ``claim --force`` で
+        取り直すと新しい宣言を消しうる。区間ごとロックで囲う。
+
+        ロックが取れないときは**囲わずに続行する**。解放できずに宣言を残すほうが有害
+        （幽霊が資源を占有し続ける）であり、所有者照合という主防御は失われないためである。
+        ロック無しで消したことは監査ログに残す。
+
+        Returns
+        -------
+        RemovalResult
+            消した / 無かった / 他人のものだった / 消せなかった。呼び出し側が
+            **事実と違う説明**を出さないよう、4 つを畳まずに返す。
+        """
+        with self.locked(resource_id) as lock:
+            if lock is not LockState.ACQUIRED:
+                self.audit("remove_unlocked", resource=resource_id, lock=str(lock))
+            entry = self.read(resource_id)
+            if entry is None:
+                return RemovalResult.ABSENT
+            if not self.owns(entry, nonce=nonce, cwd=cwd):
+                self.audit("remove_refused", resource=resource_id, reason="他者の宣言のため")
+                return RemovalResult.NOT_OWNED
+            return self.remove_detailed(resource_id, reason=reason)
 
     def list_all(self) -> list[Entry]:
         """全エントリを読む。読めなかったものは黙って飛ばす。"""
@@ -374,21 +511,8 @@ class Board:
             self.audit("mkdir_failed", resource=entry.resource, error=str(exc))
             return False
 
-        payload = json.dumps(entry.to_dict(), ensure_ascii=False, indent=2)
-        try:
-            handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            return False
-        except OSError as exc:
-            self.audit("claim_failed", resource=entry.resource, error=str(exc))
-            return False
-
-        try:
-            with os.fdopen(handle, "w", encoding="utf-8") as stream:
-                stream.write(payload + "\n")
-        except OSError as exc:
-            self.audit("claim_write_failed", resource=entry.resource, error=str(exc))
-            self.remove(entry.resource, reason="書き込みに失敗したため取り消した")
+        payload = json.dumps(entry.to_dict(), ensure_ascii=False, indent=2) + "\n"
+        if not self._create_exclusively(path, payload, entry.resource):
             return False
 
         # 見積もりも残す。次に同じ資源を使うとき、前回どう見積もったかを振り返れる
@@ -402,6 +526,55 @@ class Board:
             usage=entry.usage,
             sharing=entry.sharing or None,
         )
+        return True
+
+    def _create_exclusively(
+        self, path: Path, payload: str, resource_id: str, *, kind: str = "claim"
+    ) -> bool:
+        """中身の入ったファイルを**先着 1 名で**作る。作れたら True。
+
+        ``O_EXCL`` で作ってから書くと、作成と書き込みの間に読んだ他セッションが
+        **空のファイル**を見る。取得の排他自体は崩れない（作成が先着 1 名だから）が、
+        フックや ``rb status`` から宣言が一瞬消える。先に一時ファイルへ書いてから
+        ハードリンクで名前を付ければ、見えた瞬間には中身が揃っている。
+        ハードリンクが使えないファイルシステムでは従来の手順へ退避する。
+        """
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.new")
+        try:
+            temporary.write_text(payload, encoding="utf-8")
+        except OSError as exc:
+            self.audit(f"{kind}_write_failed", resource=resource_id, error=str(exc))
+            return False
+
+        try:
+            os.link(temporary, path)
+            return True
+        except FileExistsError:
+            return False
+        except OSError:
+            return self._create_by_exclusive_open(path, payload, resource_id, kind=kind)
+        finally:
+            _unlink_with_retry(temporary)
+
+    def _create_by_exclusive_open(
+        self, path: Path, payload: str, resource_id: str, *, kind: str = "claim"
+    ) -> bool:
+        """``O_EXCL`` で作ってから書く。ハードリンクが使えない環境の退避路。"""
+        try:
+            handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return False
+        except OSError as exc:
+            self.audit(f"{kind}_failed", resource=resource_id, error=str(exc))
+            return False
+
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(payload)
+        except OSError as exc:
+            self.audit(f"{kind}_write_failed", resource=resource_id, error=str(exc))
+            _unlink_with_retry(path)
+            return False
         return True
 
     @property
@@ -434,73 +607,104 @@ class Board:
             self.audit("join_mkdir_failed", resource=entry.resource, error=str(exc))
             return False
 
-        payload = json.dumps(entry.to_dict(), ensure_ascii=False, indent=2)
-        try:
-            handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            return False
-        except OSError as exc:
-            self.audit("join_failed", resource=entry.resource, error=str(exc))
-            return False
-
-        try:
-            with os.fdopen(handle, "w", encoding="utf-8") as stream:
-                stream.write(payload + "\n")
-        except OSError as exc:
-            self.audit("join_write_failed", resource=entry.resource, error=str(exc))
-            self.remove_join(entry.resource, cwd, reason="書き込みに失敗したため取り消した")
+        payload = json.dumps(entry.to_dict(), ensure_ascii=False, indent=2) + "\n"
+        if not self._create_exclusively(path, payload, entry.resource, kind="join"):
             return False
 
         self.audit("joined", resource=entry.resource, job=entry.job, cwd=cwd)
         return True
 
-    def list_joins(self, resource_id: str) -> list[Entry]:
-        """その資源への相乗り申告を読む。読めなかったものは飛ばす。"""
+    def _load_joins(self) -> list[tuple[Path, Entry]]:
+        """相乗り申告をパスつきで読む。読めなかったものは飛ばす。
+
+        **確定的な幽霊だけをここで捨てる。** 相乗りには主宣言と違って幽霊を退ける経路が
+        無い（``claim`` に相当する操作が無い）ため、落ちたセッションの申告が永久に残り、
+        その資源を「使用中」に固定してしまう。``rb wait`` は二度と RELEASED を返さず、
+        フックは全セッションの全プロンプトに出し続ける。
+
+        捨てるのは ``since < 現在の起動時刻`` の 1 つだけとする。再起動で全 PID が無効に
+        なるため推測を含まない。**猶予や PID を使った推測はしない**（実測が「空き」でも
+        宣言が幽霊である証明にはならないという非対称性を崩さないため。
+        CLAUDE.md「Liveness Judgment」）。
+        """
         try:
             paths = sorted(self.joins_dir.glob("*.json"))
         except OSError:
             return []
 
-        entries: list[Entry] = []
+        boot = platform_info.boot_time()
+        loaded: list[tuple[Path, Entry]] = []
         for path in paths:
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError, ValueError):
                 continue
             entry = Entry.from_dict(data)
-            if entry is not None and entry.resource == resource_id:
-                entries.append(entry)
-        return entries
+            if entry is None:
+                continue
+            since = entry.since_dt
+            if boot is not None and since is not None and since < boot:
+                self.audit("join_stale_removed", resource=entry.resource, since=entry.since)
+                _unlink_with_retry(path)
+                continue
+            loaded.append((path, entry))
+        return loaded
+
+    def list_joins(self, resource_id: str) -> list[Entry]:
+        """その資源への相乗り申告を読む。読めなかったものは飛ばす。"""
+        return [entry for _, entry in self._load_joins() if entry.resource == resource_id]
 
     def list_all_joins(self) -> list[Entry]:
         """全ての相乗り申告を読む。資源の一覧を作るときに使う。"""
-        try:
-            paths = sorted(self.joins_dir.glob("*.json"))
-        except OSError:
-            return []
-
-        entries: list[Entry] = []
-        for path in paths:
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError, ValueError):
-                continue
-            entry = Entry.from_dict(data)
-            if entry is not None:
-                entries.append(entry)
-        return entries
+        return [entry for _, entry in self._load_joins()]
 
     def remove_join(self, resource_id: str, cwd: str, *, reason: str) -> bool:
-        """自分の相乗り申告を取り下げる。"""
-        try:
-            self.join_path(resource_id, cwd).unlink()
-        except FileNotFoundError:
-            return False
-        except OSError as exc:
-            self.audit("join_remove_failed", resource=resource_id, error=str(exc))
+        """指定した作業ディレクトリの相乗り申告を取り下げる（パスの完全一致）。"""
+        result, error = _unlink_with_retry(self.join_path(resource_id, cwd))
+        if result is RemovalResult.FAILED:
+            self.audit("join_remove_failed", resource=resource_id, error=error)
+        if result is not RemovalResult.REMOVED:
             return False
         self.audit("join_removed", resource=resource_id, cwd=cwd, reason=reason)
         return True
+
+    def remove_own_join(self, resource_id: str, cwd: str, *, reason: str) -> bool:
+        """自分の相乗り申告を取り下げる。
+
+        照合は主宣言（:meth:`owns`）と**同じ規則**にする。パスの完全一致にすると、
+        申告したときと違うディレクトリから ``release`` したときに
+        ``join_path`` のキーが変わって自分の申告を外せない。主宣言は祖先関係を
+        許すのに相乗りだけ完全一致、という非対称は使う側から見て説明できない。
+        """
+        for path, entry in self._load_joins():
+            if entry.resource != resource_id or not self.owns(entry, cwd=cwd):
+                continue
+            result, error = _unlink_with_retry(path)
+            if result is RemovalResult.FAILED:
+                self.audit("join_remove_failed", resource=resource_id, error=error)
+                return False
+            if result is RemovalResult.REMOVED:
+                self.audit("join_removed", resource=resource_id, cwd=cwd, reason=reason)
+                return True
+        return False
+
+    def remove_joins(self, resource_id: str, *, reason: str) -> int:
+        """その資源の相乗り申告を**全て**取り下げる。消せた件数を返す。
+
+        ``release --force`` から使う。主宣言だけ強制解放できても、残った相乗りが
+        資源を「使用中」に固定し続けるため、掃除する手段が無いことになる。
+        """
+        removed = 0
+        for path, entry in self._load_joins():
+            if entry.resource != resource_id:
+                continue
+            result, error = _unlink_with_retry(path)
+            if result is RemovalResult.REMOVED:
+                removed += 1
+                self.audit("join_removed", resource=resource_id, reason=reason)
+            elif result is RemovalResult.FAILED:
+                self.audit("join_remove_failed", resource=resource_id, error=error)
+        return removed
 
     def replace(self, entry: Entry, *, reason: str, expect_nonce: str | None = None) -> bool:
         """既存のエントリを差し替える。取得ではなく**更新**である。
@@ -550,17 +754,26 @@ class Board:
         return True
 
     def remove(self, resource_id: str, *, reason: str) -> bool:
-        """エントリを削除する。存在しなければ False。理由は監査ログに残す。"""
-        path = self.path_for(resource_id)
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            return False
-        except OSError as exc:
-            self.audit("remove_failed", resource=resource_id, error=str(exc))
-            return False
-        self.audit("removed", resource=resource_id, reason=reason)
-        return True
+        """エントリを削除する。消せたときだけ True。理由は監査ログに残す。
+
+        「無かった」と「消せなかった」を区別する必要があるときは
+        :meth:`remove_detailed` を使う。
+        """
+        return self.remove_detailed(resource_id, reason=reason) is RemovalResult.REMOVED
+
+    def remove_detailed(self, resource_id: str, *, reason: str) -> RemovalResult:
+        """エントリを削除し、結果を 3 値で返す。
+
+        Windows では他プロセスが読んでいる最中の削除が共有違反になる。フックが
+        全セッションの全プロンプトで掲示板を読むため、「消せなかった」は実際に起こる。
+        「無かった」と畳むと、呼び出し側が嘘の説明を出すことになる。
+        """
+        result, error = _unlink_with_retry(self.path_for(resource_id))
+        if result is RemovalResult.REMOVED:
+            self.audit("removed", resource=resource_id, reason=reason)
+        elif result is RemovalResult.FAILED:
+            self.audit("remove_failed", resource=resource_id, error=error)
+        return result
 
     def audit(self, event: str, **fields: object) -> None:
         """監査ログに 1 行追記する。失敗しても黙って諦める。"""

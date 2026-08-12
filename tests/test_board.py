@@ -96,6 +96,43 @@ def test_audit_records_claim_and_removal(board: Board) -> None:
     assert all("at" in record for record in lines)
 
 
+def test_audit_lines_stay_valid_json_when_too_long(board: Board) -> None:
+    """長すぎるレコードは**切らずに畳む**。
+
+    途中で切ると JSON として壊れ、その行は読む側から丸ごと消える
+    （`rb history` は壊れた行を飛ばす）。長さの判定は文字数ではなく
+    **エンコード後のバイト数**で行う（日本語は 1 文字 3 バイト）。
+    """
+    from resource_broker import audit
+
+    board.audit("claimed", resource="pc-a::GPU0", note="あ" * 5000)
+
+    lines = [
+        line
+        for path in board.audit_dir.glob("*.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    records = [json.loads(line) for line in lines]  # 壊れていれば例外になる
+
+    assert any(record.get("truncated") for record in records)
+    assert all(len((line + "\n").encode("utf-8")) <= audit.MAX_LINE_BYTES for line in lines)
+    assert all(record.get("event") for record in records)  # 何が起きたかは残る
+
+
+def test_short_audit_lines_are_kept_whole(board: Board) -> None:
+    """短いレコードはそのまま残す（畳むのは上限を超えたときだけ）。"""
+    board.audit("claimed", resource="pc-a::GPU0", note="compute apps なし")
+
+    records = [
+        json.loads(line)
+        for path in board.audit_dir.glob("*.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert records[0]["note"] == "compute apps なし"
+    assert "truncated" not in records[0]
+
+
 def test_entry_from_dict_rejects_shapeless_data() -> None:
     """resource が無いデータは Entry にしない。"""
     assert Entry.from_dict({"holder": {}}) is None

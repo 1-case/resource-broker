@@ -83,6 +83,23 @@ def test_busy_resource_is_reported(tmp_path: Path) -> None:
     assert "job.log" in result.stdout  # 進捗の観測点を示す
 
 
+def test_a_resource_held_only_by_joiners_is_reported(tmp_path: Path) -> None:
+    """相乗りだけが残った資源も注入する。
+
+    絞り込みは ``occupied``（誰か 1 人でも宣言しているか）で行う。``free``
+    （主宣言の枠が取れるか）で絞ると、実際に使っている者がいるのに通知から消える。
+    """
+    board = Board(tmp_path)
+    place = "C:\\works\\malm"
+    joiner = build_entry(normalize("GPU0"), job="相乗りのジョブ", cwd=place, session="malm")
+    assert board.add_join(joiner, place)
+
+    result = run_hook(home=tmp_path)
+
+    assert result.returncode == 0
+    assert "GPU0" in result.stdout
+
+
 def test_empty_board_still_explains_how_to_use(tmp_path: Path) -> None:
     """掲示板が空でも使い方は伝える。
 
