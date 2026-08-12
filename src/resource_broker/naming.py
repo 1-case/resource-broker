@@ -2,7 +2,7 @@ r"""資源 ID の正規化と、ファイル名への安全な変換。
 
 命名の原則は 2 つ。**その端末で一意**であること、**人間が現物を指させる**こと。
 両方を満たすのは Windows のデバイスマネージャの表記であり、正規名はそれに合わせる
-（DESIGN.md「資源の命名規約」）。
+（DESIGN.md「Resource Naming」）。
 
 資源 ID には ``\\nas\share`` や ``USB\VID_0403&PID_6001\A50285BI`` のように
 ファイル名に使えない文字が含まれる。掲示板のファイル名は安全化した文字列に
@@ -50,7 +50,7 @@ def normalize(resource_id: str, host: str | None = None) -> str:
     -----
     Web API のレート制限のように**マシンに紐づかない資源**は、本来ホスト名を
     付けるべきではない。Phase 1 はマシンローカルの資源だけを扱うため一律に付ける。
-    グローバルスコープの導入は Phase 5 の課題である（DESIGN.md「未決事項」）。
+    グローバルスコープの導入は Phase 5 の課題である（DESIGN.md「Open Issues」）。
     """
     trimmed = (resource_id or "").strip()
     if not trimmed:

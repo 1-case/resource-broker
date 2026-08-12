@@ -17,7 +17,6 @@ import pytest
 from resource_broker import clock, platform_info
 from resource_broker.board import Board, build_entry
 from resource_broker.cli import main
-from resource_broker.probes.base import ExplodingProbe, FakeProbe, Observation, observe_safely
 
 CORRUPT_PAYLOADS = [
     "",
@@ -68,29 +67,16 @@ def test_audit_failure_does_not_propagate(board: Board, monkeypatch: pytest.Monk
     board.audit("test_event")  # 例外が出なければ合格
 
 
-def test_exploding_probe_is_folded_into_unknown() -> None:
-    """規約を破って例外を投げるプローブでも、判定不能に畳み込まれる。"""
-    result = observe_safely(ExplodingProbe())
+def test_unobserved_resource_is_unknown_not_free() -> None:
+    """調べていないことは「空き」ではなく「判定不能」である。
 
-    assert result.busy is None
-    assert result.error is not None
+    本ツールは資源を調べない。既定が「空き」に倒れると、誰も調べていない資源を
+    全セッションが同時に取れてしまう。
+    """
+    from resource_broker.liveness import Observation
 
-
-def test_missing_probe_is_unknown_not_free() -> None:
-    """プローブが無いことは「空き」ではなく「判定不能」である。"""
-    assert observe_safely(None).busy is None
-
-
-def test_probe_returning_wrong_type_is_unknown() -> None:
-    """Observation 以外を返す実装も判定不能に畳み込まれる。"""
-
-    class Rogue:
-        resource_kind = "rogue"
-
-        def observe(self) -> object:
-            return "空いてます"
-
-    assert observe_safely(Rogue()).busy is None  # type: ignore[arg-type]
+    assert Observation().busy is None
+    assert Observation().known is False
 
 
 @pytest.mark.parametrize("text", ["", None, "きのう", "2026-13-45T99:99:99", "0000"])
@@ -123,25 +109,56 @@ def test_cli_returns_zero_on_internal_error(
     assert "内部エラー" in capsys.readouterr().err
 
 
-def test_claim_proceeds_when_probe_is_broken(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """プローブが壊れていても、空いていれば宣言できる。"""
-    monkeypatch.setattr("resource_broker.cli.probe_for", lambda _r: ExplodingProbe())
+def test_claim_proceeds_when_the_session_could_not_investigate(tmp_path: Path) -> None:
+    """調べようとして分からなかった場合でも宣言できる。
 
-    assert main(["--home", str(tmp_path), "claim", "GPU0", "--job", "学習"]) == 0
-
-
-def test_busy_probe_blocks_claim_even_without_entry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """掲示板が空でも、実測が使用中なら宣言は通る。
-
-    エントリが無ければ FREE と判定するのが設計である（実測は帰属を教えないため、
-    未宣言の使用者を検出しても宣言を止める根拠にはしない）。この挙動を固定しておく。
+    「情報がなくて判断できない」ときの既定は**通す**（CLAUDE.md「Fail-Open」）。
+    調べられない資源を宣言不能にすると、掲示板そのものが使えなくなる。
     """
-    monkeypatch.setattr(
-        "resource_broker.cli.probe_for", lambda _r: FakeProbe(Observation(busy=True))
+    code = main(
+        [
+            "--home",
+            str(tmp_path),
+            "claim",
+            "GPU0",
+            "--job",
+            "学習",
+            "--observed",
+            "nvidia-smi が応答しない",
+            "--found",
+            "unknown",
+        ]
     )
 
-    assert main(["--home", str(tmp_path), "claim", "GPU0", "--job", "学習"]) == 0
+    assert code == 0
+
+
+def test_claim_proceeds_when_the_board_directory_is_unwritable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """掲示板が書けなくても、ユーザーの作業を止めない。
+
+    宣言は残らないが、それは事故防止の失敗であって作業の停止理由ではない。
+    """
+
+    def explode(*_args: object, **_kwargs: object) -> None:
+        raise OSError("書けない")
+
+    monkeypatch.setattr(Path, "mkdir", explode)
+    code = main(
+        [
+            "--home",
+            str(tmp_path),
+            "claim",
+            "GPU0",
+            "--job",
+            "学習",
+            "--observed",
+            "compute apps なし",
+            "--found",
+            "free",
+        ]
+    )
+
+    assert code in (0, 1)  # 通すか「取れなかった」と言うか。例外は外に出さない
+    capsys.readouterr()

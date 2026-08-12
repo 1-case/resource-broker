@@ -2,7 +2,7 @@
 
 掲示板は**資源ごとに 1 ファイル**の JSON である。単一ファイルに集約しないのは、
 破損の被害を 1 資源に閉じ込めるためと、``O_EXCL`` による取得競合の解決を
-単純にするためである（DESIGN.md「アーキテクチャ」）。
+単純にするためである（DESIGN.md「Architecture」）。
 
 本モジュールの全ての公開関数は**例外を投げない**。読めない・書けない・壊れているは
 すべて「情報が無い」に畳み込み、呼び出し側が fail-open で通せるようにする。
@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from . import clock, naming, platform_info
+from . import audit, clock, naming, platform_info
 
 SCHEMA = 1
 
@@ -32,7 +32,7 @@ class Entry:
     """掲示板の 1 エントリ。
 
     全フィールドを機械が生成できることが要件である。人間や LLM にしか
-    書けない項目を増やしてはならない（DESIGN.md「掲示板のスキーマ」）。
+    書けない項目を増やしてはならない（DESIGN.md「Board Schema」）。
     """
 
     resource: str
@@ -131,7 +131,7 @@ class Board:
     @property
     def audit_dir(self) -> Path:
         """監査ログを置くディレクトリ。"""
-        return self.root / "audit"
+        return audit.audit_dir(self.root)
 
     def path_for(self, resource_id: str) -> Path:
         """資源 ID に対応するエントリのパスを返す。"""
@@ -235,19 +235,8 @@ class Board:
         return True
 
     def audit(self, event: str, **fields: object) -> None:
-        """監査ログに 1 行追記する。失敗しても黙って諦める。
-
-        「沈黙は成功ではない」（CLAUDE.md）を守るための記録である。
-        後から「なぜそう判定したか」「いつ判定が止まったか」を追えるようにする。
-        """
-        record = {"at": clock.now_iso(), "event": event, **fields}
-        try:
-            self.audit_dir.mkdir(parents=True, exist_ok=True)
-            target = self.audit_dir / f"{clock.now().strftime('%Y-%m-%d')}.jsonl"
-            with target.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-        except Exception:  # noqa: BLE001 - 監査の失敗で本処理を止めない
-            return
+        """監査ログに 1 行追記する。失敗しても黙って諦める。"""
+        audit.append(self.root, event, **fields)
 
 
 def build_entry(
@@ -286,5 +275,16 @@ def build_entry(
         log=log,
         since=clock.now_iso(),
         boot=clock.to_iso(boot) if boot else None,
-        observed=observed,
+        observed=_stamp_observed(observed),
     )
+
+
+def _stamp_observed(observed: dict[str, object] | None) -> dict[str, object] | None:
+    """実測に観測時刻を刻む。
+
+    「いつ観測したか」が無いと、掲示板に残った実測値がどの時点のものか分からない。
+    時刻はここで機械生成する（DESIGN.md「Board Schema」の ``observed.at``）。
+    """
+    if observed is None:
+        return None
+    return {"at": clock.now_iso(), **observed}

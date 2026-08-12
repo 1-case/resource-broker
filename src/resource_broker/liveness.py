@@ -18,10 +18,39 @@ CI の Linux ARM64 上でも判定ロジックそのものを検証できる。
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 
-from .probes.base import Observation
+
+@dataclass(frozen=True)
+class Observation:
+    """セッションが資源を実際に調べた結果。
+
+    **本ツールは資源を調べない。** 何をどう調べるかは資源ごとに異なり、それを実装に
+    持てば「GPU なら nvidia-smi」のような資源固有の分岐が生まれる。有限資源一般を
+    扱うという目的に反するし、調べ方は陳腐化する。調べるのは資源を使おうとする
+    セッション（Claude Code）の仕事であり、ここにはその**結論だけ**が入る
+    （DESIGN.md「Who Investigates」）。
+
+    Attributes
+    ----------
+    busy : bool or None
+        使用中なら True、空いていれば False、**調べていない・分からなければ None**。
+        None は「情報が無い」であって「空いている」ではない。
+    note : str
+        何を見たかの生の記録。本ツールは**解釈しない**。掲示板に観測点として載せ、
+        意味づけは読む側に任せる。
+    """
+
+    busy: bool | None = None
+    note: str = ""
+
+    @property
+    def known(self) -> bool:
+        """使用中か空きかの結論が出ているか。"""
+        return self.busy is not None
+
 
 #: 宣言してから実測に現れるまでの猶予。
 #:

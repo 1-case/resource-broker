@@ -1,0 +1,96 @@
+resource-broker 独自ライセンス（全権留保 / All Rights Reserved）
+
+Copyright (c) 2026 satorunnlg. All rights reserved.
+
+本ソフトウェア及び関連文書ファイル（以下「本ソフトウェア」）に関する著作権その他の
+一切の権利は、satorunnlg（以下「著作権者」）に留保される。
+
+--------------------------------------------------------------------------------
+第1条（許諾しない行為）
+
+著作権者の書面による事前の許諾なく、本ソフトウェアの全部又は一部について
+次の行為を行うことはできない。
+
+  (a) 複製、改変、翻案、翻訳
+  (b) 再配布、公衆送信、譲渡、貸与、販売、サブライセンス
+  (c) 逆コンパイル、逆アセンブル、その他のリバースエンジニアリング
+  (d) 二次的著作物の作成及びその利用
+  (e) 本ソフトウェアを用いた役務の第三者への提供
+
+第2条（内部利用）
+
+著作権者、及び著作権者が明示的に許可した者は、内部での研究・開発・評価の目的に
+限り、本ソフトウェアを使用することができる。本条は第1条の各行為を許諾するものではない。
+
+第3条（生成物）
+
+本ソフトウェアが生成する掲示板の内容、監査ログその他の生成物についても、
+本ライセンスの条件が及ぶ。
+
+第4条（第三者ソフトウェア）
+
+本ソフトウェアは、第三者が権利を有するオープンソースソフトウェアを利用する。
+当該第三者ソフトウェアには、それぞれの提供者が定めるライセンスが適用され、
+本ライセンスの条件は当該第三者ソフトウェアには及ばない。
+
+利用する第三者ソフトウェアとそのライセンスは DESIGN.md「Tech Stack」に記載する。
+本ソフトウェアを第三者へ配布する場合は、各ライセンスが要求する著作権表示及び
+ライセンス全文を THIRD_PARTY_NOTICES.md として同梱しなければならない。
+
+本ソフトウェアは資源の実測を行わず、そのための外部コマンドを起動しない。
+資源を調べる手段の選択と実行は利用者の責任において行われる。
+
+第5条（無保証）
+
+本ソフトウェアは「現状有姿（AS IS）」で提供される。著作権者は、商品性、特定目的への
+適合性、非侵害性を含むがこれらに限られない、明示又は黙示のいかなる保証も行わない。
+
+第6条（責任の制限）
+
+著作権者は、本ソフトウェアの使用又は使用不能に起因して生じた直接的、間接的、
+付随的、特別、懲罰的又は結果的損害（データの損失、事業の中断、計算資源の競合に
+よる作業の失敗を含む）について、契約責任、不法行為責任その他の法的根拠を問わず、
+一切の責任を負わない。
+
+本ソフトウェアは開発環境における資源の使用状況の共有を目的とするものであり、
+排他制御の強制を保証しない。本ソフトウェアは設計上、内部エラー時に資源の使用を
+許可する側に倒れる（fail-open）。人身又は財産に危険を及ぼしうる用途、及び
+排他性の保証を要する用途への使用は想定していない。
+
+第7条（準拠法及び管轄）
+
+本ライセンスは日本法に準拠して解釈される。本ライセンスに関して生じた紛争については、
+著作権者の住所地を管轄する地方裁判所を第一審の専属的合意管轄裁判所とする。
+
+--------------------------------------------------------------------------------
+English (reference translation)
+
+This software and associated documentation files (the "Software") are proprietary.
+All rights are reserved by satorunnlg (the "Copyright Holder").
+
+No copying, modification, redistribution, public transmission, sale, sublicensing,
+reverse engineering, or creation of derivative works is permitted without the prior
+written consent of the Copyright Holder. Internal research, development, and
+evaluation use by the Copyright Holder and expressly authorized persons is permitted.
+Board contents, audit logs, and other artifacts produced by the Software are also
+covered by this license.
+
+The Software incorporates third-party open source software, which remains governed
+by its own license terms; see DESIGN.md, section "Tech Stack". The Software does
+not probe resources and invokes no external command for that purpose; choosing and
+running such means is the user's responsibility. Any distribution must include
+THIRD_PARTY_NOTICES.md carrying the required notices.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. THE COPYRIGHT
+HOLDER SHALL NOT BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM
+THE SOFTWARE OR ITS USE. The Software shares resource usage information; it does
+not guarantee mutual exclusion, and by design it fails open.
+
+Governed by the laws of Japan. In case of any discrepancy, the Japanese text above
+prevails.
+
+--------------------------------------------------------------------------------
+注記
+
+本ライセンス文は法律専門家の作成によるものではない。本ソフトウェアを外部へ
+配布・提供する前に、法務のレビューを受けること。
