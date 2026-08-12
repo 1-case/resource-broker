@@ -106,6 +106,53 @@ def test_notice_tells_the_session_to_investigate(tmp_path: Path) -> None:
     assert "自分で調べる" in result.stdout
 
 
+# --- 文字コード ------------------------------------------------------------------
+
+
+def run_hook_raw(home: Path) -> bytes:
+    """フックを起動し、**復号せずに生バイト**を返す。
+
+    ロケール依存の文字化けは、テキストとして読んでしまうと検出できない。
+    """
+    env = dict(os.environ)
+    env["RESOURCE_BROKER_HOME"] = str(home)
+    # 実運用のフックは環境変数の設定なしに起動される。ここでも取り除いて再現する
+    env.pop("PYTHONIOENCODING", None)
+    env.pop("PYTHONUTF8", None)
+    completed = subprocess.run(
+        [sys.executable, str(HOOK)], input=b"{}", capture_output=True, env=env, timeout=60
+    )
+    return completed.stdout
+
+
+def test_output_is_utf8_regardless_of_locale(tmp_path: Path) -> None:
+    """注入内容は常に UTF-8 で出す。
+
+    Windows では ``sys.stdout.encoding`` がコンソールでもパイプでも cp932 になる。
+    そのまま書くと cp932 のバイト列が出て、UTF-8 として読む Claude Code 側で
+    判読不能になる。**導入直後のセッションで実際に起きた回帰である。**
+    """
+    raw = run_hook_raw(tmp_path)
+
+    assert raw, "何も出力されていない"
+    text = raw.decode("utf-8")  # ここで例外が出れば文字化けしている
+    assert "掲示板は空です" in text
+
+
+def test_japanese_from_rb_survives(tmp_path: Path) -> None:
+    """``rb`` 側の日本語も化けずに届く。
+
+    フックの出力だけ UTF-8 にしても、``rb`` が cp932 で書けば宣言の中身が化ける。
+    片方だけ直しても足りない。
+    """
+    declare(tmp_path, "GPU0", job="学習ジョブ（日本語のジョブ名）")
+
+    text = run_hook_raw(tmp_path).decode("utf-8")
+
+    assert "学習ジョブ（日本語のジョブ名）" in text
+    assert "nvidia-smi: compute apps 1 件" in text
+
+
 # --- fail-open ------------------------------------------------------------------
 
 
