@@ -22,7 +22,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from . import clock, liveness, naming, platform_info, runner
+from . import clock, liveness, naming, platform_info, runner, waiting
 from .board import Board, Entry, build_entry
 from .liveness import Observation, Verdict
 
@@ -91,6 +91,9 @@ def _cmd_status(args: argparse.Namespace) -> int:
                 "since": entry.since if entry else None,
                 "log": entry.log if entry else None,
                 "observed": entry.observed if entry else None,
+                "eta": entry.eta if entry else None,
+                "usage": entry.usage if entry else None,
+                "sharing": (entry.sharing or None) if entry else None,
             }
         )
 
@@ -111,6 +114,18 @@ def _cmd_status(args: argparse.Namespace) -> int:
             job = holder.get("job") or "(ジョブ未記入)"
             print(f"{'':<24} 宣言   {holder.get('session', '?')} / {job}")
             print(f"{'':<24} since  {row['since']}")
+        eta = row["eta"] or {}
+        if eta.get("stated"):
+            at = f"（{eta['at']} 頃）" if eta.get("at") else ""
+            print(f"{'':<24} ETA    {eta['stated']}{at}  ※申告であって約束ではない")
+        usage = row["usage"] or {}
+        if usage.get("peak") or usage.get("avg"):
+            print(
+                f"{'':<24} 見積   瞬時最大 {usage.get('peak') or '-'}"
+                f" / 平均 {usage.get('avg') or '-'}"
+            )
+        if row["sharing"]:
+            print(f"{'':<24} 相乗り {row['sharing']}")
         if row["log"]:
             print(f"{'':<24} log    {row['log']}")
         observed = row["observed"] or {}
@@ -127,6 +142,10 @@ def acquire(
     *,
     job: str,
     found: str,
+    eta: str = "",
+    peak: str = "",
+    avg: str = "",
+    sharing: str = "",
     display: str = "",
     log: str | None = None,
     force: bool = False,
@@ -173,6 +192,10 @@ def acquire(
         log=log,
         pid=pid,
         observed={"note": observation.note, "found": found},
+        eta=eta,
+        peak=peak,
+        avg=avg,
+        sharing=sharing,
     )
     if not board.try_claim(new_entry):
         # ここに来るのは、判定してから作成するまでの間に他セッションが取った場合。
@@ -194,6 +217,10 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         observation,
         job=args.job,
         found=args.found,
+        eta=args.eta,
+        peak=args.peak or "",
+        avg=args.avg or "",
+        sharing=args.sharing or "",
         display=args.display or "",
         log=args.log,
         force=args.force,
@@ -235,6 +262,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         observation,
         job=args.job,
         found=args.found,
+        eta=args.eta,
+        peak=args.peak or "",
+        avg=args.avg or "",
+        sharing=args.sharing or "",
         display=args.display or "",
         log=str(log_path),
         force=args.force,
@@ -256,6 +287,105 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(f"解放しました: {entry.display}")
 
 
+def _cmd_wait(args: argparse.Namespace) -> int:
+    """資源が解放されるまで待つ。
+
+    ETA では打ち切らない。掲示板の ETA は申告であって約束ではないため、
+    過ぎたからといって待機をやめる根拠にはしない（CLAUDE.md「Time Handling」）。
+    打ち切るのは呼び出し側が指定した ``--timeout`` だけである。
+    """
+    board = Board(args.home)
+    resource_id = naming.normalize(args.resource)
+
+    entry = board.read(resource_id)
+    if entry is None:
+        print(f"既に解放されています: {naming.display_default(resource_id)}")
+        return EXIT_OK
+
+    print(f"待機します: {entry.display} <- {entry.session} / {entry.job}")
+    if entry.eta:
+        stated = entry.eta.get("stated") if isinstance(entry.eta, dict) else None
+        at = entry.eta.get("at") if isinstance(entry.eta, dict) else None
+        print(f"  ETA   {stated}{f'（{at} 頃）' if at else ''}  ※申告であって約束ではない")
+    if entry.log:
+        print(f"  log   {entry.log}")
+    print(f"  {args.interval:g} 秒ごとに確認、上限 {args.timeout:g} 秒。Ctrl+C で中断できます")
+
+    try:
+        result = waiting.wait_for_release(
+            board, resource_id, interval_s=args.interval, timeout_s=args.timeout
+        )
+    except KeyboardInterrupt:
+        print("中断しました（宣言はそのままです）", file=sys.stderr)
+        return EXIT_INTERRUPTED
+
+    if result.released:
+        print(f"解放されました（{result.polls} 回確認 / {result.waited_s:.0f} 秒）")
+        print("使う前にもう一度自分で状態を調べること（解放＝空きとは限らない）")
+        return EXIT_OK
+
+    print(
+        f"上限に達しました（{result.polls} 回確認 / {result.waited_s:.0f} 秒）。まだ使用中です",
+        file=sys.stderr,
+    )
+    return EXIT_BUSY
+
+
+def _cmd_history(args: argparse.Namespace) -> int:
+    """過去の宣言を振り返る。見積もりの精度を上げるための材料である。"""
+    board = Board(args.home)
+    target = naming.normalize(args.resource) if args.resource else None
+
+    records = []
+    try:
+        paths = sorted(board.audit_dir.glob("*.jsonl"))
+    except OSError:
+        paths = []
+    for path in paths:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(record, dict) or record.get("event") != "claimed":
+                continue
+            if target and record.get("resource") != target:
+                continue
+            records.append(record)
+
+    records = records[-args.limit :]
+
+    if args.json:
+        print(json.dumps({"claims": records}, ensure_ascii=False, indent=2))
+        return EXIT_OK
+
+    if not records:
+        print("過去の宣言は見つかりませんでした")
+        return EXIT_OK
+
+    for record in records:
+        eta = record.get("eta") or {}
+        usage = record.get("usage") or {}
+        eta_text = eta.get("stated") if isinstance(eta, dict) else None
+        peak = usage.get("peak") if isinstance(usage, dict) else None
+        avg = usage.get("avg") if isinstance(usage, dict) else None
+        print(
+            f"{record.get('at', '?')}  {naming.display_default(str(record.get('resource', '?')))}"
+        )
+        print(f"    job  {record.get('job', '')}")
+        if eta_text:
+            print(f"    ETA  {eta_text}")
+        if peak or avg:
+            print(f"    見積 peak={peak or '-'} avg={avg or '-'}")
+    print()
+    print("前回の見積もりと実績を突き合わせ、次の申告の精度を上げること")
+    return EXIT_OK
+
+
 def _cmd_release(args: argparse.Namespace) -> int:
     board = Board(args.home)
     resource_id = naming.normalize(args.resource)
@@ -264,6 +394,47 @@ def _cmd_release(args: argparse.Namespace) -> int:
     else:
         print("宣言は見つかりませんでした（既に解放済みです）")
     return EXIT_OK
+
+
+def _add_declaration_options(parser: argparse.ArgumentParser) -> None:
+    """宣言に必要なオプションを付ける。``claim`` と ``run`` で共通である。
+
+    必須は ``--job`` ``--observed`` ``--eta`` の 3 つ。ここが本ツールの強制であり、
+    **書かせること自体に意味がある**。ETA を必須にしているのは、正確な値が欲しいからではなく、
+    「どれくらいで終わるか」を一度考えさせるためである。外れても本ツールは何も判断しない。
+    """
+    parser.add_argument("--job", required=True, help="何をするか（1 行）")
+    parser.add_argument(
+        "--observed",
+        required=True,
+        help="自分で調べて何を見たか（例: 'nvidia-smi: compute apps なし'）",
+    )
+    parser.add_argument(
+        "--eta",
+        required=True,
+        help=(
+            "終わるまでの見込み。'30m' '2h' '1h30m' なら絶対時刻を機械が計算して併記する。"
+            "自由記述も可（'モデル次第' 等）。**判断には使わない**"
+        ),
+    )
+    parser.add_argument(
+        "--found",
+        choices=sorted(FOUND_CHOICES),
+        default="unknown",
+        help="調べた結論。既定は unknown（分からなかった）",
+    )
+    parser.add_argument(
+        "--peak", default=None, help="利用見積もりの瞬時最大（例: 'VRAM 6GB' '80%%' '4 cores'）"
+    )
+    parser.add_argument("--avg", default=None, help="利用見積もりの平均（同上）")
+    parser.add_argument(
+        "--sharing",
+        default=None,
+        help="相乗りの可否と条件（例: '可（VRAM 残 6GB まで）' '不可'）。本ツールは解釈しない",
+    )
+    parser.add_argument("--log", default=None, help="進捗が読めるログのパス")
+    parser.add_argument("--display", default=None, help="表示名")
+    parser.add_argument("--force", action="store_true", help="他者の宣言を退けて強制的に取得する")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -293,21 +464,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     claim.add_argument("resource", help="資源 ID")
-    claim.add_argument("--job", required=True, help="何をするか（1 行）")
-    claim.add_argument(
-        "--observed",
-        required=True,
-        help="自分で調べて何を見たか（例: 'nvidia-smi: compute apps なし'）",
-    )
-    claim.add_argument(
-        "--found",
-        choices=sorted(FOUND_CHOICES),
-        default="unknown",
-        help="調べた結論。既定は unknown（分からなかった）",
-    )
-    claim.add_argument("--log", default=None, help="進捗が読めるログのパス")
-    claim.add_argument("--display", default=None, help="表示名")
-    claim.add_argument("--force", action="store_true", help="他者の宣言を退けて強制的に取得する")
+    _add_declaration_options(claim)
     claim.set_defaults(func=_cmd_claim)
 
     release = sub.add_parser("release", help="宣言を解放する")
@@ -324,22 +481,45 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument("--res", required=True, help="資源 ID")
-    run.add_argument("--job", required=True, help="何をするか（1 行）")
-    run.add_argument(
-        "--observed",
-        required=True,
-        help="自分で調べて何を見たか（例: 'nvidia-smi: compute apps なし'）",
-    )
-    run.add_argument(
-        "--found",
-        choices=sorted(FOUND_CHOICES),
-        default="unknown",
-        help="調べた結論。既定は unknown（分からなかった）",
-    )
-    run.add_argument("--log", default=None, help="ログの出力先（既定は掲示板ルートの logs/）")
-    run.add_argument("--display", default=None, help="表示名")
-    run.add_argument("--force", action="store_true", help="他者の宣言を退けて強制的に取得する")
+    _add_declaration_options(run)
     run.set_defaults(func=_cmd_run)
+
+    wait = sub.add_parser(
+        "wait",
+        help="資源が解放されるまで待つ",
+        description=(
+            "掲示板から宣言が消えるまでブロックする。ETA では打ち切らない"
+            "（申告であって約束ではない）。打ち切るのは --timeout だけである。"
+            "毎回のポーリングは監査ログに残る。"
+        ),
+    )
+    wait.add_argument("resource", help="資源 ID")
+    wait.add_argument(
+        "--interval",
+        type=float,
+        default=waiting.DEFAULT_INTERVAL_S,
+        help=f"ポーリング間隔の秒数（既定 {waiting.DEFAULT_INTERVAL_S:g}）",
+    )
+    wait.add_argument(
+        "--timeout",
+        type=float,
+        default=waiting.DEFAULT_TIMEOUT_S,
+        help=f"待機の上限秒数（既定 {waiting.DEFAULT_TIMEOUT_S:g}）。超えたら一度戻る",
+    )
+    wait.set_defaults(func=_cmd_wait)
+
+    history = sub.add_parser(
+        "history",
+        help="過去の宣言を振り返る（見積もりの根拠にする）",
+        description=(
+            "監査ログから過去の宣言と解放を拾う。前回どう見積もって実際どうだったかを"
+            "見返すためのもので、見積もりの精度を回ごとに上げるために使う。"
+        ),
+    )
+    history.add_argument("resource", nargs="?", default=None, help="資源 ID（省略時は全件）")
+    history.add_argument("--limit", type=int, default=20, help="表示する件数（既定 20）")
+    history.add_argument("--json", action="store_true", help="JSON で出力する")
+    history.set_defaults(func=_cmd_history)
 
     return parser
 
