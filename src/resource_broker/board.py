@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import json
 import os
+import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +23,19 @@ from pathlib import Path
 from . import audit, clock, naming, platform_info
 
 SCHEMA = 1
+
+#: 取得の排他区間を守るロックを待つ秒数。
+#:
+#: ロックが要るのは「読んで、幽霊を退けて、作る」の間だけで、保持は数ミリ秒である。
+#: ここで待たされるのは他セッションが同じ資源を同時に取りにきたときに限られる。
+LOCK_WAIT_S = 2.0
+
+#: ロックが放置されたとみなす秒数。
+#:
+#: ロックを持ったままプロセスが死ぬと、掲示板がその資源について永久に固まる。
+#: 本ツールが壊れてユーザーの作業を止めてはならない（CLAUDE.md「Fail-Open」）ので、
+#: 明らかに古いロックは奪う。保持時間はミリ秒単位なので、この閾値は十分に安全側である。
+LOCK_STALE_S = 30.0
 
 #: 読み取り時に既知として扱うキー。これ以外は extra に退避して書き戻す（前方互換）。
 _KNOWN_KEYS = frozenset(
@@ -37,6 +53,16 @@ _KNOWN_KEYS = frozenset(
         "sharing",
     }
 )
+
+
+def _related_paths(left: str, right: str) -> bool:
+    """2 つのパスが同じ場所か、一方が他方の配下か。"""
+    a = os.path.normcase(os.path.normpath(left))
+    b = os.path.normcase(os.path.normpath(right))
+    if a == b:
+        return True
+    sep = os.sep
+    return a.startswith(b + sep) or b.startswith(a + sep)
 
 
 @dataclass
@@ -66,9 +92,21 @@ class Entry:
 
     @property
     def pid(self) -> int | None:
-        """宣言に書かれた PID。無ければ None。"""
+        """宣言に書かれた PID。無ければ None。
+
+        ``bool`` は ``int`` の派生なので明示的に除く。壊れた掲示板に ``"pid": true`` が
+        あると PID 1 の生存を確かめにいくことになる。
+        """
         value = self.holder.get("pid")
-        return value if isinstance(value, int) else None
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
+
+    @property
+    def nonce(self) -> str:
+        """この宣言を一意に識別する値。所有者の照合に使う。"""
+        value = self.holder.get("nonce")
+        return value if isinstance(value, str) else ""
 
     @property
     def job(self) -> str:
@@ -160,6 +198,84 @@ class Board:
         """資源 ID に対応するエントリのパスを返す。"""
         return self.entries_dir / f"{naming.safe_filename(resource_id)}.json"
 
+    def lock_path(self, resource_id: str) -> Path:
+        """取得の排他区間を守るロックのパス。"""
+        return self.entries_dir / f"{naming.safe_filename(resource_id)}.lock"
+
+    @contextmanager
+    def locked(self, resource_id: str, *, wait_s: float = LOCK_WAIT_S):  # noqa: ANN201
+        """取得の排他区間を守る。
+
+        ``O_EXCL`` が守るのは**ファイルの作成**だけである。「読んで、幽霊なら消して、作る」
+        という手順の途中は無防備で、2 つのセッションが同じ幽霊を見て両方とも成功しうる。
+        これは本ツールが防ぐと宣言している事故そのものなので、区間ごと囲う。
+
+        取れなければ ``False`` を渡す。呼び出し側は**取得を諦める**こと。ロックの保持は
+        ミリ秒単位なので、待って取れないのは他セッションが同時に取りにきたときだけであり、
+        そこで通すと二重取得になる。
+
+        放置されたロックは奪う。ロックを持ったままプロセスが死んで掲示板が永久に固まるのは、
+        本ツールの故障でユーザーの作業を止めることに等しい。
+        """
+        path = self.lock_path(resource_id)
+        acquired = False
+        deadline = time.monotonic() + wait_s
+
+        try:
+            self.entries_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.audit("lock_mkdir_failed", resource=resource_id, error=str(exc))
+            yield False
+            return
+
+        while True:
+            try:
+                handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                if self._steal_stale_lock(path, resource_id):
+                    continue
+                if time.monotonic() >= deadline:
+                    self.audit("lock_timeout", resource=resource_id)
+                    break
+                time.sleep(0.05)
+                continue
+            except OSError as exc:
+                self.audit("lock_failed", resource=resource_id, error=str(exc))
+                break
+
+            acquired = True
+            try:
+                os.write(handle, str(os.getpid()).encode("ascii"))
+            except OSError:
+                pass
+            finally:
+                os.close(handle)
+            break
+
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
+    def _steal_stale_lock(self, path: Path, resource_id: str) -> bool:
+        """放置されたロックを奪う。奪ったら True。"""
+        try:
+            age = time.time() - path.stat().st_mtime
+        except OSError:
+            return False
+        if age < LOCK_STALE_S:
+            return False
+        try:
+            path.unlink()
+        except OSError:
+            return False
+        self.audit("lock_stolen", resource=resource_id, age_s=round(age, 1))
+        return True
+
     def read(self, resource_id: str) -> Entry | None:
         """エントリを読む。存在しない・壊れている場合は None。
 
@@ -185,6 +301,40 @@ class Board:
         if entry is None:
             self.audit("entry_malformed", resource=resource_id)
         return entry
+
+    def owns(self, entry: Entry, *, nonce: str | None = None, cwd: str | None = None) -> bool:
+        """そのエントリが自分のものか。
+
+        nonce が一致すれば確実に自分のものである（宣言ごとに一意）。nonce を持たない
+        古いエントリのために cwd での照合も残す。
+
+        cwd の照合は**同一か、一方が他方の配下**なら自分のものとみなす。宣言したときと
+        解放するときで作業ディレクトリが違うことは普通にある（サブディレクトリへ降りた等）。
+        そこで弾くと、自分の資源を自分で解放できないという最悪の使い勝手になる。
+        別プロジェクトの宣言はパスが分かれるので、守りたい線は保たれる。
+
+        **所有者を確かめずに消してはならない。** 他セッションの生きた宣言を消すと、
+        掲示板は空・資源は掴まれたままという最も検出しにくい不整合ができる。
+        """
+        holder = entry.holder if isinstance(entry.holder, dict) else {}
+        if nonce and holder.get("nonce"):
+            return str(holder["nonce"]) == nonce
+        declared = str(holder.get("cwd") or "")
+        if cwd and declared:
+            return _related_paths(declared, cwd)
+        return False
+
+    def remove_if_owned(
+        self, resource_id: str, *, reason: str, nonce: str | None = None, cwd: str | None = None
+    ) -> bool:
+        """自分の宣言であるときだけ削除する。"""
+        entry = self.read(resource_id)
+        if entry is None:
+            return False
+        if not self.owns(entry, nonce=nonce, cwd=cwd):
+            self.audit("remove_refused", resource=resource_id, reason="他者の宣言のため")
+            return False
+        return self.remove(resource_id, reason=reason)
 
     def list_all(self) -> list[Entry]:
         """全エントリを読む。読めなかったものは黙って飛ばす。"""
@@ -352,15 +502,30 @@ class Board:
         self.audit("join_removed", resource=resource_id, cwd=cwd, reason=reason)
         return True
 
-    def replace(self, entry: Entry, *, reason: str) -> bool:
+    def replace(self, entry: Entry, *, reason: str, expect_nonce: str | None = None) -> bool:
         """既存のエントリを差し替える。取得ではなく**更新**である。
 
         ``try_claim`` と違い ``O_EXCL`` は使わない。ここは資源の取得ではなく、
         既に持っている宣言の書き換えだからである。取り違えないよう、
         **資源の取得は ``try_claim`` だけ**が担う。
 
+        Parameters
+        ----------
+        expect_nonce : str, optional
+            期待する現在の宣言の nonce。読んでから書くまでの間に保持者が入れ替わっていた場合、
+            **古い内容で新しい宣言を潰さない**ための照合である。渡さないと無条件上書きになる。
+
+            ``since`` では照合しない。秒精度なので、同じ秒に解放と再取得が起きると
+            別の宣言を同じものと誤認する（テストで実際に踏んだ）。
+
         書き込み中に他セッションが読んでも壊れた JSON を見ないよう、一時ファイル経由で置換する。
         """
+        if expect_nonce is not None:
+            current = self.read(entry.resource)
+            if current is None or current.nonce != expect_nonce:
+                self.audit("update_conflict", resource=entry.resource, expected=expect_nonce)
+                return False
+
         path = self.path_for(entry.resource)
         try:
             self.entries_dir.mkdir(parents=True, exist_ok=True)
@@ -438,6 +603,9 @@ def build_entry(
             "cwd": cwd or os.getcwd(),
             "pid": pid,
             "job": job,
+            # 宣言ごとに一意。所有者の照合に使う。cwd だけでは、同じ場所から
+            # 解放と再取得が起きたときに「別の宣言」を自分のものと誤認する
+            "nonce": uuid.uuid4().hex,
         },
         log=log,
         since=clock.now_iso(),

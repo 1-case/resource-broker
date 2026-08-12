@@ -95,61 +95,94 @@ def match(command: str, patterns: list[dict[str, object]]) -> dict[str, object] 
     return None
 
 
-def declaration_for(root: Path, resource: str | None) -> dict[str, object] | None:
-    """その資源の宣言を返す。資源が指定されていなければ最初の 1 件。
+def declarations_for(root: Path, resource: str | None) -> list[dict[str, object]]:
+    """その資源の宣言（主宣言と相乗り）を返す。
+
+    資源が特定されていない判定行では**無関係な宣言を返さない**。以前は掲示板の先頭 1 件を
+    返しており、GPU を使うコマンドの直前に COM3 の宣言が「現状」として出ていた。
+    その場に置いた具体的事実が嘘だと、以後の注意文全体が読まれなくなる。
 
     **判定はしない。** 幽霊かどうかは読む側が ``rb status`` で確かめる。
     """
-    try:
-        paths = sorted((root / "board").glob("*.json"))
-    except OSError:
-        return None
+    if resource is None:
+        return []
 
-    for path in paths:
+    board = root / "board"
+    found: list[dict[str, object]] = []
+    for directory, is_join in ((board, False), (board / "joins", True)):
         try:
-            entry = json.loads(path.read_text(encoding=ENCODING))
-        except (OSError, json.JSONDecodeError, ValueError):
+            paths = sorted(directory.glob("*.json"))
+        except OSError:
             continue
-        if not isinstance(entry, dict) or not entry.get("resource"):
-            continue
-        if resource is None:
-            return entry
-        declared = str(entry["resource"]).split("::", 1)[-1]
-        if declared == resource:
-            return entry
-    return None
+        for path in paths:
+            try:
+                entry = json.loads(path.read_text(encoding=ENCODING))
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(entry, dict) or not entry.get("resource"):
+                continue
+            if str(entry["resource"]).split("::", 1)[-1] == resource:
+                entry["_join"] = is_join
+                found.append(entry)
+    return found
 
 
-def build_notice(rule: dict[str, object], entry: dict[str, object] | None) -> str:
+def declared_by_me(entries: list[dict[str, object]], cwd: str) -> bool:
+    """その資源を自分が既に宣言しているか。
+
+    宣言済みの相手に「宣言してから使え」と毎回言うのはノイズであり、ノイズは無視を招く。
+    """
+    for entry in entries:
+        holder = entry.get("holder")
+        holder = holder if isinstance(holder, dict) else {}
+        declared_cwd = str(holder.get("cwd", ""))
+        if declared_cwd and os.path.normcase(os.path.normpath(declared_cwd)) == os.path.normcase(
+            os.path.normpath(cwd)
+        ):
+            return True
+    return False
+
+
+def build_notice(rule: dict[str, object], entries: list[dict[str, object]]) -> str:
     """注意文を組み立てる。短く、具体的に。"""
     resource = rule.get("resource")
     target = str(resource) if resource else "有限資源"
     lines = [f"[rb] このコマンドは {target} を使う可能性があります。"]
+    if rule.get("note"):
+        lines.append(f"  判定表の注記: {rule['note']}")
 
-    if entry is None:
-        lines.append(f"  掲示板に {target} の宣言はありません（誰も使っていないとは限らない）。")
-    else:
+    if not entries:
+        if resource:
+            lines.append(
+                f"  掲示板に {target} の宣言はありません（誰も使っていないとは限らない）。"
+            )
+        else:
+            lines.append("  判定表にどの資源かが書かれていません。自分で特定すること。")
+
+    for entry in entries:
         holder = entry.get("holder")
         holder = holder if isinstance(holder, dict) else {}
+        kind = "相乗り" if entry.get("_join") else "現状"
         lines.append(
-            f"  現状: {holder.get('session', '?')} / {holder.get('job') or '(ジョブ未記入)'}"
+            f"  {kind}: {holder.get('session', '?')} / {holder.get('job') or '(ジョブ未記入)'}"
             f" (since {entry.get('since', '?')})"
         )
         eta = entry.get("eta")
         if isinstance(eta, dict) and eta.get("stated"):
             at = f"（{eta['at']} 頃）" if eta.get("at") else ""
-            lines.append(f"  ETA: {eta['stated']}{at} ※申告であって約束ではない")
+            lines.append(f"    ETA: {eta['stated']}{at} ※申告であって約束ではない")
 
         usage = entry.get("usage")
         if isinstance(usage, dict) and (usage.get("peak") or usage.get("avg")):
             lines.append(
-                f"  見積もり: 瞬時最大 {usage.get('peak') or '-'} / 平均 {usage.get('avg') or '-'}"
+                f"    見積もり: 瞬時最大 {usage.get('peak') or '-'}"
+                f" / 平均 {usage.get('avg') or '-'}"
             )
 
         if entry.get("sharing"):
-            lines.append(f"  相乗り: {entry['sharing']}（可否は当事者で決めること）")
+            lines.append(f"    相乗り: {entry['sharing']}（可否は当事者で決めること）")
         if entry.get("log"):
-            lines.append(f"  log: {entry['log']}")
+            lines.append(f"    log: {entry['log']}")
 
     lines.append("  使うなら自分で状態を調べ、rb run 経由で宣言すること。詳細は rb status。")
     return "\n".join(lines)
@@ -195,8 +228,11 @@ def notice_for(payload: dict[str, object]) -> str | None:
     if not command:
         return None
 
-    # rb 自身の呼び出しには出さない。既に掲示板を触っている
-    if re.search(r"(^|[\\/\s])(rb|resource-broker)(\.exe)?\s", command):
+    # rb 自身の呼び出しには出さない。既に掲示板を触っている。
+    # 判定は「実際に起動される部分」に対して行う。文章として rb に言及しただけで
+    # 黙ってしまうと、注意すべきコマンドを取りこぼす。
+    runnable = executable_part(command)
+    if re.search(r"(^|[\\/\s])(rb|resource-broker)(\.exe)?\s", runnable):
         return None
 
     root = board_root()
@@ -209,7 +245,15 @@ def notice_for(payload: dict[str, object]) -> str | None:
         return None
 
     resource = rule.get("resource")
-    return build_notice(rule, declaration_for(root, str(resource) if resource else None))
+    entries = declarations_for(root, str(resource) if resource else None)
+
+    # 既に自分が宣言している資源には出さない。宣言済みの相手に毎回「宣言しろ」と言うのは
+    # ノイズであり、ノイズは無視を招く。
+    cwd = str(payload.get("cwd") or os.getcwd())
+    if declared_by_me(entries, cwd):
+        return None
+
+    return build_notice(rule, entries)
 
 
 def main() -> int:

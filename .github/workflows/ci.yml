@@ -1,8 +1,9 @@
 # CI: 1-case 組織の self-hosted runner（Linux ARM64 / Raspberry Pi CM5）で実行する。
 # 本ツールは Windows を第一級の対象とするが、プラットフォーム依存部分（boot time 取得・
-# nvidia-smi・デバイス列挙）は platform_info.py と probes/ に隔離してあるため、
-# 純粋なロジック（掲示板・幽霊判定・命名）は Linux 上でも検証できる。
-# 実 GPU・実 COM を要求するテストは書かない（CLAUDE.md「Testing Constraints」）。
+# PID の生存確認・プロセスツリーの終了）は platform_info.py と runner.py に隔離してあるため、
+# 純粋なロジック（掲示板・幽霊判定・命名・待機）は Linux 上でも検証できる。
+# 本ツールは資源を調べないので、実 GPU・実 COM を要求するテストは原理的に存在しない。
+# 既知の穴: Windows 固有の ctypes 経路（GetTickCount64 / OpenProcess）は CI を通らない。
 name: CI
 
 on:

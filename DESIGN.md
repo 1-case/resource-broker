@@ -77,10 +77,12 @@ resource-broker/
 │   ├── audit.py          監査ログの追記（掲示板から共用）
 │   ├── platform_info.py  boot time / PID 生存 / ホスト名（OS 依存をここに隔離）
 │   ├── runner.py         子プロセスの起動とログの強制（spawn は注入可能）
-│   └── cli.py            status / claim / release / run
-├── hooks/
-│   ├── sessionstart_notice.py   掲示板の現状をコンテキストへ注入（stdlib のみ・常に exit 0）
-│   └── pretooluse_guard.py      未宣言の資源使用を deny（未着手）
+│   ├── waiting.py        宣言が減るまで待つ（ポーリングは監査ログへ）
+│   └── cli.py            status / claim / release / run / join / update / wait / history
+├── hooks/                すべて stdlib のみ・常に exit 0・何も止めない
+│   ├── sessionstart_notice.py   起動時に掲示板の現状と使い方を注入
+│   ├── prompt_board_reminder.py 毎プロンプトに宣言一覧を注入（掲示板を直接読む）
+│   └── pretooluse_notice.py     判定表に一致したコマンドの直前に現状を知らせる
 ├── tests/
 ├── tools/speak.py
 └── pyproject.toml
@@ -253,7 +255,8 @@ rb claim GPU0 --job "E009 学習" --observed "nvidia-smi: compute apps なし" -
 - `sharing` は保持者が立てた旗であり、**取得の排他性は変えない**。相乗りするかどうかは
   当事者が決める。掲示板は伝えるだけである
 - `log` は**パスだけ**を持つ。進捗の書式もパーサも定義しない。読むのは LLM なので形式は問わない
-- `boot` は書き込み時点の `LastBootUpTime`。幽霊判定に使う
+- `boot` は書き込み時点の `LastBootUpTime`。**判定には使わない**（判定は常に現在の起動時刻と
+  `since` を比べる）。宣言がどの起動セッションのものかを後から追うための記録である
 - 未知フィールドは無視して読む（前方互換）。`schema` の非互換な変更は破壊的変更として扱う
 
 ### Ghost Detection
@@ -400,12 +403,15 @@ GPU を掴んだが、その時点で起動時の通知はすでに過去のも�
 |---|---|
 | `pattern` | コマンド文字列に対する正規表現。壊れていればその行だけ飛ばす |
 | `resource` | 要求する資源 ID（省略可）。省略時は「何か 1 つ宣言していれば通す」 |
-| `note` | deny の理由文に添える説明 |
+| `note` | 注意文に添える説明。なぜこのパターンを入れたかを残す |
 
-- **既定は「表が無い」＝何も止めない。** 導入しただけでは挙動が変わらない
-- 表が壊れていても止めない。**陳腐化は素通し側（fail-open）に倒れる**
-- `rb` 自身の呼び出しは常に通す。止めると宣言する手段まで塞がれる
-- 宣言の照合は `holder.cwd` で行う。**他セッションの宣言では通らない**（それを許すと排他が壊れる）
+- **既定は「表が無い」＝何も出さない。** 導入しただけでは挙動が変わらない
+- 表が壊れていても何も起きない。**陳腐化は「注意が出なくなる」側に倒れる**
+- `rb` 自身の呼び出しには出さない。既に掲示板を触っている
+- **自分が既に宣言している資源には出さない**。宣言済みの相手に毎回言うのはノイズであり、
+  ノイズは無視を招く。照合は `holder.cwd` で行う
+- `resource` を書かない行では、無関係な宣言を「現状」として出さない
+  （以前は掲示板の先頭 1 件を返しており、GPU のコマンドの直前に COM3 の宣言が出ていた）
 
 プローブの調べ方を登録させる案は却下したが、この表は**壊れ方の向きが逆**である。
 調べ方が陳腐化すると「空きに見える」＝危険側に倒れるのに対し、判定表が陳腐化しても
@@ -421,12 +427,22 @@ GPU を掴んだが、その時点で起動時の通知はすでに過去のも�
 uv tool install --editable %USERPROFILE%\works\assets\resource-broker
 #    -> %USERPROFILE%\.local\bin\rb.exe（--editable なのでリポジトリの変更が即反映される）
 
-# 2. SessionStart フックを user スコープへ **マージ** 登録する
-#    ~/.claude/settings.json の hooks.SessionStart に追記する。既存の hooks を上書きしない
-#    command: python "%USERPROFILE%\works\assets\resource-broker\hooks\sessionstart_notice.py"
+# 2. 3 つのフックを user スコープへ **マージ** 登録する
+#    ~/.claude/settings.json に追記する。既存の hooks を上書きしない
+#    SessionStart     : hooks/sessionstart_notice.py
+#    UserPromptSubmit : hooks/prompt_board_reminder.py
+#    PreToolUse(Bash) : hooks/pretooluse_notice.py
 
-# 3. 全セッションを再起動する（フック設定は起動時のスナップショット）
+# 3. 注意喚起を出す対象を決める（任意）
+#    %LOCALAPPDATA%\resource-broker\guard.json に patterns を書く。無ければ何も出ない
+
+# 4. 全セッションを再起動する（フック設定は起動時のスナップショット）
 ```
+
+**`--editable` は諸刃である。** リポジトリの変更が入れ直しなしで反映される一方、
+**編集途中・ブランチ切替の一瞬の状態が全セッションへ即時反映される**。
+このリポジトリで壊れたコードを一瞬でも置くと、マシン上の全セッションが巻き込まれる。
+開発と運用を分けるなら、リリース済みのコピーから起動する形へ移す必要がある（未着手）。
 
 - **`rb` の PATH 登録が無くてもフックは動く**（フックは掲示板を読むだけ）。ただし deny された側が
   `rb claim` を打てないと詰むため、`PreToolUse` を入れる前には必須である
