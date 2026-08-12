@@ -76,11 +76,37 @@ def load_patterns(root: Path) -> list[dict[str, object]]:
     return [p for p in patterns[:MAX_PATTERNS] if isinstance(p, dict) and p.get("pattern")]
 
 
+#: 引用符で囲まれた区間。中身は「実行されるコマンド」ではなくデータとみなす。
+_QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"", re.DOTALL)
+
+
+def executable_part(command: str) -> str:
+    """コマンド文字列から、**実際に起動される部分**だけを取り出す。
+
+    投入初日に自分自身を deny した。STATUS.md を書き換えるコマンドのヒアドキュメントに
+    スクリプト名が**文章として**含まれていたためである。**コマンドについて書くことと、
+    コマンドを実行することは違う。** 区別できなければ、ドキュメントの編集も grep も
+    コミットメッセージも止まる。
+
+    完全な shell の構文解析はしない（できないし、するべきでもない）。データが載りやすい
+    2 か所だけを落とす。
+
+    - ヒアドキュメント（``<<`` 以降）。本文はコマンドではない
+    - 引用符で囲まれた区間。``--job "E059 の再実行"`` のような説明文が入る
+
+    取りこぼす方向に倒れる（``bash -c "python train.py"`` は一致しなくなる）。
+    **誤って止めるより、取りこぼすほうがよい**という優先順位に従う。
+    """
+    head = command.split("<<", 1)[0]
+    return _QUOTED.sub(" ", head)
+
+
 def match(command: str, patterns: list[dict[str, object]]) -> dict[str, object] | None:
     """コマンドに一致する判定を返す。壊れた正規表現は飛ばす。"""
+    target = executable_part(command)
     for entry in patterns:
         try:
-            if re.search(str(entry["pattern"]), command):
+            if re.search(str(entry["pattern"]), target):
                 return entry
         except re.error:
             continue
