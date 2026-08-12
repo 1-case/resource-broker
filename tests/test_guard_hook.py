@@ -169,6 +169,54 @@ def test_unrelated_commands_pass(tmp_path: Path, command: str) -> None:
     assert run_hook(tmp_path, bash(command)).returncode == ALLOW
 
 
+def test_mentioning_a_command_is_not_running_it(tmp_path: Path) -> None:
+    """コマンド名に**言及しただけ**では止めない（回帰テスト）。
+
+    投入初日に踏んだ誤 deny。STATUS.md を書き換えるコマンドのヒアドキュメントに
+    スクリプト名が文章として含まれていたため、ドキュメント編集が止まった。
+    区別できなければ grep もコミットメッセージも止まる。
+    """
+    write_guard(tmp_path, [GPU_RULE])
+    command = "\n".join(
+        [
+            "python - <<'PY'",
+            "text = '今日の事故コマンド（python -u scripts/run_e059.py --stage eval）'",
+            "print(text)",
+            "PY",
+        ]
+    )
+
+    assert run_hook(tmp_path, bash(command)).returncode == ALLOW
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git commit -m 'fix: run_e059.py の宣言漏れを直す'",
+        'grep -rn "run_e059.py" docs/',
+        "echo 'run_e059.py を実行する前に宣言すること'",
+        'rb claim GPU0 --job "run_e059.py の準備" --observed "調べた"',
+    ],
+)
+def test_quoted_text_does_not_trigger(tmp_path: Path, command: str) -> None:
+    """引用符の中の文字列はデータであって、起動されるコマンドではない。"""
+    write_guard(tmp_path, [GPU_RULE])
+
+    assert run_hook(tmp_path, bash(command)).returncode == ALLOW
+
+
+def test_real_invocation_is_still_denied(tmp_path: Path) -> None:
+    """言及を通すようにしても、素の実行はきちんと止める。"""
+    write_guard(tmp_path, [GPU_RULE])
+
+    for command in (
+        "python -u scripts/run_e059.py --stage eval",
+        "cd folnet && uv run python scripts/run_e060.py",
+        "python scripts/run_e059.py > out.log 2>&1",
+    ):
+        assert run_hook(tmp_path, bash(command)).returncode == DENY, command
+
+
 def test_other_tools_are_not_touched(tmp_path: Path) -> None:
     """Bash 以外のツールには関与しない。"""
     write_guard(tmp_path, [GPU_RULE])
