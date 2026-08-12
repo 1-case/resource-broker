@@ -174,7 +174,8 @@ def test_claim_proceeds_when_the_board_directory_is_unwritable(
 
     assert code == 0
     assert "宣言しました" not in captured.out
-    assert "掲示板に残っていません" in captured.err
+    assert "掲示板に残せていません" in captured.err
+    assert "他セッションからは見えません" in captured.err
 
 
 def test_lock_failure_does_not_look_like_contention(

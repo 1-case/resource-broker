@@ -10,8 +10,10 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -191,6 +193,37 @@ def test_run_is_blocked_by_a_live_declaration(tmp_path: Path) -> None:
     assert entries(tmp_path)  # 先客の宣言は消えていない
 
 
+def test_run_does_not_claim_success_when_the_board_could_not_record_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """掲示板に残せていないのに「宣言しました」と言わない。
+
+    ``acquire`` は掲示板が書けない・壊れたファイルが居座る場合でも ``entry`` を返し、
+    ``declared=False`` で通す（fail-open）。そこを分岐しないと、**他セッションから
+    見えない利用を成功した宣言として偽装する**ことになる。掲示板の唯一の役目は
+    「他セッションから見えること」であり、そこが果たせていないなら成功と言えない。
+
+    **実行は止めない。** fail-open は「資源アクセスを止めない」原則である。
+    """
+    from resource_broker.naming import normalize
+
+    board = Board(tmp_path)
+    board.entries_dir.mkdir(parents=True, exist_ok=True)
+    # 読めないエントリが居座っている＝ O_EXCL で作れず、読んでも None になる状態
+    board.path_for(normalize("GPU0")).write_text("{ これは JSON ではない", encoding="utf-8")
+    marker = tmp_path / "実行された.txt"
+    capsys.readouterr()
+
+    code = rb_run(tmp_path, sys.executable, "-c", f"open(r'{marker}', 'w').close()")
+    captured = capsys.readouterr()
+
+    assert code == 0  # 実行は止めない
+    assert marker.exists()  # 実際に走っている
+    assert "宣言しました" not in captured.out
+    assert "掲示板に残せていません" in captured.err
+    assert "他セッションからは見えません" in captured.err
+
+
 def test_run_without_command_does_not_claim(tmp_path: Path) -> None:
     """`--` の後ろが空なら、宣言もしない（引数の不備として 2 を返す）。"""
     argv = ["run", "--res", "GPU0", "--job", "x", "--observed", "調べた", "--eta", "5m"]
@@ -238,6 +271,99 @@ def test_child_environment_disables_buffering() -> None:
     assert runner.child_environment({})["PYTHONUNBUFFERED"] == "1"
 
 
+# --- ログの容量と保持期限 -------------------------------------------------------
+
+
+def test_log_is_capped_and_says_so(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """上限に達したらログの追記をやめ、**やめたことを 1 行残す**。
+
+    ログは掲示板・監査ログと同じルートに置く。出力の多い長時間ジョブ 1 つでディスクが
+    埋まると、掲示板も監査ログも書けなくなり、**全セッションが掲示板を失ったまま
+    fail-open で資源を取り合う**。
+
+    黙って捨ててはならない。読む側が「ここでジョブが止まった」と読む
+    （CLAUDE.md「Silence Is Not Success」）。
+    """
+    monkeypatch.setattr(runner, "MAX_LOG_BYTES", 2000)
+    log = tmp_path / "job.log"
+
+    code = rb_run(
+        tmp_path,
+        sys.executable,
+        "-c",
+        "print('x' * 200000)",
+        log=str(log),
+    )
+
+    text = log.read_text(encoding="utf-8", errors="replace")
+    assert code == 0  # ジョブは止めない
+    assert "上限" in text and "破棄した" in text
+    assert log.stat().st_size < 20000  # 20 万バイトは落ちていない
+
+
+def test_the_job_keeps_running_after_the_log_is_capped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """上限に達しても子は最後まで走る。
+
+    上限を「読むのをやめる」で実装すると、パイプが詰まって子が書き込みでブロックする。
+    **ログの上限がジョブの停止に化ける**のが最悪の結末である。
+    """
+    monkeypatch.setattr(runner, "MAX_LOG_BYTES", 100)
+    marker = tmp_path / "最後まで走った.txt"
+
+    code = rb_run(
+        tmp_path,
+        sys.executable,
+        "-c",
+        f"print('y' * 500000); open(r'{marker}', 'w').close()",
+        log=str(tmp_path / "job.log"),
+    )
+
+    assert code == 0
+    assert marker.exists(), "上限に達したところで子が止まっている"
+
+
+def test_old_logs_are_pruned(tmp_path: Path) -> None:
+    """保持期限を過ぎたログは掃除する。世代管理が無いと溜まり続ける。"""
+    logs = tmp_path / runner.LOG_DIR
+    logs.mkdir(parents=True, exist_ok=True)
+    old = logs / "古い.log"
+    fresh = logs / "新しい.log"
+    old.write_text("古い", encoding="utf-8")
+    fresh.write_text("新しい", encoding="utf-8")
+    stale = time.time() - (runner.LOG_RETENTION_DAYS + 1) * 86400
+    os.utime(old, (stale, stale))
+
+    removed = runner.prune_old_logs(logs)
+
+    assert removed == 1
+    assert old.exists() is False
+    assert fresh.exists() is True
+
+
+def test_pruning_failures_are_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """掃除に失敗してもジョブを止めない。
+
+    掃除は付随的な仕事である。ここで例外を出すと「掃除できないからジョブが走らない」
+    という本末転倒が起きる。
+    """
+    logs = tmp_path / runner.LOG_DIR
+    logs.mkdir(parents=True, exist_ok=True)
+    old = logs / "古い.log"
+    old.write_text("古い", encoding="utf-8")
+    stale = time.time() - (runner.LOG_RETENTION_DAYS + 1) * 86400
+    os.utime(old, (stale, stale))
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError("消せない")
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+
+    assert runner.prune_old_logs(logs) == 0  # 例外を出さない
+    assert rb_run(tmp_path, sys.executable, "-c", "print('ok')") == 0
+
+
 # --- 子孫まで確実に止める -------------------------------------------------------
 
 
@@ -273,6 +399,11 @@ class FakeProcess:
         self.killed = True
 
 
+# ``group_alive`` は各テストで必ず注入する。既定の :func:`runner._group_alive` は
+# 実プロセスグループへ問い合わせるため、偽の PID を渡すと**このマシン上の無関係な
+# プロセスグループ**に当たりうる。検証したいのは昇格の順序だけである。
+
+
 def test_stop_escalates_when_the_child_ignores_the_first_signal() -> None:
     """SIGTERM を無視する子は強制終了へ昇格する。
 
@@ -286,10 +417,44 @@ def test_stop_escalates_when_the_child_ignores_the_first_signal() -> None:
         forces.append(force)
         return True
 
-    runner._stop(process, kill_tree=kill_tree, timeout_s=0)  # type: ignore[arg-type]
+    runner._stop(
+        process,  # type: ignore[arg-type]
+        kill_tree=kill_tree,
+        group_alive=lambda _pid: False,
+        timeout_s=0,
+    )
 
     assert forces == [False, True]  # 穏当に頼んでから、強制する
     assert process.waits == 2
+
+
+def test_stop_escalates_when_only_the_grandchild_survives() -> None:
+    """**直接の子が素直に終わっても、孫が残っていれば昇格する。**
+
+    推奨している形が ``rb run ... -- uv run python train.py`` であり、直接の子は
+    ``uv``、資源を掴むのは孫の ``python`` である。``uv`` が ``SIGTERM`` に応じると
+    ``process.wait()`` は成功して戻るため、そこで return すると**孫だけが資源を
+    掴んだまま残り、``finally`` が掲示板から宣言を消す**。掲示板は空・資源は
+    掴まれたままという、最も検出しにくい不整合になる。
+    """
+    process = FakeProcess()  # 直接の子は第 1 段で素直に終わる
+    forces: list[bool] = []
+    group = {"alive": True}  # だが孫が残っている
+
+    def kill_tree(pid: int, force: bool) -> bool:
+        forces.append(force)
+        if force:
+            group["alive"] = False  # 強制終了でグループごと消える
+        return True
+
+    runner._stop(
+        process,  # type: ignore[arg-type]
+        kill_tree=kill_tree,
+        group_alive=lambda _pid: group["alive"],
+        timeout_s=0,
+    )
+
+    assert forces == [False, True]
 
 
 def test_stop_does_not_escalate_when_the_child_exits() -> None:
@@ -301,7 +466,36 @@ def test_stop_does_not_escalate_when_the_child_exits() -> None:
         forces.append(force)
         return True
 
-    runner._stop(process, kill_tree=kill_tree, timeout_s=0)  # type: ignore[arg-type]
+    runner._stop(
+        process,  # type: ignore[arg-type]
+        kill_tree=kill_tree,
+        group_alive=lambda _pid: False,
+        timeout_s=0,
+    )
+
+    assert forces == [False]
+
+
+def test_stop_does_not_escalate_when_group_liveness_is_unknown() -> None:
+    """生存を判定できない環境では昇格しない。
+
+    Windows にはプロセスグループの概念が無く、``taskkill /T`` が木ごと落とすため
+    直接の子の終了で足りる。ここで「判定できない」を「生きている」に倒すと、
+    **素直に終わろうとしている子を毎回強制終了する**ことになる。
+    """
+    process = FakeProcess()
+    forces: list[bool] = []
+
+    def kill_tree(pid: int, force: bool) -> bool:
+        forces.append(force)
+        return True
+
+    runner._stop(
+        process,  # type: ignore[arg-type]
+        kill_tree=kill_tree,
+        group_alive=lambda _pid: None,
+        timeout_s=0,
+    )
 
     assert forces == [False]
 
@@ -313,10 +507,56 @@ def test_stop_falls_back_to_single_process_termination() -> None:
     """
     process = FakeProcess(survives=1)
 
-    runner._stop(process, kill_tree=lambda _pid, _force: False, timeout_s=0)
+    runner._stop(
+        process,  # type: ignore[arg-type]
+        kill_tree=lambda _pid, _force: False,
+        group_alive=lambda _pid: False,
+        timeout_s=0,
+    )
 
     assert process.terminated is True
     assert process.killed is True
+
+
+def test_group_liveness_does_not_go_through_getpgid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """グループの生存確認で ``getpgid`` を経由しない。
+
+    直接の子を ``wait()`` で回収した後は ``getpgid`` が失敗する。経由すると
+    「孫だけが生き残っている」という**まさに見たい状態**が「グループは無い」に化ける。
+    """
+    import os
+
+    if sys.platform == "win32":
+        pytest.skip("Windows にはプロセスグループの概念が無い")
+
+    def explode(_pid: int) -> int:
+        raise ProcessLookupError("直接の子は既に回収されている")
+
+    monkeypatch.setattr(os, "getpgid", explode, raising=False)
+    monkeypatch.setattr(os, "killpg", lambda _pgid, _sig: None, raising=False)
+
+    assert runner._group_alive(4242) is True
+
+
+def test_posix_kill_tree_reaches_the_group_after_the_child_was_reaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """直接の子を回収した後でも、グループへ ``SIGKILL`` が届く。
+
+    ``getpgid`` が失敗したところで諦めると、資源を掴んでいる孫が残る。
+    子は ``start_new_session=True`` で起動しているので ``pgid == 子の PID`` である。
+    """
+    import os
+
+    def explode(_pid: int) -> int:
+        raise ProcessLookupError("直接の子は既に回収されている")
+
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "getpgid", explode, raising=False)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: sent.append((pgid, sig)), raising=False)
+
+    assert runner._kill_tree_posix(4242, True) is True
+    assert sent == [(4242, runner._SIGKILL)]
 
 
 def test_posix_kill_tree_escalates_the_signal(monkeypatch: pytest.MonkeyPatch) -> None:

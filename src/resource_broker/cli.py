@@ -27,6 +27,7 @@ from . import clock, liveness, naming, platform_info, runner, waiting
 from .board import (
     Board,
     Entry,
+    JoinResult,
     LockState,
     RemovalResult,
     UpdateResult,
@@ -417,13 +418,25 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         return result.code
 
     if not result.declared:
-        # 通したが宣言は残っていない。**成功と言わない**（掲示板に出ないため
-        # 他セッションからは見えない）。
-        print("宣言は掲示板に残っていません。他セッションからは見えません", file=sys.stderr)
+        _warn_not_declared()
         return result.code
 
     print(f"宣言しました: {result.entry.display} / {result.entry.job}")
     return EXIT_OK
+
+
+def _warn_not_declared() -> None:
+    """掲示板に残せていないことを強く伝える。**実行や作業は止めない**（fail-open）。
+
+    ``acquire`` は掲示板が書けない・壊れたファイルが居座る場合でも ``entry`` を返し、
+    ``declared=False`` で通す。ここを分岐せずに「宣言しました」と出すと、
+    **他セッションから見えない利用を成功した宣言として偽装する**ことになる。
+    掲示板の唯一の役目は「他セッションから見えること」なので、そこが果たせて
+    いないなら成功と言ってはならない。
+    """
+    print("警告: 宣言を掲示板に残せていません。他セッションからは見えません", file=sys.stderr)
+    print("  他セッションはこの利用を知らないまま同じ資源を取りにきます", file=sys.stderr)
+    print("  作業は止めませんが、衝突を避けたいなら掲示板の状態を確かめること", file=sys.stderr)
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -474,7 +487,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # `UnicodeEncodeError`（Windows のコンソールは cp932）や閉じたパイプの
     # `OSError` で落ちると、宣言だけが掲示板に残る。
     try:
-        print(f"宣言しました: {entry.display} / {entry.job}")
+        # **記録できていないのに「宣言しました」と言わない。** 掲示板が書けなかった場合も
+        # 実行は通す（fail-open）が、他セッションから見えない利用を成功した宣言として
+        # 偽装してはならない。
+        if result.declared:
+            print(f"宣言しました: {entry.display} / {entry.job}")
+        else:
+            _warn_not_declared()
         print(f"ログ: {log_path}")
         return runner.execute(list(args.trailing), log_path, spawn=SPAWN)
     except KeyboardInterrupt:
@@ -676,8 +695,21 @@ def _cmd_join(args: argparse.Namespace) -> int:
         avg=args.avg or "",
         sharing=args.sharing or "",
     )
-    if not board.add_join(entry, cwd):
+    # **「既にある」と「残せなかった」を畳まない。** 畳むと、mkdir・書き込み・ハードリンクの
+    # いずれが失敗しても「既に申告しています」と答えることになり、掲示板に 1 件も残って
+    # いないのに利用者を安心させる。他セッションから見えない利用が始まる。
+    result = board.add_join_detailed(entry, cwd)
+    if result is JoinResult.EXISTS:
         print("既に相乗りを申告しています（同じ作業ディレクトリから二重には申告できません）")
+        return EXIT_OK
+    if result is JoinResult.FAILED:
+        # 掲示板に書けないのは**インフラの故障**であって資源の競合ではない。
+        # 作業は止めない（fail-open）が、成功とは言わない。
+        print(
+            "警告: 相乗りを掲示板に残せていません。他セッションからは見えません",
+            file=sys.stderr,
+        )
+        print("  掲示板が作れない・書けない可能性がある（監査ログを参照）", file=sys.stderr)
         return EXIT_OK
 
     print(f"相乗りを申告しました: {entry.display} / {entry.job}")
@@ -779,13 +811,14 @@ def _cmd_release(args: argparse.Namespace) -> int:
     """自分の宣言を取り下げる。主宣言が自分のものならそれを、無ければ相乗りを外す。"""
     board = Board(args.home)
     resource_id = naming.normalize(args.resource)
+    prefer = "primary" if args.primary else ("join" if args.join else None)
 
     # 読んで、所有を確かめて、消すまでを排他区間にする（`update` と同じ理由）。
     with board.locked(resource_id) as lock:
         _warn_if_unlocked(board, resource_id, lock, event="release_unlocked")
         if args.force:
             return _release_forced(board, resource_id)
-        return _release_own(board, resource_id)
+        return _release_own(board, resource_id, prefer=prefer)
 
 
 def _release_forced(board: Board, resource_id: str) -> int:
@@ -829,51 +862,113 @@ def _release_forced(board: Board, resource_id: str) -> int:
     return EXIT_OK
 
 
-def _release_own(board: Board, resource_id: str) -> int:
-    """自分の宣言だけを取り下げる。見る順序は **完全一致の相乗り → 主宣言 → 祖先の相乗り**。
+def _release_own(board: Board, resource_id: str, *, prefer: str | None = None) -> int:
+    """自分の宣言だけを取り下げる。**曖昧なときは黙って選ばず、指定を求める。**
 
-    この順序は、逆向きの 2 つの誤りを両方避けるために決まっている。どちらも実際に踏んだ。
+    ここは 5 周にわたって同じ振り子を往復した場所である。順序を変えるたびに、
+    直したのと対称な穴が空いた。
 
-    **相乗りを祖先まで含めて先に見ると**、自分は相乗りしていないのに祖先から出された
-    他人の申告が ``owns`` を通り（このマシンでは全プロジェクトが 1 つのルートの下にある）、
-    それを消して早期 return する。他人の申告だけが消え、呼び出し側自身の主宣言は残る。
+    - **相乗りを祖先まで含めて先に見る**と、自分は相乗りしていないのに祖先から出された
+      他人の申告が ``owns`` を通り（このマシンは全プロジェクトが 1 つのルートの下にある）、
+      それを消して早期 return する。他人の申告だけが消え、自分の主宣言は残る
+    - **主宣言を先に見る**と、相乗り者の cwd が主宣言者と同じ（または配下）のとき
+      ``owns`` が通り、**他人の主宣言を消す**。ジョブが走っている最中に宣言だけが消える
+    - **完全一致の相乗りを最優先**にすると、今度は逆向きが残る。S が主宣言し、T が
+      同じ cwd から相乗りしている場面で、**S が ``rb release`` を打つと T の相乗りが
+      先に消え、S の主宣言が残る**
 
-    **主宣言を先に見ると**、今度は逆に、相乗り者の cwd が主宣言者と同じ（または配下）のとき
-    ``owns`` が通り、**他人の主宣言を消してしまう**。``rb join`` は主宣言の存在しか
-    確認しないので「自分が主宣言者かつ相乗り者」は起こり得ないという前提は成立しない。
-    ジョブが走っている最中に宣言だけが消え、資源は掴まれたままになる。
+    **cwd だけでは S と T を区別できない。** どちらを選んでも片方が壊れるので、
+    自動で選ぶのをやめる。両方が候補になったら止めて ``--primary`` / ``--join`` を
+    指定させる。片方しか無いときだけ従来どおり自動で選ぶ。
 
-    **完全一致の相乗りには、その曖昧さが無い。** その場所から自分で出した申告であり、
-    かつ定義上「自分の主宣言」ではありえない。だから最初に見てよい。
+    曖昧とみなすのは**この場所から出された相乗り**（パスの完全一致）が存在する場合だけに
+    限る。祖先フォールバックで拾う候補は「自分のものかもしれない」という推測であり、
+    そこまで曖昧に数えると、他人がハブのルートから出した相乗りがあるだけで
+    自分の主宣言すら解放できなくなる。
+
+    Parameters
+    ----------
+    prefer : {"primary", "join"}, optional
+        どちらを外すか。省略時は候補が 1 つのときだけ自動で選ぶ。
     """
     cwd = os.getcwd()
     entry = board.read(resource_id)
+    mine_primary = entry is not None and board.owns(entry, cwd=cwd)
+    # 「この場所から出された相乗り」だけを曖昧さの材料にする（上の docstring 参照）。
+    has_exact_join = board.join_path(resource_id, cwd).exists()
 
-    if board.join_path(resource_id, cwd).exists():
+    if prefer is None and mine_primary and has_exact_join:
+        return _report_ambiguous_release(resource_id, entry)
+
+    if prefer == "primary":
+        if mine_primary and entry is not None:
+            return _release_own_primary(board, resource_id, entry)
+        return _refuse_primary_release(entry)
+
+    if prefer == "join":
+        join = board.remove_own_join(resource_id, cwd, reason="release コマンド（--join）")
+        if join is None:
+            print("自分の相乗りの申告は見つかりませんでした", file=sys.stderr)
+            return EXIT_OK
+        _report_join_release(resource_id, join, cwd)
+        return EXIT_OK
+
+    # 以降は候補が 1 つしか無い場合である。見る順序は
+    # **完全一致の相乗り → 主宣言 → 祖先の相乗り**。
+    if has_exact_join:
         exact = board.remove_own_join(resource_id, cwd, reason="release コマンド")
         if exact is not None:
-            print(f"相乗りを取り下げました: {naming.display_default(resource_id)}")
+            _report_join_release(resource_id, exact, cwd)
             return EXIT_OK
 
-    if entry is not None and board.owns(entry, cwd=cwd):
+    if mine_primary and entry is not None:
         return _release_own_primary(board, resource_id, entry)
 
     join = board.remove_own_join(resource_id, cwd, reason="release コマンド")
     if join is not None:
-        print(f"相乗りを取り下げました: {naming.display_default(resource_id)}")
-        declared = str(join.holder.get("cwd") or "")
-        if declared and os.path.normcase(declared) != os.path.normcase(cwd):
-            # 完全一致ではなく祖先フォールバックで選んだ。**誤爆が目視できるように**
-            # 申告元を出す。出さなければ、他人の申告を消したことに気づく手段が無い。
-            print(f"  申告元: {declared}（自分の場所から出した申告ではありません）")
+        _report_join_release(resource_id, join, cwd)
         return EXIT_OK
 
+    return _refuse_primary_release(entry)
+
+
+def _report_ambiguous_release(resource_id: str, entry: Entry | None) -> int:
+    """主宣言と相乗りの両方が候補になったことを伝えて、何も消さずに戻る。
+
+    **黙ってどちらかを選ばない。** 同じ作業ディレクトリから主宣言と相乗りが出ている場合、
+    掲示板の情報だけでは「どちらが呼び出し側のものか」を決められない。推測して外すと、
+    走っているジョブの宣言を消すか、他人の相乗りを消すかのどちらかになる。
+    """
+    print("主宣言と相乗りの両方が自分のものの候補です。どちらを外すか指定してください")
+    if entry is not None:
+        print(f"  主宣言: {entry.session} / {entry.job}（since {entry.since}）")
+    print("  相乗り: この作業ディレクトリから出した申告")
+    display = naming.display_default(resource_id)
+    print(f"  rb release {display} --primary   （主宣言を外す）")
+    print(f"  rb release {display} --join      （相乗りを取り下げる）")
+    return EXIT_USAGE
+
+
+def _report_join_release(resource_id: str, join: Entry, cwd: str) -> None:
+    """相乗りを外したことを伝える。祖先フォールバックなら申告元も出す。"""
+    print(f"相乗りを取り下げました: {naming.display_default(resource_id)}")
+    declared = str(join.holder.get("cwd") or "")
+    if declared and os.path.normcase(declared) != os.path.normcase(cwd):
+        # 完全一致ではなく祖先フォールバックで選んだ。**誤爆が目視できるように**
+        # 申告元を出す。出さなければ、他人の申告を消したことに気づく手段が無い。
+        print(f"  申告元: {declared}（自分の場所から出した申告ではありません）")
+
+
+def _refuse_primary_release(entry: Entry | None) -> int:
+    """外せる宣言が無かったことを伝える。
+
+    **他人の宣言は消さない。** 掲示板の唯一の強制点は先着排他であり、最も打ちやすい
+    コマンドでそれを無効化できてはならない。claim が ``--force`` を要求するのと対称にする。
+    """
     if entry is None:
         print("宣言は見つかりませんでした（既に解放済みです）")
         return EXIT_OK
 
-    # **他人の宣言は消さない。** 掲示板の唯一の強制点は先着排他であり、最も打ちやすい
-    # コマンドでそれを無効化できてはならない。claim が --force を要求するのと対称にする。
     print("他セッションの宣言は解放できません（--force で強制解放できます）", file=sys.stderr)
     print(f"  宣言者: {entry.session} / {entry.job}", file=sys.stderr)
     print(f"  since : {entry.since}", file=sys.stderr)
@@ -996,11 +1091,23 @@ def build_parser() -> argparse.ArgumentParser:
     _add_declaration_options(claim)
     claim.set_defaults(func=_cmd_claim)
 
-    release = sub.add_parser("release", help="宣言を解放する（自分のものだけ）")
+    release = sub.add_parser(
+        "release",
+        help="宣言を解放する（自分のものだけ）",
+        description=(
+            "自分の主宣言または相乗りを取り下げる。同じ作業ディレクトリから両方が"
+            "出ている場合、掲示板の情報だけではどちらが呼び出し側のものか決められないため、"
+            "**推測せずに指定を求める**。--primary / --join で狙って外すこと。"
+        ),
+    )
     release.add_argument("resource", help="資源 ID")
     release.add_argument(
         "--force", action="store_true", help="他セッションの宣言も強制的に解放する"
     )
+    # **どちらを外すかの明示。** 両方が候補になるとき、本ツールは選ばずに止める。
+    kind = release.add_mutually_exclusive_group()
+    kind.add_argument("--primary", action="store_true", help="主宣言のほうを外す")
+    kind.add_argument("--join", action="store_true", help="相乗りのほうを取り下げる")
     release.set_defaults(func=_cmd_release)
 
     run = sub.add_parser(

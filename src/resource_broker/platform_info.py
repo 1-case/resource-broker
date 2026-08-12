@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import socket
 import sys
+from collections.abc import Callable
 from datetime import datetime, timedelta
 
 from . import clock
@@ -25,6 +26,21 @@ _STILL_ACTIVE = 259
 _ERROR_ACCESS_DENIED = 5
 _ERROR_INVALID_PARAMETER = 87
 
+#: 起動からの経過ミリ秒を返すもの。**テストで差し替える。**
+#:
+#: Windows の実 API を呼ばずに、32 bit 相当の負値・巻き戻り・巨大値を与えて
+#: :func:`boot_time` が壊れないことを検証するための注入点である。
+#: CI は Linux で回るため、この経路は注入以外に検証手段が無い。
+TickMillis = Callable[[], object]
+
+#: 起動からの経過時間として受け入れる上限（秒）。約 10 年。
+#:
+#: **実測値は sanity check を通す**（CLAUDE.md「Liveness Judgment」）。範囲外を通すと
+#: 起動時刻がでたらめになり、幽霊判定で唯一「確定」とされている条件
+#: （``since < 起動時刻``）が静かに壊れる。壊れ方は**稼働中の宣言が「再起動前の幽霊」
+#: として退去される**という最悪の向きである。
+MAX_UPTIME_S = 10.0 * 365.0 * 24.0 * 3600.0
+
 
 def hostname() -> str:
     """このマシンのホスト名を返す。取得できなければ ``unknown-host``。"""
@@ -35,43 +51,95 @@ def hostname() -> str:
     return (name or "unknown-host").strip().lower()
 
 
-def boot_time() -> datetime | None:
+def boot_time(*, tick_millis: TickMillis | None = None) -> datetime | None:
     """このマシンが起動した時刻を返す。取得できなければ None。
 
     掲示板の幽霊判定に使う。エントリの ``since`` がこの時刻より前なら、
     そのエントリは再起動をまたいで残った幽霊であると**確定**できる
     （再起動で全 PID が無効かつ再利用されるため）。
 
+    Parameters
+    ----------
+    tick_millis : callable, optional
+        起動からの経過ミリ秒を返すもの。渡すと Windows 経路を強制する。
+        テスト専用の注入点である（:data:`TickMillis`）。
+
     Returns
     -------
     datetime or None
         タイムゾーン付きの起動時刻。取得できなければ None。
     """
-    uptime = _uptime_seconds()
+    uptime = _uptime_seconds(tick_millis=tick_millis)
     if uptime is None:
         return None
     return clock.now() - timedelta(seconds=uptime)
 
 
-def _uptime_seconds() -> float | None:
-    """起動からの経過秒数を返す。取得できなければ None。"""
-    if _WINDOWS:
-        try:
-            import ctypes
+def _windows_tick_millis() -> object:
+    """``GetTickCount64`` の生の戻り値（ミリ秒）。取得できなければ None。
 
-            # GetTickCount64 はスリープ・休止に費やした時間も含む（= 実時間の経過）。
-            # QueryUnbiasedInterruptTime はスリープ分を除くため、ここでは使わない。
-            millis = ctypes.windll.kernel32.GetTickCount64()  # type: ignore[attr-defined]
-        except Exception:
+    Notes
+    -----
+    **戻り値の型を必ず宣言する。** ``ctypes`` の既定の戻り値は ``c_int``
+    （32 bit 符号付き）であり、64 bit を返す API をそのまま呼ぶと
+    **稼働 24.9 日で負値、49.7 日で下位 32 bit へ巻き戻る**。巻き戻ると起動時刻が
+    実際より大幅に新しく計算され、稼働中の宣言が「再起動前の幽霊」として退去される。
+    幽霊判定の中で唯一「確定的」とされている条件が、静かに壊れる形である。
+
+    ``GetTickCount64`` はスリープ・休止に費やした時間も含む（= 実時間の経過）。
+    ``QueryUnbiasedInterruptTime`` はスリープ分を除くため、ここでは使わない。
+    """
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        function = kernel32.GetTickCount64
+        function.restype = ctypes.c_ulonglong
+        function.argtypes = []
+        return function()
+    except Exception:  # noqa: BLE001 - 判定材料が無いだけ。呼び出し側は fail-open で通す
+        return None
+
+
+def _sane_uptime(seconds: object) -> float | None:
+    """経過秒数を sanity check にかける。範囲外なら None（＝判定材料が無い）。
+
+    **範囲外を通さない。** 実測値は壊れた値を返すことがある
+    （実測: アイドル時の ``power.draw`` が 590.01 W と報告された）。
+    ここで通すと起動時刻がでたらめになり、生きている宣言を退去させうる。
+    判定できないときは「退けない」側（None）へ倒す。
+    """
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+        return None
+    value = float(seconds)
+    if value != value:  # NaN
+        return None
+    if value <= 0.0 or value > MAX_UPTIME_S:
+        return None
+    return value
+
+
+def _uptime_seconds(*, tick_millis: TickMillis | None = None) -> float | None:
+    """起動からの経過秒数を返す。取得できなければ None。
+
+    Parameters
+    ----------
+    tick_millis : callable, optional
+        起動からの経過ミリ秒を返すもの。渡すと Windows 経路を強制する。
+    """
+    if tick_millis is not None or _WINDOWS:
+        try:
+            millis = (tick_millis or _windows_tick_millis)()
+        except Exception:  # noqa: BLE001 - この層は例外を出さない（モジュール docstring）
             return None
-        if not isinstance(millis, int) or millis <= 0:
+        if isinstance(millis, bool) or not isinstance(millis, (int, float)):
             return None
-        return millis / 1000.0
+        return _sane_uptime(float(millis) / 1000.0)
 
     try:
         with open("/proc/uptime", encoding="ascii") as handle:
             first = handle.readline().split()[0]
-        return float(first)
+        return _sane_uptime(float(first))
     except (OSError, IndexError, ValueError):
         return None
 
