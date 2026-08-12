@@ -11,8 +11,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from resource_broker import liveness
-from resource_broker.liveness import Verdict
-from resource_broker.probes.base import Observation
+from resource_broker.liveness import Observation, Verdict
 
 JST = timezone(timedelta(hours=9))
 BOOT = datetime(2026, 8, 12, 4, 27, 53, tzinfo=JST)
@@ -22,7 +21,7 @@ BEFORE_BOOT = BOOT - timedelta(hours=1)
 FRESH = NOW - timedelta(minutes=1)  # 猶予の内側（宣言したばかり）
 AGED = NOW - timedelta(hours=1)  # 猶予の外側
 
-UNKNOWN = Observation(busy=None, error="プローブが使えない")
+UNKNOWN = Observation(busy=None, note="調べていない")
 BUSY = Observation(busy=True)
 IDLE = Observation(busy=False)
 
