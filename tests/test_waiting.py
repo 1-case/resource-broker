@@ -15,6 +15,7 @@ Esc でも抜けられない）。ここで守るのは 4 つ。
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -23,6 +24,12 @@ from resource_broker.board import Board, build_entry
 from resource_broker.naming import normalize
 
 RESOURCE = normalize("GPU0")
+
+#: 相乗り者の作業ディレクトリ。**ネイティブの区切りで組み立てる。**
+#:
+#: Windows 形式のリテラルを実パスとして使うと、POSIX では ``\`` が区切りではないため
+#: 配下判定が意味を失う（テストは通るが何も検証しなくなる）。
+JOINER_CWD = os.path.join(os.sep, "works", "malm")
 
 
 class FakeClock:
@@ -109,7 +116,7 @@ def test_returns_when_a_joiner_leaves(tmp_path: Path) -> None:
     """
     board = Board(tmp_path)
     declare(board)
-    join(board, "C:\\works\\malm")
+    join(board, JOINER_CWD)
     fake = FakeClock()
     calls = {"n": 0}
 
@@ -117,7 +124,7 @@ def test_returns_when_a_joiner_leaves(tmp_path: Path) -> None:
         calls["n"] += 1
         fake.sleep(seconds)
         if calls["n"] == 2:
-            board.remove_join(RESOURCE, "C:\\works\\malm", reason="テストで離脱")
+            board.remove_join(RESOURCE, JOINER_CWD, reason="テストで離脱")
 
     result = waiting.wait_for_room(
         board, RESOURCE, interval_s=5, timeout_s=1000, sleep=sleep, now=fake.now
@@ -145,7 +152,7 @@ def test_does_not_return_when_a_joiner_is_added(tmp_path: Path) -> None:
         calls["n"] += 1
         fake.sleep(seconds)
         if calls["n"] == 2:
-            join(board, "C:\\works\\malm")
+            join(board, JOINER_CWD)
 
     result = waiting.wait_for_room(
         board, RESOURCE, interval_s=10, timeout_s=60, sleep=sleep, now=fake.now
@@ -190,7 +197,7 @@ def test_shrink_after_a_replacement_still_wakes(tmp_path: Path) -> None:
     """
     board = Board(tmp_path)
     declare(board)
-    join(board, "C:\\works\\malm")
+    join(board, JOINER_CWD)
     fake = FakeClock()
     calls = {"n": 0}
 
@@ -201,7 +208,7 @@ def test_shrink_after_a_replacement_still_wakes(tmp_path: Path) -> None:
             board.remove(RESOURCE, reason="テストで交代")
             assert board.try_claim(build_entry(RESOURCE, job="別のジョブ", session="malm"))
         if calls["n"] == 3:
-            board.remove_join(RESOURCE, "C:\\works\\malm", reason="テストで離脱")
+            board.remove_join(RESOURCE, JOINER_CWD, reason="テストで離脱")
 
     result = waiting.wait_for_room(
         board, RESOURCE, interval_s=5, timeout_s=1000, sleep=sleep, now=fake.now
@@ -225,9 +232,9 @@ def test_growth_then_shrink_still_wakes(tmp_path: Path) -> None:
         calls["n"] += 1
         fake.sleep(seconds)
         if calls["n"] == 1:
-            join(board, "C:\\works\\malm")
+            join(board, JOINER_CWD)
         if calls["n"] == 3:
-            board.remove_join(RESOURCE, "C:\\works\\malm", reason="テストで離脱")
+            board.remove_join(RESOURCE, JOINER_CWD, reason="テストで離脱")
 
     result = waiting.wait_for_room(
         board, RESOURCE, interval_s=5, timeout_s=1000, sleep=sleep, now=fake.now

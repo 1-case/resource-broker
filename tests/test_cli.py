@@ -228,7 +228,7 @@ def test_wait_does_not_report_release_when_only_joins_remain(
 
     board = Board(tmp_path)
     resource = normalize("GPU0")
-    place = "C:\\works\\theirs"
+    place = str(tmp_path / "works" / "theirs")
     assert board.add_join(build_entry(resource, job="相乗りのジョブ", cwd=place), place)
     capsys.readouterr()
 

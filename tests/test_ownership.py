@@ -24,12 +24,29 @@ from resource_broker.cli import main
 from resource_broker.naming import normalize
 
 RESOURCE = normalize("GPU0")
-MINE = "C:\\works\\mine"
-THEIRS = "C:\\works\\theirs"
+
+#: 互いに**無関係な** 2 つの作業ディレクトリ。階層関係を持たせない。
+#:
+#: ネイティブの区切りで組み立てる。以前は ``C:\works\mine`` のような Windows 形式の
+#: リテラルを実パスとして使っていたが、POSIX では ``\`` は区切りではないため
+#: 「区切りの無い 1 つの名前」になり、配下判定が常に False になる。
+#: **所有関係のテストが Linux CI で何も検証していなかった**（CI は通っていた）。
+MINE = os.path.join(os.sep, "works", "mine")
+THEIRS = os.path.join(os.sep, "works", "theirs")
 
 
 def run(tmp_path: Path, *args: str) -> int:
     return main(["--home", str(tmp_path), *args])
+
+
+def places(tmp_path: Path, *names: str) -> list[str]:
+    """階層関係のある作業ディレクトリを**ネイティブなパス**で組み立てる。
+
+    ``"hub"``, ``"hub/assets/malm"`` のように ``/`` 区切りで書くと、
+    実行中の OS の区切りへ変換したパスが返る。**文字列リテラルで階層を書かない**
+    （書くと片方の OS でだけ意味を失い、しかもテストは通ってしまう）。
+    """
+    return [str(tmp_path.joinpath(*name.split("/"))) for name in names]
 
 
 def claim(tmp_path: Path, *extra: str) -> int:
@@ -193,8 +210,9 @@ def test_an_ancestor_directory_does_not_own_the_declaration(
     掲示板の唯一の強制点（先着排他）が、上の階層に居るだけで無効になってはならない。
     """
     board = Board(tmp_path)
-    plant(board, "C:\\works\\assets\\malm")
-    monkeypatch.setattr(os, "getcwd", lambda: "C:\\works")
+    hub, asset = places(tmp_path, "works", "works/assets/malm")
+    plant(board, asset)
+    monkeypatch.setattr(os, "getcwd", lambda: hub)
     capsys.readouterr()
 
     assert run(tmp_path, "release", "GPU0") == 1
@@ -211,8 +229,9 @@ def test_a_subdirectory_still_owns_its_declaration(
     自分の資源を自分で解放できないという最悪の使い勝手になる。
     """
     board = Board(tmp_path)
-    plant(board, "C:\\works\\assets\\malm", job="自分のジョブ")
-    monkeypatch.setattr(os, "getcwd", lambda: "C:\\works\\assets\\malm\\runs\\e008")
+    asset, deeper = places(tmp_path, "works/assets/malm", "works/assets/malm/runs/e008")
+    plant(board, asset, job="自分のジョブ")
+    monkeypatch.setattr(os, "getcwd", lambda: deeper)
 
     assert run(tmp_path, "release", "GPU0") == 0
     assert board.read(RESOURCE) is None
@@ -783,7 +802,8 @@ def test_claim_names_the_corrupt_entry_instead_of_failing_silently(
     assert code == 0  # 判断材料が無いだけ。作業は止めない（fail-open）
     assert "壊れたエントリ" in captured.err
     assert "--force" in captured.err
-    assert "宣言は掲示板に残っていません" in captured.err
+    assert "掲示板に残せていません" in captured.err
+    assert "宣言しました" not in captured.out
 
 
 # --- 幽霊判定の境界 -------------------------------------------------------------
@@ -949,6 +969,46 @@ def test_join_is_allowed_even_when_found_busy(
     assert "相乗りを申告しました" in capsys.readouterr().out
 
 
+def test_join_reports_an_io_failure_apart_from_a_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """掲示板に残せなかったことを「既に申告しています」と言わない。
+
+    ``add_join`` の失敗には mkdir・書き込み・ハードリンクの失敗も含まれる。
+    それを「既にある」と畳むと、**掲示板に 1 件も残っていないのに利用者を安心させる**。
+    他セッションから見えない利用が始まるのは、掲示板が防ごうとしているものそのものである。
+
+    **作業は止めない**（fail-open）。掲示板に書けないのはインフラの故障であって
+    資源の競合ではない。
+    """
+    plant(Board(tmp_path), THEIRS)
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise OSError("相乗りのディレクトリが作れない")
+
+    monkeypatch.setattr(Path, "mkdir", refuse)
+    capsys.readouterr()
+
+    code = run(
+        tmp_path,
+        "join",
+        "--res",
+        "GPU0",
+        "--job",
+        "相乗り",
+        "--observed",
+        "調べた",
+        "--eta",
+        "10m",
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0  # 止めない
+    assert "既に相乗りを申告しています" not in captured.out
+    assert "掲示板に残せていません" in captured.err
+    assert "相乗りを申告しました" not in captured.out
+
+
 def test_join_twice_from_the_same_place_is_refused(tmp_path: Path) -> None:
     """同じ作業ディレクトリから二重には申告できない。"""
     plant(Board(tmp_path), THEIRS)
@@ -1009,6 +1069,86 @@ def test_a_join_within_the_boot_margin_survives(
     assert len(board.list_joins(RESOURCE)) == 1
 
 
+def test_a_stale_join_is_removed_only_when_it_still_matches(tmp_path: Path) -> None:
+    """相乗りの削除も **nonce の CAS** に乗る（読み取りと削除の間の入れ替わり）。
+
+    古い相乗りを読んだ後、消す前に別プロセスが同じ ``(資源, cwd)`` を取り下げて
+    出し直すことがある。無条件の ``unlink`` はその**新しい生きた申告**を消す。
+    主宣言で塞いだのと同じ read-delete race である。
+    """
+    board = Board(tmp_path)
+    old = build_entry(RESOURCE, job="古い相乗り", cwd=THEIRS, session="theirs")
+    assert board.add_join(old, THEIRS)
+
+    # 読み終えた直後に、同じ場所の申告が取り下げられて出し直された状況を作る
+    board.join_path(RESOURCE, THEIRS).unlink()
+    assert board.add_join(build_entry(RESOURCE, job="新しい相乗り", cwd=THEIRS), THEIRS)
+
+    result = board._capture_and_remove(
+        board.join_path(RESOURCE, THEIRS),
+        expect_nonce=old.nonce,
+        resource_id=RESOURCE,
+        reason="テスト",
+    )
+
+    assert result is RemovalResult.NOT_OWNED
+    assert [join.job for join in board.list_joins(RESOURCE)] == ["新しい相乗り"]
+
+
+def test_stale_join_cleanup_goes_through_the_cas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """読み取り時の相乗り掃除が、無条件 ``unlink`` ではなく CAS を通ること。
+
+    ここが素通しに戻ると、上のテストが守っている性質は経路ごと迂回される。
+    """
+    board = Board(tmp_path)
+    joiner = build_entry(RESOURCE, job="落ちたセッション", cwd=THEIRS, session="theirs")
+    assert board.add_join(joiner, THEIRS)
+    monkeypatch.setattr(
+        "resource_broker.platform_info.boot_time", lambda: clock.now() + timedelta(minutes=10)
+    )
+
+    seen: list[str] = []
+    original = Board._capture_and_remove
+
+    def spy(
+        self: Board, path: Path, *, expect_nonce: str, resource_id: str, reason: str
+    ) -> RemovalResult:
+        seen.append(expect_nonce)
+        return original(
+            self, path, expect_nonce=expect_nonce, resource_id=resource_id, reason=reason
+        )
+
+    monkeypatch.setattr(Board, "_capture_and_remove", spy)
+
+    assert board.list_joins(RESOURCE) == []
+    assert seen == [joiner.nonce]
+
+
+def test_a_stale_join_that_cannot_be_removed_is_still_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """掃除に失敗した相乗りを「無い」と答えない。
+
+    消せていないものを消えたことにすると、資源が空きに見えて他セッションが取りにくる。
+    掲示板が出しうる誤りのうち最も危ないのがこれである。
+    """
+    board = Board(tmp_path)
+    assert board.add_join(build_entry(RESOURCE, job="消せない相乗り", cwd=THEIRS), THEIRS)
+    monkeypatch.setattr(
+        "resource_broker.platform_info.boot_time", lambda: clock.now() + timedelta(minutes=10)
+    )
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError("共有違反")
+
+    monkeypatch.setattr(os, "rename", refuse)
+    monkeypatch.setattr("resource_broker.board.UNLINK_DELAY_S", 0.0)
+
+    assert [join.job for join in board.list_joins(RESOURCE)] == ["消せない相乗り"]
+
+
 def test_a_live_join_is_not_discarded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """起動後に出された相乗りは、猶予も PID も見ずにそのまま残す。
 
@@ -1036,7 +1176,7 @@ def test_force_release_also_clears_the_joins(
     """
     board = Board(tmp_path)
     plant(board, THEIRS)
-    for place in ("C:\\works\\a", "C:\\works\\b"):
+    for place in places(tmp_path, "works/a", "works/b"):
         assert board.add_join(build_entry(RESOURCE, job="相乗り", cwd=place), place)
     capsys.readouterr()
 
@@ -1066,10 +1206,10 @@ def test_a_join_can_be_released_from_a_subdirectory(
     """
     board = Board(tmp_path)
     plant(board, THEIRS)
-    place = "C:\\works\\assets\\malm"
+    place, deeper = places(tmp_path, "works/assets/malm", "works/assets/malm/runs/e008")
     assert board.add_join(build_entry(RESOURCE, job="相乗り", cwd=place), place)
 
-    monkeypatch.setattr(os, "getcwd", lambda: place + "\\runs\\e008")
+    monkeypatch.setattr(os, "getcwd", lambda: deeper)
 
     assert run(tmp_path, "release", "GPU0") == 0
     assert board.list_joins(RESOURCE) == []
@@ -1101,8 +1241,7 @@ def test_release_prefers_my_own_join_over_one_declared_from_an_ancestor(
     """
     board = Board(tmp_path)
     plant(board, THEIRS)
-    hub = "C:\\works"
-    mine = "C:\\works\\assets\\malm"
+    hub, mine = places(tmp_path, "works", "works/assets/malm")
     assert board.add_join(build_entry(RESOURCE, job="ハブの相乗り", cwd=hub), hub)
     assert board.add_join(build_entry(RESOURCE, job="私の相乗り", cwd=mine), mine)
 
@@ -1122,12 +1261,13 @@ def test_release_picks_the_nearest_ancestor_join(
     """
     board = Board(tmp_path)
     plant(board, THEIRS)
-    hub = "C:\\works"
-    near = "C:\\works\\assets\\malm"
+    hub, near, deeper = places(
+        tmp_path, "works", "works/assets/malm", "works/assets/malm/runs/e008"
+    )
     assert board.add_join(build_entry(RESOURCE, job="ハブの相乗り", cwd=hub), hub)
     assert board.add_join(build_entry(RESOURCE, job="近い相乗り", cwd=near), near)
 
-    monkeypatch.setattr(os, "getcwd", lambda: near + "\\runs\\e008")
+    monkeypatch.setattr(os, "getcwd", lambda: deeper)
 
     assert run(tmp_path, "release", "GPU0") == 0
     assert [join.job for join in board.list_joins(RESOURCE)] == ["ハブの相乗り"]
@@ -1144,8 +1284,7 @@ def test_release_keeps_an_ancestors_join_when_i_have_none(
     二重の誤りになる。主宣言を先に見れば、どちらも起きない。
     """
     board = Board(tmp_path)
-    mine = "C:\\works\\assets\\foo"
-    hub = "C:\\works"
+    hub, mine = places(tmp_path, "works", "works/assets/foo")
     monkeypatch.setattr(os, "getcwd", lambda: mine)
     assert claim(tmp_path) == 0  # 主宣言は自分のもの
     assert board.add_join(build_entry(RESOURCE, job="ハブの相乗り", cwd=hub), hub)
@@ -1189,32 +1328,110 @@ def test_force_release_reports_the_joins_even_when_the_primary_fails(
     assert "相乗り 1 件" in captured.err
 
 
-def test_release_by_a_joiner_sharing_my_cwd_keeps_the_primary(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """主宣言者と同じ場所から相乗りした者が release しても、主宣言は消えない（回帰テスト）。
-
-    解放の順序を「主宣言を先に見る」に変えたとき、対称な穴が空いた。``owns`` は祖先関係を
-    許すので、相乗り者の cwd が主宣言者と同じ（または配下）だと**他人の主宣言が自分のものとして
-    通る**。ジョブが走っている最中に宣言だけが消え、資源は掴まれたままになる。
-
-    ``rb join`` は主宣言の**存在**しか確認しないので、「自分が主宣言者かつ相乗り者」は
-    起こり得ないという前提は成立しない。完全一致の相乗りを最初に見ることで塞ぐ。
-    """
+def shared_primary_and_join(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Board:
+    """同じ作業ディレクトリから S の主宣言と T の相乗りが出ている状況を作る。"""
     board = Board(tmp_path)
     shared = str(tmp_path / "同じ場所")
     os.makedirs(shared, exist_ok=True)
 
-    # S が主宣言を出す（cwd = shared）
     assert board.try_claim(build_entry(RESOURCE, job="S のジョブ", cwd=shared, session="S"))
-    # T が同じ場所から相乗りする
     assert board.add_join(build_entry(RESOURCE, job="T の相乗り", cwd=shared, session="T"), shared)
 
     monkeypatch.chdir(shared)
-    assert run(tmp_path, "release", "GPU0") == 0
-    assert "相乗りを取り下げました" in capsys.readouterr().out
+    return board
 
+
+def test_release_stops_when_both_a_primary_and_a_join_are_mine(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """主宣言と相乗りの両方が候補になったら、**何も消さずに指定を求める**。
+
+    ここは 5 周にわたって同じ振り子を往復した場所である。相乗りを先に見れば他人の申告を
+    消し、主宣言を先に見れば他人の主宣言を消し、完全一致の相乗りを最優先にすれば
+    主宣言者が ``release`` を打っても相乗りだけが消える。**cwd だけでは S と T を
+    区別できない**以上、どれを選んでも片方が壊れる。
+
+    したがって自動で選ぶのをやめる。掲示板の情報で決められないことを推測しない、
+    というのがこの節の唯一の出口である。
+    """
+    board = shared_primary_and_join(tmp_path, monkeypatch)
+    capsys.readouterr()
+
+    code = run(tmp_path, "release", "GPU0")
+    captured = capsys.readouterr()
+
+    assert code == 2  # 引数の不備として返す（資源の競合ではない）
+    assert "どちらを外すか指定してください" in captured.out
+    assert "--primary" in captured.out and "--join" in captured.out
+    # **どちらも消していない。** 曖昧なまま片方を消すのが、5 周続いた失敗の形である
     survivor = board.read(RESOURCE)
-    assert survivor is not None, "S の主宣言が消えている"
-    assert survivor.job == "S のジョブ"
+    assert survivor is not None and survivor.job == "S のジョブ"
+    assert [join.job for join in board.list_joins(RESOURCE)] == ["T の相乗り"]
+
+
+def test_release_can_target_the_primary_or_the_join(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--join`` は相乗りだけを、``--primary`` は主宣言だけを外す。
+
+    S（主宣言者）と T（相乗り者）が同じ場所に居るとき、**それぞれが自分のものだけを
+    外せる**ことが要件である。どちらか一方しか外せない実装は、片方のセッションから見て
+    「自分の宣言が解放できない」か「他人の宣言を消してしまう」のどちらかになる。
+    """
+    board = shared_primary_and_join(tmp_path, monkeypatch)
+
+    # T が自分の相乗りを取り下げる
+    assert run(tmp_path, "release", "GPU0", "--join") == 0
     assert board.list_joins(RESOURCE) == []
+    survivor = board.read(RESOURCE)
+    assert survivor is not None and survivor.job == "S のジョブ", "S の主宣言が消えている"
+
+    # S が自分の主宣言を解放する
+    assert run(tmp_path, "release", "GPU0", "--primary") == 0
+    assert board.read(RESOURCE) is None
+
+
+def test_release_primary_does_not_fall_back_to_the_join(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--primary`` を指定したら、相乗りには手を出さない。
+
+    指定したものが無かったときに黙って別のものを消すと、明示指定の意味が消える。
+    """
+    board = shared_primary_and_join(tmp_path, monkeypatch)
+    assert board.remove(RESOURCE, reason="テスト")  # 主宣言だけ先に消えた状況
+
+    assert run(tmp_path, "release", "GPU0", "--primary") == 0
+    assert [join.job for join in board.list_joins(RESOURCE)] == ["T の相乗り"]
+
+
+def test_release_join_does_not_fall_back_to_the_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--join`` を指定したら、主宣言には手を出さない。"""
+    board = shared_primary_and_join(tmp_path, monkeypatch)
+    assert board.remove_joins(RESOURCE, reason="テスト") == 1  # 相乗りだけ先に消えた状況
+
+    assert run(tmp_path, "release", "GPU0", "--join") == 0
+    survivor = board.read(RESOURCE)
+    assert survivor is not None and survivor.job == "S のジョブ"
+
+
+def test_release_still_chooses_automatically_when_only_one_candidate_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """候補が 1 つしか無いときは従来どおり自動で選ぶ。
+
+    曖昧でない場面まで指定を求めると、最もよく打つコマンドが毎回落ちる。
+    止めるのは「決められないとき」だけである。
+    """
+    board = Board(tmp_path)
+    place = str(tmp_path / "私の場所")
+    os.makedirs(place, exist_ok=True)
+    monkeypatch.chdir(place)
+    plant(board, THEIRS)  # 主宣言は他人のもの
+    assert board.add_join(build_entry(RESOURCE, job="私の相乗り", cwd=place), place)
+
+    assert run(tmp_path, "release", "GPU0") == 0
+    assert board.list_joins(RESOURCE) == []
+    assert board.read(RESOURCE) is not None  # 他人の主宣言はそのまま

@@ -118,6 +118,20 @@ class UpdateResult(StrEnum):
     FAILED = "failed"
 
 
+class JoinResult(StrEnum):
+    """相乗りの申告の結果。
+
+    **「既にある」と「掲示板に残せなかった」を畳まない。** 畳むと、mkdir・書き込み・
+    ハードリンクのいずれが失敗しても「既に申告しています」と答えることになり、
+    **掲示板に 1 件も残っていないのに利用者を安心させる**。他セッションから見えない
+    利用が始まるのは、掲示板が防ごうとしているもの（衝突）そのものである。
+    """
+
+    ADDED = "added"
+    EXISTS = "exists"
+    FAILED = "failed"
+
+
 class MoveResult(StrEnum):
     """ファイル移動の結果。CAS の「捕まえる」「戻す」で使う。"""
 
@@ -601,8 +615,6 @@ class Board:
         数回やり直して吸収し、吸収できなければ ``FAILED`` を返して**保守的に諦める**
         （消せていないのに消えたと答えるより、退けられなかったと答えるほうが安全である）。
         """
-        path = self.path_for(resource_id)
-
         # 1. 先読み。ここで弾ければファイルを動かさずに済み、戻す処理も走らない。
         current = self.read(resource_id)
         if current is None:
@@ -611,6 +623,29 @@ class Board:
             self.audit("remove_refused", resource=resource_id, reason="nonce が一致しない")
             return RemovalResult.NOT_OWNED
 
+        return self._capture_and_remove(
+            self.path_for(resource_id),
+            expect_nonce=expect_nonce,
+            resource_id=resource_id,
+            reason=reason,
+        )
+
+    def _capture_and_remove(
+        self, path: Path, *, expect_nonce: str, resource_id: str, reason: str
+    ) -> RemovalResult:
+        """**捕まえてから確かめて消す**（CAS の 2〜3 段目）。先読みは呼び出し側の仕事。
+
+        パスを引数に取るのは、主宣言（``board/<safe>.json``）と相乗り
+        （``board/joins/<safe>.json``）で**同じ形を使う**ためである。無条件の ``unlink``
+        は、読んだ内容と消す対象が同じである保証を持たない。読んでから消すまでの間に
+        別プロセスが同じ名前を消して作り直すと、**新しい生きた申告を消す**。
+        主宣言で塞いだ read-delete race と同じものなので、相乗りにも同じ形を適用する。
+
+        Returns
+        -------
+        RemovalResult
+            消した / 無かった / 別物だった / 消せなかった。
+        """
         # 2. 捕まえる。ここだけが排他の根拠であり、ロックの有無に依存しない。
         tombstone = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.taken")
         moved, error = _rename_with_retry(path, tombstone)
@@ -842,7 +877,21 @@ class Board:
         return self.joins_dir / f"{key}.json"
 
     def add_join(self, entry: Entry, cwd: str) -> bool:
-        """相乗りを申告する。同じ作業ディレクトリから二重に申告はできない。
+        """相乗りを申告する。**残せたときだけ** True。
+
+        「既にある」と「残せなかった」を区別する必要があるときは
+        :meth:`add_join_detailed` を使う。
+        """
+        return self.add_join_detailed(entry, cwd) is JoinResult.ADDED
+
+    def add_join_detailed(self, entry: Entry, cwd: str) -> JoinResult:
+        """相乗りを申告し、結果を 3 値で返す。同じ作業ディレクトリから二重には申告できない。
+
+        Returns
+        -------
+        JoinResult
+            追加した / 既にある / 掲示板に残せなかった。**畳まない**
+            （:class:`JoinResult` 参照）。
 
         Notes
         -----
@@ -855,14 +904,19 @@ class Board:
             self.joins_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             self.audit("join_mkdir_failed", resource=entry.resource, error=str(exc))
-            return False
+            return JoinResult.FAILED
 
         payload = json.dumps(entry.to_dict(), ensure_ascii=False, indent=2) + "\n"
         if not self._create_exclusively(path, payload, entry.resource, kind="join"):
-            return False
+            # 作れなかった理由を分ける。**ファイルがあるかどうか**でしか区別できないが、
+            # 「既に自分（誰か）の申告がある」と「書けなかった」は対処がまるで違う。
+            if path.exists():
+                return JoinResult.EXISTS
+            self.audit("join_failed", resource=entry.resource, cwd=cwd)
+            return JoinResult.FAILED
 
         self.audit("joined", resource=entry.resource, job=entry.job, cwd=cwd)
-        return True
+        return JoinResult.ADDED
 
     def _load_joins(self) -> list[tuple[Path, Entry]]:
         """相乗り申告をパスつきで読む。読めなかったものは飛ばす。
@@ -876,6 +930,11 @@ class Board:
         なるため推測を含まない。**猶予や PID を使った推測はしない**（実測が「空き」でも
         宣言が幽霊である証明にはならないという非対称性を崩さないため。
         CLAUDE.md「Liveness Judgment」）。
+
+        **捨てるときも無条件では消さない。** 読んでから消すまでの間に、別セッションが
+        同じ ``(資源, cwd)`` の申告を取り下げて出し直すことがある。無条件の ``unlink``
+        はその**新しい生きた申告**を消す。主宣言で塞いだ read-delete race と同じものなので、
+        同じ捕獲型 CAS（:meth:`_capture_and_remove`）に載せる。
         """
         try:
             paths = sorted(self.joins_dir.glob("*.json"))
@@ -898,8 +957,21 @@ class Board:
                 continue
             since = entry.since_dt
             if cutoff is not None and since is not None and since < cutoff:
-                self.audit("join_stale_removed", resource=entry.resource, since=entry.since)
-                _unlink_with_retry(path)
+                removed = self._capture_and_remove(
+                    path,
+                    expect_nonce=entry.nonce,
+                    resource_id=entry.resource,
+                    reason="再起動をまたいだ相乗り",
+                )
+                if removed is RemovalResult.REMOVED:
+                    self.audit("join_stale_removed", resource=entry.resource, since=entry.since)
+                    continue
+                if removed is RemovalResult.ABSENT:
+                    continue  # 読んだ直後に誰かが消した。もう無い
+                # 消せなかった、または捕まえたら別物だった（新しい申告が出ている）。
+                # **消せていないものを「無い」と答えない。** 資源が空きに見えて
+                # 他セッションが取りにくる。読めた事実のほうを残す。
+                loaded.append((path, entry))
                 continue
             loaded.append((path, entry))
         return loaded
@@ -922,8 +994,8 @@ class Board:
         self.audit("join_removed", resource=resource_id, cwd=cwd, reason=reason)
         return True
 
-    def remove_own_join(self, resource_id: str, cwd: str, *, reason: str) -> Entry | None:
-        """自分の相乗り申告を取り下げる。
+    def find_own_join(self, resource_id: str, cwd: str) -> tuple[Path, Entry] | None:
+        """自分の相乗り申告を**探すだけ**。消さない。
 
         照合は主宣言（:meth:`owns`）と**同じ規則**にする。パスの完全一致だけにすると、
         申告したときと違うディレクトリから ``release`` したときに
@@ -936,6 +1008,32 @@ class Board:
         ``declared_cwd`` が最長（＝最も自分に近い）ものを選ぶ。同じ理由で、
         自分がまさにその場所から出した申告があるなら、それ以外を選ぶ理由は無い。
 
+        探索と削除を分けてあるのは、呼び出し側が**消す前に候補の有無を知る**必要が
+        あるためである（``rb release`` は主宣言と相乗りの両方が候補になるとき、
+        どちらも消さずに指定を求める。DESIGN.md「Ownership」）。
+
+        Returns
+        -------
+        tuple of (Path, Entry) or None
+            選んだ申告のパスと中身。候補が無ければ None。
+        """
+        exact = self.join_path(resource_id, cwd)
+        candidates = [
+            (path, entry)
+            for path, entry in self._load_joins()
+            if entry.resource == resource_id and self.owns(entry, cwd=cwd)
+        ]
+        for path, entry in candidates:
+            if path == exact:
+                return (path, entry)
+        if candidates:
+            # 最も近い祖先を選ぶ。declared_cwd が長いほど自分に近い。
+            return max(candidates, key=lambda item: len(str(item[1].holder.get("cwd") or "")))
+        return None
+
+    def remove_own_join(self, resource_id: str, cwd: str, *, reason: str) -> Entry | None:
+        """自分の相乗り申告を取り下げる。選び方は :meth:`find_own_join` と同じ。
+
         Returns
         -------
         Entry or None
@@ -944,20 +1042,7 @@ class Board:
             するためである。祖先フォールバックで他人の申告を消したとき、誤爆が
             目視できなければ気づく手段が無い。
         """
-        exact = self.join_path(resource_id, cwd)
-        candidates = [
-            (path, entry)
-            for path, entry in self._load_joins()
-            if entry.resource == resource_id and self.owns(entry, cwd=cwd)
-        ]
-        chosen: tuple[Path, Entry] | None = None
-        for path, entry in candidates:
-            if path == exact:
-                chosen = (path, entry)
-                break
-        if chosen is None and candidates:
-            # 最も近い祖先を選ぶ。declared_cwd が長いほど自分に近い。
-            chosen = max(candidates, key=lambda item: len(str(item[1].holder.get("cwd") or "")))
+        chosen = self.find_own_join(resource_id, cwd)
         if chosen is None:
             return None
 
