@@ -169,6 +169,9 @@ def _cmd_status(args: argparse.Namespace) -> int:
                 "occupied": occupied,
                 "holder": entry.holder if entry else None,
                 "since": entry.since if entry else None,
+                # 宣言してからの経過。**表示のためだけの値**であり、判断には使わない。
+                # 長く持っていることは幽霊である証拠にならない。
+                "held_for_seconds": _held_seconds(entry) if entry else None,
                 "log": entry.log if entry else None,
                 "observed": entry.observed if entry else None,
                 "eta": entry.eta if entry else None,
@@ -194,7 +197,9 @@ def _cmd_status(args: argparse.Namespace) -> int:
         if holder:
             job = holder.get("job") or "(ジョブ未記入)"
             print(f"{'':<24} 宣言   {holder.get('session', '?')} / {job}")
-            print(f"{'':<24} since  {row['since']}")
+            held = row["held_for_seconds"]
+            elapsed = f"（{_format_duration(held)} 経過）" if held is not None else ""
+            print(f"{'':<24} since  {row['since']}{elapsed}")
         eta = row["eta"] or {}
         if eta.get("stated"):
             at = f"（{eta['at']} 頃）" if eta.get("at") else ""
@@ -708,6 +713,36 @@ def _release_after_run(
         pass
 
 
+def _held_seconds(entry: Entry) -> float | None:
+    """宣言してからの経過秒数。時刻が読めなければ None。
+
+    **これは表示のための値であって、判断には使わない。** 長く持っていることは
+    幽霊である証拠にならない（CLAUDE.md「Liveness Judgment」）。9 時間の宣言が
+    正当なことは実際にある。古さが一目で分かるようにするだけである。
+    """
+    since = entry.since_dt
+    if since is None:
+        return None
+    return (clock.now() - since).total_seconds()
+
+
+def _held_for(entry: Entry) -> str:
+    """宣言してからの経過を人が読める長さで返す。読めなければ空文字。"""
+    seconds = _held_seconds(entry)
+    return "" if seconds is None else _format_duration(seconds)
+
+
+#: 待っている側に必ず渡す助言。**本ツールは実測が空きでも宣言を勝手に退けない**ため、
+#: 「掲示板が古いまま」の状態から抜ける道は人間か保持者しかない。それを黙っていると、
+#: 待っている側は待ち続けるしかなくなる（実際に 2 時間 48 分待たせた）。
+WAIT_ADVICE = (
+    "  待っている間に自分でも資源の状態を調べること。"
+    "空いているのに宣言が残っているなら、\n"
+    "  保持者に確認するか、確認が取れなければ人間に相談すること"
+    "（本ツールは実測が空きでも宣言を退けない）"
+)
+
+
 def _cmd_wait(args: argparse.Namespace) -> int:
     """資源が解放されるまで待つ。
 
@@ -737,6 +772,8 @@ def _cmd_wait(args: argparse.Namespace) -> int:
             f"待機します: {naming.label(resource_id, entry.display)}"
             f" <- {entry.session} / {entry.job}"
         )
+        held = _held_for(entry)
+        print(f"  since {entry.since}{f'（{held} 経過）' if held else ''}")
         if entry.eta:
             stated = entry.eta.get("stated") if isinstance(entry.eta, dict) else None
             at = entry.eta.get("at") if isinstance(entry.eta, dict) else None
@@ -744,6 +781,7 @@ def _cmd_wait(args: argparse.Namespace) -> int:
         if entry.log:
             print(f"  log   {entry.log}")
     print(f"  {args.interval:g} 秒ごとに確認、上限 {args.timeout:g} 秒。Ctrl+C で中断できます")
+    print(WAIT_ADVICE)
 
     try:
         result = waiting.wait_for_room(
@@ -766,10 +804,21 @@ def _cmd_wait(args: argparse.Namespace) -> int:
         print("入れるかどうかは自分で調べて判断すること。駄目ならもう一度 rb wait すればよい")
         return EXIT_OK
 
+    # **上限で戻るときこそ助言が要る。** ここで黙ると、待っている側は同じ待機を
+    # 繰り返すしかない。掲示板が古いまま固まっている場合、そこから抜ける道は
+    # 保持者か人間しかなく、本ツールは自力で退けられない。
     print(
         f"上限に達しました（{result.polls} 回確認 / {result.waited_s:.0f} 秒）。まだ使用中です",
         file=sys.stderr,
     )
+    holder = board.read(resource_id)
+    if holder is not None:
+        held = _held_for(holder)
+        print(
+            f"  保持者: {holder.session} / {holder.job}{f'（{held} 前から）' if held else ''}",
+            file=sys.stderr,
+        )
+    print(WAIT_ADVICE, file=sys.stderr)
     return EXIT_BUSY
 
 

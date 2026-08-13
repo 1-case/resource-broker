@@ -19,8 +19,11 @@ import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from resource_broker import clock, waiting
 from resource_broker.board import Board, build_entry
+from resource_broker.cli import main
 from resource_broker.naming import normalize
 
 RESOURCE = normalize("GPU0")
@@ -322,3 +325,86 @@ def test_unreadable_board_is_treated_as_released(tmp_path: Path) -> None:
     result = wait(Board(tmp_path / "存在しない"), FakeClock())
 
     assert result.reason == waiting.RELEASED
+
+
+# --- 待っている側に逃げ道を示す ---------------------------------------------------
+
+
+def hold_gpu(tmp_path: Path, *, minutes_ago: int = 0) -> None:
+    """他セッションの宣言を 1 件置く。``minutes_ago`` で古さを作る。"""
+    board = Board(tmp_path)
+    entry = build_entry(
+        normalize("GPU0"),
+        job="E061 本計測",
+        session="folnet",
+        cwd=str(tmp_path / "other-session"),
+        eta="9h",
+    )
+    if minutes_ago:
+        entry.since = (
+            datetime.fromisoformat(entry.since) - timedelta(minutes=minutes_ago)
+        ).isoformat()
+    assert board.try_claim(entry)
+
+
+def test_wait_tells_the_waiter_how_to_escape(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """待機の開始時に「自分で調べて、駄目なら人間へ」を伝える。
+
+    本ツールは実測が空きでも宣言を退けない。だから掲示板が古いまま固まると、
+    抜ける道は保持者か人間しかない。それを黙っていると待ち続けるしかなくなる。
+    実際に解放し忘れで 2 時間 48 分待たせた。
+    """
+    hold_gpu(tmp_path)
+    capsys.readouterr()
+
+    assert main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0"]) != 0
+    captured = capsys.readouterr()
+    text = captured.out + captured.err
+
+    assert "自分でも資源の状態を調べる" in text
+    assert "人間に相談" in text
+
+
+def test_wait_shows_how_long_the_holder_has_held(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """保持者がどれだけ持っているかを出す。
+
+    ``since`` の生の時刻だけでは古さが分からない（人間が引き算するしかない）。
+    **これは表示であって判断ではない。** 長く持っていることは幽霊の証拠にならない。
+    """
+    hold_gpu(tmp_path, minutes_ago=200)
+    capsys.readouterr()
+
+    assert main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0"]) != 0
+    captured = capsys.readouterr()
+
+    assert "3h20m 経過" in captured.out
+
+
+def test_wait_timeout_names_the_holder(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """上限で戻るときに保持者と助言を出す。
+
+    ここで黙ると、待っている側は同じ待機を繰り返すしかない。
+    """
+    hold_gpu(tmp_path, minutes_ago=200)
+    capsys.readouterr()
+
+    assert main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0"]) != 0
+    err = capsys.readouterr().err
+
+    assert "保持者: folnet" in err
+    assert "3h20m 前から" in err
+    assert "人間に相談" in err
+
+
+def test_status_shows_the_elapsed_time(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """``rb status`` にも経過時間を出す。古さが一目で分かるようにする。"""
+    hold_gpu(tmp_path, minutes_ago=452)
+    capsys.readouterr()
+
+    assert main(["--home", str(tmp_path), "status"]) == 0
+
+    assert "7h32m 経過" in capsys.readouterr().out
