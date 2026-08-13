@@ -418,6 +418,75 @@ def acquire(
     return result
 
 
+def acquire_join(
+    board: Board, resource_id: str, args: argparse.Namespace, *, log: str
+) -> Acquisition:
+    """相乗りとして申告する。``rb run --join`` の取得側。
+
+    ``acquire`` と違い**取得の競合が無い**（相乗りは何人でも入れる）。したがって
+    ``EXIT_BUSY`` を返す経路も持たない。判断するのは「主宣言があるか」だけである。
+
+    ラッパーから相乗りできるようにしたのは、**相乗りの取り下げ忘れが主宣言より
+    危険だからである。** 相乗りの幽霊判定は ``since < 起動時刻`` しか無く、猶予も
+    PID も使わない。取り下げ忘れた相乗りは**再起動か ``--force`` まで残り続け**、
+    その資源を「使用中」に固定する。手で ``rb join`` してから手で ``rb release`` する
+    運用では、この取りこぼしが必ず起きる。
+
+    Returns
+    -------
+    Acquisition
+        ``declared`` は**このプロセスが申告を作ったか**を表す。既存の申告を
+        再利用した場合と掲示板に残せなかった場合は False にし、後始末で
+        **自分が作っていない申告を消さない**ようにする。
+    """
+    primary = board.read(resource_id)
+    if primary is None:
+        print(
+            "その資源に主宣言がありません。--join を外して主宣言として実行してください",
+            file=sys.stderr,
+        )
+        return Acquisition(None, EXIT_USAGE)
+
+    # claim と違い `--found busy` でも止めない。相乗りは使われていることが前提である。
+    entry = build_entry(
+        resource_id,
+        job=args.job,
+        display=args.display or "",
+        log=log,
+        observed={"note": args.observed, "found": args.found},
+        eta=args.eta,
+        peak=args.peak or "",
+        avg=args.avg or "",
+        sharing=args.sharing or "",
+    )
+    result = board.add_join_detailed(entry, os.getcwd())
+
+    if result is JoinResult.EXISTS:
+        # 既にある申告はこのプロセスのものとは限らない。**実行は通すが取り下げない。**
+        # 消すと、同じ場所で走っている別のジョブの申告を消すことになる。
+        print(
+            "既に相乗りを申告済みです。その申告のまま実行します（終了時に取り下げません）",
+            file=sys.stderr,
+        )
+        return Acquisition(entry, EXIT_OK, declared=False)
+    if result is JoinResult.FAILED:
+        # 掲示板に書けないのは**インフラの故障**であって資源の競合ではない。
+        # 実行は通す（fail-open）が、残せていないことは隠さない。
+        print(
+            "警告: 相乗りを掲示板に残せていません。他セッションからは見えません",
+            file=sys.stderr,
+        )
+        return Acquisition(entry, EXIT_OK, declared=False)
+
+    print(f"相乗りを申告しました: {naming.label(resource_id, entry.display)} / {entry.job}")
+    print(f"  主宣言: {primary.session} / {primary.job}")
+    if primary.sharing:
+        print(f"  保持者の相乗り方針: {primary.sharing}")
+    else:
+        print("  保持者は相乗り可否を書いていません。合意が取れているか確認すること")
+    return Acquisition(entry, EXIT_OK, declared=True)
+
+
 def _explain_failed_displacement(removal: RemovalResult) -> str:
     """幽霊を退けられなかった理由を 1 行で説明する。
 
@@ -492,6 +561,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
         )
         return EXIT_USAGE
 
+    if args.join and args.force:
+        # --force は「他者の主宣言を退けて取る」であり、--join は「退けずに入る」である。
+        # 併用を黙ってどちらかに倒すと、相乗りのつもりで他人の宣言を消しうる。
+        print("--join と --force は同時に指定できません", file=sys.stderr)
+        return EXIT_USAGE
+
     board = Board(args.home)
     resource_id = naming.normalize(args.res)
     observation = Observation(busy=FOUND_CHOICES.get(args.found), note=args.observed)
@@ -500,22 +575,26 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # 掃除すると、利用者のプロジェクト配下にある無関係な *.log を消す。
     runner.prune_own_logs(board.root)
 
-    # ラッパーはジョブと同じ寿命を持つ。ここでだけ PID を記録する。
-    result = acquire(
-        board,
-        resource_id,
-        observation,
-        job=args.job,
-        found=args.found,
-        eta=args.eta,
-        peak=args.peak or "",
-        avg=args.avg or "",
-        sharing=args.sharing or "",
-        display=args.display or "",
-        log=str(log_path),
-        force=args.force,
-        pid=os.getpid(),
-    )
+    if args.join:
+        # 相乗りとして入る。取得の競合が無いので `--force` は意味を持たない。
+        result = acquire_join(board, resource_id, args, log=str(log_path))
+    else:
+        # ラッパーはジョブと同じ寿命を持つ。ここでだけ PID を記録する。
+        result = acquire(
+            board,
+            resource_id,
+            observation,
+            job=args.job,
+            found=args.found,
+            eta=args.eta,
+            peak=args.peak or "",
+            avg=args.avg or "",
+            sharing=args.sharing or "",
+            display=args.display or "",
+            log=str(log_path),
+            force=args.force,
+            pid=os.getpid(),
+        )
     entry = result.entry
     if entry is None:
         print("資源を取得できなかったため、コマンドを実行していません", file=sys.stderr)
@@ -533,7 +612,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # **記録できていないのに「宣言しました」と言わない。** 掲示板が書けなかった場合も
         # 実行は通す（fail-open）が、他セッションから見えない利用を成功した宣言として
         # 偽装してはならない。
-        if result.declared:
+        if args.join:
+            # 相乗りの説明は acquire_join が結果に応じて既に出している。
+            # ここで `_warn_not_declared` を足すと、「既に申告済み」の場合に
+            # **掲示板に載っているのに載っていないと言う**ことになる。
+            pass
+        elif result.declared:
             print(f"宣言しました: {entry.display} / {entry.job}")
         else:
             _warn_not_declared()
@@ -546,7 +630,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return EXIT_INTERRUPTED
     finally:
         _release_after_run(
-            board, resource_id, entry, declared=result.declared, exit_code=exit_code
+            board,
+            resource_id,
+            entry,
+            declared=result.declared,
+            exit_code=exit_code,
+            joined=args.join,
         )
 
 
@@ -557,6 +646,7 @@ def _release_after_run(
     *,
     declared: bool,
     exit_code: int | None = None,
+    joined: bool = False,
 ) -> None:
     """``rb run`` の後始末。**ここから例外を出さない。**
 
@@ -568,15 +658,31 @@ def _release_after_run(
     exit_code : int, optional
         子プロセスの終了コード。**解放の理由に添えて監査ログへ残す。**
         ラッパー自身が落ちた場合は None（「分からない」であって「成功」ではない）。
+    joined : bool
+        相乗りとして入ったか。**主宣言と取り違えない。** 相乗りで走ったのに
+        主宣言を消しにいくと、他セッションの生きた宣言を消すことになる。
     """
     try:
         if not declared:
-            return  # そもそも掲示板に残っていない。消すものが無い
+            return  # そもそもこのプロセスは申告を作っていない。消すものが無い
 
         # 終了コードを理由に含める。**成否を解釈はしない**（0 が成功とは限らない資源もある）。
         # 値をそのまま運び、意味づけは振り返る側に任せる。
         code = "不明" if exit_code is None else str(exit_code)
         reason = f"rb run の終了（exit={code}）"
+
+        if joined:
+            # **相乗りの取り下げ忘れは主宣言より危険である。** 幽霊判定が
+            # `since < 起動時刻` しか無いため、残ると再起動か --force まで消えない。
+            if board.remove_own_join(resource_id, os.getcwd(), reason=reason) is not None:
+                print(f"相乗りを取り下げました: {naming.display_default(resource_id)}")
+            else:
+                print(
+                    "相乗りを取り下げられませんでした"
+                    "（掲示板に残っています。rb release --join で外すこと）",
+                    file=sys.stderr,
+                )
+            return
 
         # **自分の宣言であることを確かめてから消す。** 実行中に他セッションが --force で
         # 取り直していた場合、無条件に消すと生きた宣言を消してしまう。掲示板は空・資源は
@@ -1335,6 +1441,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument("--res", required=True, help="資源 ID")
+    run.add_argument(
+        "--join",
+        action="store_true",
+        help="主宣言を取らず、相乗りとして入る（終了時に相乗りを取り下げる）",
+    )
     _add_declaration_options(run)
     run.set_defaults(func=_cmd_run)
 
