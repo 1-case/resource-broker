@@ -796,7 +796,10 @@ def _cmd_history(args: argparse.Namespace) -> int:
         print("過去の宣言は見つかりませんでした")
         return EXIT_OK
 
-    ratios: list[float] = []
+    # **全体を均した値は出さない。** 案件ごとに規模も予測しやすさも違うので、
+    # それらをまたいだ中央値や平均は意味を持たない。しかも集計値は
+    # 「次は 1/4 で申告すればいい」という機械的な補正を誘い、ETA を必須にした目的
+    # （一度考えさせる）と正反対に働く。突き合わせるのは同じ案件の前回である。
     for record, release in zip(records, releases, strict=True):
         eta = record.get("eta") or {}
         usage = record.get("usage") or {}
@@ -812,9 +815,8 @@ def _cmd_history(args: argparse.Namespace) -> int:
 
         actual = "解放の記録なし" if elapsed is None else _format_duration(elapsed)
         if eta_text and elapsed is not None and stated:
-            ratio = elapsed / stated
-            ratios.append(ratio)
-            print(f"    ETA   {eta_text}  →  実績 {actual}（{ratio:.2f} 倍）")
+            # 比を出すのは**同じ案件の中**だけ。ここは自分の申告と自分の実績の対比である。
+            print(f"    ETA   {eta_text}  →  実績 {actual}（{elapsed / stated:.2f} 倍）")
         elif eta_text:
             print(f"    ETA   {eta_text}  →  実績 {actual}")
         else:
@@ -826,14 +828,7 @@ def _cmd_history(args: argparse.Namespace) -> int:
             print(f"    終了  {release['reason']}")
 
     print()
-    if ratios:
-        ordered = sorted(ratios)
-        middle = len(ordered) // 2
-        median = (
-            ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
-        )
-        print(f"実績 / 申告: {len(ratios)} 件、中央値 {median:.2f} 倍（1 倍を下回るほど過大申告）")
-    print("前回の見積もりと実績を突き合わせ、次の申告の精度を上げること")
+    print("同じ案件の前回の申告と実績を突き合わせ、次の申告の精度を上げること")
     return EXIT_OK
 
 
