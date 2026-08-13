@@ -406,3 +406,92 @@ def test_refusal_without_a_sharing_flag_still_points_somewhere(
 
     assert "相乗り:" not in err  # 申告が無いものを勝手に作らない
     assert "rb wait" in err
+
+
+# --- 相乗りも振り返りの対象にする -------------------------------------------------
+
+
+def test_history_includes_joins(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """相乗りで走ったジョブも申告と実績を突き合わせられる。
+
+    落とすと、相乗りだけ振り返りの材料が無い。見積もりを上げたいのは同じである。
+    """
+    base = clock.now()
+    board = Board(tmp_path)
+    assert board.try_claim(build_entry(normalize("GPU0"), job="主宣言", session="folnet"))
+
+    monkeypatch.setattr(clock, "now", lambda: base)
+    joined = build_entry(normalize("GPU0"), job="相乗り学習", session="malm", eta="20m")
+    assert board.add_join(joined, str(tmp_path / "malm"))
+
+    monkeypatch.setattr(clock, "now", lambda: base + timedelta(minutes=10))
+    assert board.remove_join(normalize("GPU0"), str(tmp_path / "malm"), reason="rb run の終了")
+    capsys.readouterr()
+
+    assert run(tmp_path, "history", "GPU0") == 0
+    out = capsys.readouterr().out
+
+    assert "相乗り" in out
+    assert "相乗り学習" in out
+    assert "20m" in out  # 申告
+    assert "0.50 倍" in out  # 実績 10m / 申告 20m
+
+
+def test_history_matches_joins_by_working_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同じ資源への相乗りが複数あっても取り違えない。
+
+    相乗りは何人でも入れるので、資源だけで対応させると**別セッションの取り下げを
+    自分の申告に結び付ける**。実所要が実際と無関係な値になる。
+    ここでは B が先に抜けるので、資源だけで見ると A の実績が B の分になる。
+    """
+    resource = normalize("GPU0")
+    board = Board(tmp_path)
+    assert board.try_claim(build_entry(resource, job="主宣言", session="folnet"))
+    base = clock.now()
+
+    def at(minutes: int) -> None:
+        monkeypatch.setattr(clock, "now", lambda: base + timedelta(minutes=minutes))
+
+    at(0)
+    assert board.add_join(build_entry(resource, job="A", session="a"), str(tmp_path / "a"))
+    at(1)
+    assert board.add_join(build_entry(resource, job="B", session="b"), str(tmp_path / "b"))
+    at(3)
+    assert board.remove_join(resource, str(tmp_path / "b"), reason="B の終了")
+    at(30)
+    assert board.remove_join(resource, str(tmp_path / "a"), reason="A の終了")
+    capsys.readouterr()
+
+    assert run(tmp_path, "history", "GPU0", "--json") == 0
+    claims = json.loads(capsys.readouterr().out)["claims"]
+
+    elapsed = {c["job"]: c["elapsed_seconds"] for c in claims if c["event"] == "joined"}
+    assert elapsed == {"A": 30 * 60, "B": 2 * 60}
+
+
+def test_a_join_records_the_same_fields_as_a_claim(tmp_path: Path) -> None:
+    """相乗りの監査記録に ETA と見積もりが残る。
+
+    主宣言と同じ項目を残さないと、相乗りだけ history で突き合わせられない。
+    """
+    board = Board(tmp_path)
+    assert board.try_claim(build_entry(normalize("GPU0"), job="主宣言", session="folnet"))
+    entry = build_entry(
+        normalize("GPU0"), job="相乗り", session="malm", eta="20m", peak="VRAM 2GB", sharing="可"
+    )
+    assert board.add_join(entry, str(tmp_path / "malm"))
+
+    events = [
+        json.loads(line)
+        for path in sorted((tmp_path / "audit").glob("*.jsonl"))
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    (joined,) = [e for e in events if e.get("event") == "joined"]
+
+    assert joined["eta"]["stated"] == "20m"
+    assert joined["usage"]["peak"] == "VRAM 2GB"
+    assert joined["sharing"] == "可"

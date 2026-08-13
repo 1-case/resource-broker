@@ -798,6 +798,19 @@ def _format_duration(seconds: float) -> str:
     return f"{hours}h{rest:02d}m"
 
 
+def _pair_key(record: dict) -> tuple[str, str, str]:
+    """対応付けの鍵。**主宣言は資源ごと、相乗りは資源と作業ディレクトリごと。**
+
+    相乗りは同じ資源に何人でも入れるので、資源だけで対応させると
+    **別セッションの取り下げを自分の申告に結び付ける**。実所要が実際と無関係な値になる。
+    """
+    event = str(record.get("event", ""))
+    resource = str(record.get("resource", ""))
+    if event in ("joined", "join_removed"):
+        return ("join", resource, str(record.get("cwd", "")))
+    return ("primary", resource, "")
+
+
 def _match_releases(claims: list[dict], removals: list[dict]) -> list[dict | None]:
     """時刻順に並んだ宣言へ、その直後の解放を 1 件ずつ対応させる。
 
@@ -818,31 +831,37 @@ def _match_releases(claims: list[dict], removals: list[dict]) -> list[dict | Non
     list of (dict or None)
         ``claims`` と同じ並び・同じ長さ。
     """
-    pending: dict[str, list[tuple[datetime, dict]]] = {}
+    Key = tuple[str, str, str]
+    pending: dict[Key, list[tuple[datetime, dict]]] = {}
     for record in removals:
         when = _parse_at(record.get("at"))
         if when is None:
             continue
-        pending.setdefault(str(record.get("resource", "")), []).append((when, record))
+        pending.setdefault(_pair_key(record), []).append((when, record))
     for items in pending.values():
         items.sort(key=lambda item: item[0])
 
-    # 資源ごとに「どこまで使ったか」を持ち、同じ解放を 2 つの宣言に割り当てない。
-    used: dict[str, int] = {}
+    # 鍵ごとに「どこまで使ったか」を持ち、同じ解放を 2 つの宣言に割り当てない。
+    used: dict[Key, int] = {}
     matched: list[dict | None] = []
     for claim in claims:
-        resource = str(claim.get("resource", ""))
         started = _parse_at(claim.get("at"))
-        items = pending.get(resource, [])
-        index = used.get(resource, 0)
-        while index < len(items) and started is not None and items[index][0] < started:
-            index += 1
-        if index < len(items):
-            matched.append(items[index][1])
-            used[resource] = index + 1
-        else:
-            matched.append(None)
-            used[resource] = index
+        key = _pair_key(claim)
+        # 相乗りの一斉取り下げ（``rb release --force``）は cwd を持たない。自分の場所の
+        # 取り下げが見つからなければ、そちらの箱も見る。
+        candidates: list[Key] = [key] if key[0] == "primary" else [key, ("join", key[1], "")]
+        chosen: dict | None = None
+        for candidate in candidates:
+            items = pending.get(candidate, [])
+            index = used.get(candidate, 0)
+            while index < len(items) and started is not None and items[index][0] < started:
+                index += 1
+            used[candidate] = index
+            if index < len(items):
+                chosen = items[index][1]
+                used[candidate] = index + 1
+                break
+        matched.append(chosen)
     return matched
 
 
@@ -908,9 +927,11 @@ def _cmd_history(args: argparse.Namespace) -> int:
                 continue
             if target and record.get("resource") != target:
                 continue
-            if record.get("event") == "claimed":
+            # **相乗りも振り返りの対象にする。** 落とすと、相乗りで走ったジョブだけ
+            # 申告と実績を突き合わせられない。見積もりを上げたいのは同じである。
+            if record.get("event") in ("claimed", "joined"):
                 records.append(record)
-            elif record.get("event") == "removed":
+            elif record.get("event") in ("removed", "join_removed"):
                 removals.append(record)
         # 新しい日から順に見ているので、必要数が集まったらそれ以上は遡らない
         if len(records) >= limit:
@@ -951,8 +972,11 @@ def _cmd_history(args: argparse.Namespace) -> int:
         avg = usage.get("avg") if isinstance(usage, dict) else None
         elapsed, stated = _elapsed_and_stated(record, release)
 
+        # 主宣言と相乗りは別物なので、見分けが付く形で出す。
+        kind = "相乗り " if record.get("event") == "joined" else ""
         print(
-            f"{record.get('at', '?')}  {naming.display_default(str(record.get('resource', '?')))}"
+            f"{record.get('at', '?')}  "
+            f"{kind}{naming.display_default(str(record.get('resource', '?')))}"
         )
         print(f"    job   {record.get('job', '')}")
 

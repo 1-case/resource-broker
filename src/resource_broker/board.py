@@ -915,7 +915,17 @@ class Board:
             self.audit("join_failed", resource=entry.resource, cwd=cwd)
             return JoinResult.FAILED
 
-        self.audit("joined", resource=entry.resource, job=entry.job, cwd=cwd)
+        # **主宣言と同じ項目を残す。** 落とすと `rb history` で相乗りだけ申告と実績を
+        # 突き合わせられない。相乗りで走ったジョブも見積もりの精度は上げたい。
+        self.audit(
+            "joined",
+            resource=entry.resource,
+            job=entry.job,
+            cwd=cwd,
+            eta=entry.eta,
+            usage=entry.usage,
+            sharing=entry.sharing or None,
+        )
         return JoinResult.ADDED
 
     def _load_joins(self) -> list[tuple[Path, Entry]]:
