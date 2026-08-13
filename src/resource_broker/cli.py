@@ -21,6 +21,7 @@ import os
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from . import clock, liveness, naming, platform_info, runner, waiting
@@ -629,6 +630,107 @@ def _cmd_wait(args: argparse.Namespace) -> int:
     return EXIT_BUSY
 
 
+def _parse_at(value: object) -> datetime | None:
+    """監査ログの ``at`` を読む。壊れていれば None。
+
+    監査ログは追記が原子的でないため（Windows）、行が壊れうる前提で書く。
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _format_duration(seconds: float) -> str:
+    """秒を人が読める長さにする。``1h51m`` / ``13m`` / ``42s``。"""
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{minutes:.0f}m"
+    hours, rest = divmod(round(minutes), 60)
+    return f"{hours}h{rest:02d}m"
+
+
+def _match_releases(claims: list[dict], removals: list[dict]) -> list[dict | None]:
+    """時刻順に並んだ宣言へ、その直後の解放を 1 件ずつ対応させる。
+
+    掲示板は資源ごとに主宣言 1 件なので、ある宣言を閉じるのは「同じ資源で、
+    その宣言より後に来た最初の解放」である。対応が付かないものは None になる
+    （まだ実行中か、解放がログの窓の外にある）。**None を「まだ実行中」と
+    断定しない**。監査ログを何日分読んだかで変わるためである。
+
+    Parameters
+    ----------
+    claims : list of dict
+        ``at`` の昇順に並んだ ``claimed`` レコード。
+    removals : list of dict
+        同じ窓から拾った ``removed`` レコード。順不同でよい。
+
+    Returns
+    -------
+    list of (dict or None)
+        ``claims`` と同じ並び・同じ長さ。
+    """
+    pending: dict[str, list[tuple[datetime, dict]]] = {}
+    for record in removals:
+        when = _parse_at(record.get("at"))
+        if when is None:
+            continue
+        pending.setdefault(str(record.get("resource", "")), []).append((when, record))
+    for items in pending.values():
+        items.sort(key=lambda item: item[0])
+
+    # 資源ごとに「どこまで使ったか」を持ち、同じ解放を 2 つの宣言に割り当てない。
+    used: dict[str, int] = {}
+    matched: list[dict | None] = []
+    for claim in claims:
+        resource = str(claim.get("resource", ""))
+        started = _parse_at(claim.get("at"))
+        items = pending.get(resource, [])
+        index = used.get(resource, 0)
+        while index < len(items) and started is not None and items[index][0] < started:
+            index += 1
+        if index < len(items):
+            matched.append(items[index][1])
+            used[resource] = index + 1
+        else:
+            matched.append(None)
+            used[resource] = index
+    return matched
+
+
+def _elapsed_and_stated(record: dict, release: dict | None) -> tuple[float | None, float | None]:
+    """実所要と申告の長さを秒で返す。**どちらも機械が書いた時刻の差である。**
+
+    申告の長さは、自由記述の ``40m`` をここで読み直すのではなく、``claim`` の時点で
+    機械が計算した絶対時刻（``eta.at``）との差を使う。同じ文字列を 2 か所で
+    解釈すると、解釈がずれたときにどちらが正しいか分からなくなる。
+
+    ここで出す値は**人間が申告の精度を振り返るための表示**であり、
+    ツールの判断には一切使わない（CLAUDE.md「Time Handling」）。
+    """
+    started = _parse_at(record.get("at"))
+
+    elapsed: float | None = None
+    if started is not None and release is not None:
+        ended = _parse_at(release.get("at"))
+        if ended is not None:
+            elapsed = (ended - started).total_seconds()
+
+    stated: float | None = None
+    eta = record.get("eta")
+    if started is not None and isinstance(eta, dict):
+        due = _parse_at(eta.get("at"))
+        if due is not None:
+            stated = (due - started).total_seconds()
+
+    return elapsed, stated
+
+
 def _cmd_history(args: argparse.Namespace) -> int:
     """過去の宣言を振り返る。見積もりの精度を上げるための材料である。"""
     board = Board(args.home)
@@ -639,6 +741,9 @@ def _cmd_history(args: argparse.Namespace) -> int:
     limit = max(1, args.limit)
 
     records = []
+    # 解放も一緒に拾う。**実所要は宣言と解放の時刻差から出す**（どちらも機械生成）。
+    # 同じ資源の解放は必ず宣言より後に来るので、宣言を拾えた窓には解放も入っている。
+    removals: list[dict] = []
     try:
         paths = sorted(board.audit_dir.glob("*.jsonl"))
     except OSError:
@@ -656,40 +761,78 @@ def _cmd_history(args: argparse.Namespace) -> int:
                 record = json.loads(line)
             except (json.JSONDecodeError, ValueError):
                 continue
-            if not isinstance(record, dict) or record.get("event") != "claimed":
+            if not isinstance(record, dict):
                 continue
             if target and record.get("resource") != target:
                 continue
-            records.append(record)
+            if record.get("event") == "claimed":
+                records.append(record)
+            elif record.get("event") == "removed":
+                removals.append(record)
         # 新しい日から順に見ているので、必要数が集まったらそれ以上は遡らない
         if len(records) >= limit:
             break
 
     records = sorted(records, key=lambda r: str(r.get("at", "")))[-limit:]
+    releases = _match_releases(records, removals)
 
     if args.json:
-        print(json.dumps({"claims": records}, ensure_ascii=False, indent=2))
+        claims = []
+        for record, release in zip(records, releases, strict=True):
+            elapsed, stated = _elapsed_and_stated(record, release)
+            claims.append(
+                {
+                    **record,
+                    "released_at": release.get("at") if release else None,
+                    "release_reason": release.get("reason") if release else None,
+                    "elapsed_seconds": elapsed,
+                    "stated_seconds": stated,
+                }
+            )
+        print(json.dumps({"claims": claims}, ensure_ascii=False, indent=2))
         return EXIT_OK
 
     if not records:
         print("過去の宣言は見つかりませんでした")
         return EXIT_OK
 
-    for record in records:
+    ratios: list[float] = []
+    for record, release in zip(records, releases, strict=True):
         eta = record.get("eta") or {}
         usage = record.get("usage") or {}
         eta_text = eta.get("stated") if isinstance(eta, dict) else None
         peak = usage.get("peak") if isinstance(usage, dict) else None
         avg = usage.get("avg") if isinstance(usage, dict) else None
+        elapsed, stated = _elapsed_and_stated(record, release)
+
         print(
             f"{record.get('at', '?')}  {naming.display_default(str(record.get('resource', '?')))}"
         )
-        print(f"    job  {record.get('job', '')}")
-        if eta_text:
-            print(f"    ETA  {eta_text}")
+        print(f"    job   {record.get('job', '')}")
+
+        actual = "解放の記録なし" if elapsed is None else _format_duration(elapsed)
+        if eta_text and elapsed is not None and stated:
+            ratio = elapsed / stated
+            ratios.append(ratio)
+            print(f"    ETA   {eta_text}  →  実績 {actual}（{ratio:.2f} 倍）")
+        elif eta_text:
+            print(f"    ETA   {eta_text}  →  実績 {actual}")
+        else:
+            print(f"    実績  {actual}")
+
         if peak or avg:
-            print(f"    見積 peak={peak or '-'} avg={avg or '-'}")
+            print(f"    見積  peak={peak or '-'} avg={avg or '-'}")
+        if release is not None and release.get("reason"):
+            print(f"    終了  {release['reason']}")
+
     print()
+    if ratios:
+        ordered = sorted(ratios)
+        middle = len(ordered) // 2
+        median = (
+            ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+        )
+        print(f"実績 / 申告: {len(ratios)} 件、中央値 {median:.2f} 倍（1 倍を下回るほど過大申告）")
     print("前回の見積もりと実績を突き合わせ、次の申告の精度を上げること")
     return EXIT_OK
 
