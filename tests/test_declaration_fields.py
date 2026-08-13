@@ -225,12 +225,14 @@ def test_history_shows_the_actual_elapsed_time(
     assert "0.25 倍" in out  # 申告に対する比
 
 
-def test_history_reports_the_median_ratio(
+def test_history_does_not_aggregate_across_jobs(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """複数件あれば、申告に対する実績の中央値が出る。
+    """案件をまたいだ集計値（中央値・平均）を出さない。
 
-    1 件ずつ見ても傾向は掴めない。過大申告が続いているかどうかは要約でしか見えない。
+    案件ごとに規模も予測しやすさも違うので、均した値は意味を持たない。しかも
+    集計値は「次は 1/4 で申告すればいい」という機械的な補正を誘い、ETA を必須に
+    した目的（一度考えさせる）と正反対に働く。突き合わせるのは同じ案件の前回である。
     """
     base = clock.now()
     for index in range(3):
@@ -244,8 +246,12 @@ def test_history_reports_the_median_ratio(
     assert run(tmp_path, "history", "GPU0") == 0
     out = capsys.readouterr().out
 
-    assert "3 件" in out
-    assert "0.50 倍" in out
+    # 案件ごとの比は出る（自分の申告と自分の実績の対比なので意味がある）。
+    assert out.count("0.50 倍") == 3
+    # 全体を均した値は出さない。
+    assert "中央値" not in out
+    assert "平均" not in out
+    assert "3 件" not in out
 
 
 def test_history_does_not_invent_an_elapsed_time_for_a_live_claim(
