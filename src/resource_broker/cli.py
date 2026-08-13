@@ -323,8 +323,7 @@ def acquire(
             # 分岐しているのは「旗が立っているか」だけで、旗の中身では分岐しない。
             hint = naming.display_default(resource_id)
             notices.append(
-                f"  → 相乗りするなら rb join --res {hint} ...、"
-                f"空くまで待つなら rb wait {hint}"
+                f"  → 相乗りするなら rb join --res {hint} ...、空くまで待つなら rb wait {hint}"
             )
             deferred_audit.append(
                 (
