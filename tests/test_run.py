@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -645,3 +646,50 @@ def test_our_own_log_directory_is_pruned(tmp_path: Path) -> None:
     rb_run(tmp_path, sys.executable, "-c", "print('ok')")
 
     assert not stale.exists(), "自分のログ置き場が掃除されていない"
+
+
+# --- 解放の記録から、走らずに死んだジョブと完走したジョブを区別できること -----------
+
+
+def audit_reasons(tmp_path: Path) -> list[str]:
+    """監査ログに残った ``removed`` の理由。"""
+    reasons = []
+    for path in sorted((tmp_path / "audit").glob("*.jsonl")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            record = json.loads(line)
+            if record.get("event") == "removed":
+                reasons.append(str(record.get("reason", "")))
+    return reasons
+
+
+def test_the_release_record_carries_the_exit_code(tmp_path: Path) -> None:
+    """解放の理由に子の終了コードが残る。
+
+    残さないと、走らずに即死したジョブと完走したジョブが監査ログ上で同じ 1 行になる。
+    実運用で「ETA 2h30m の宣言が 6 秒で解放される」事象を後から追ったとき、
+    失敗だったのか短く済んだのかを区別できなかった（CLAUDE.md「Silence Is Not Success」）。
+    """
+    assert rb_run(tmp_path, sys.executable, "-c", "raise SystemExit(3)") == 3
+
+    assert audit_reasons(tmp_path) == ["rb run の終了（exit=3）"]
+
+
+def test_a_successful_run_is_distinguishable_from_a_failed_one(tmp_path: Path) -> None:
+    """成功と失敗が別の記録になる。**同じ文字列になってはならない。**"""
+    assert rb_run(tmp_path, sys.executable, "-c", "print('ok')") == 0
+    assert rb_run(tmp_path, sys.executable, "-c", "raise SystemExit(9)") == 9
+
+    ok, failed = audit_reasons(tmp_path)
+    assert ok != failed
+    assert "exit=0" in ok
+    assert "exit=9" in failed
+
+
+def test_a_command_that_never_started_is_not_recorded_as_success(tmp_path: Path) -> None:
+    """起動できなかったジョブが exit=0 として残らない。
+
+    走らなかったジョブを成功と報告しないという規約が、監査ログの側でも成り立つこと。
+    """
+    assert rb_run(tmp_path, "この実行ファイルは存在しない") != 0
+
+    assert audit_reasons(tmp_path) != ["rb run の終了（exit=0）"]
