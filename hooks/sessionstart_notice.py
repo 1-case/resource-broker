@@ -201,6 +201,37 @@ def describe_join(join: object) -> list[str]:
     return lines
 
 
+#: 資源 ID とホスト名の区切り。本体の ``naming.HOST_SEP`` と同じ値を持つ
+#: （:func:`clip` と同じ理由で、フックはパッケージを import しない）。
+HOST_SEP = "::"
+
+
+def board_label(resource: dict[str, object]) -> str:
+    """通知に出す見出し。**資源 ID を必ず含める。**
+
+    ``display`` は「UUID を読みやすくするための資源の別名」であって、資源の
+    同一性を置き換えるものではない。置き換えを許すと、``display`` にジョブ名が
+    入った瞬間に「どの資源が押さえられているか」が通知から消える。
+
+    実運用で ``display`` が ``malm E017 学習`` になり、GPU0 が押さえられている
+    ことが全セッションの通知から見えなくなった。取得の排他は資源 ID で効くので
+    衝突そのものは起きないが、**掲示板は読まれて初めて意味を持つ**。読めない通知は
+    通知が無いのと変わらない。
+
+    :func:`clip` と同じく、この関数は各フックへ意図的に重複させてある。
+    ``rb status --json`` が返す ``label`` を使わないのは、フックと ``rb`` の
+    版が食い違っても壊れないようにするためである。
+    """
+    resource_id = resource.get("resource")
+    base = clip(str(resource_id).split(HOST_SEP, 1)[-1] if resource_id else "", MAX_NAME_BYTES)
+    display = clip(resource.get("display"), MAX_NAME_BYTES)
+    if not base:
+        return display or "?"
+    if not display or display == base:
+        return base
+    return f"{base}（{display}）"
+
+
 def describe(resource: dict[str, object]) -> list[str]:
     """1 資源の状態を数行に整形する。**主宣言と相乗りを別々に整形する。**
 
@@ -209,7 +240,7 @@ def describe(resource: dict[str, object]) -> list[str]:
     という行になり、**誰が使っているかもログも隠れる**。実際に使っている者がいるのに
     「誰か分からない」と出すのは、このフックが出しうる最も役に立たない情報である。
     """
-    display = clip(resource.get("display") or resource.get("resource"), MAX_NAME_BYTES) or "?"
+    display = board_label(resource)
     joins = resource.get("joins")
     joins = [j for j in joins if isinstance(j, dict)] if isinstance(joins, list) else []
 

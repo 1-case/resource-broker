@@ -360,3 +360,29 @@ def test_empty_stdin_is_tolerated(tmp_path: Path) -> None:
     result = run_hook(home=tmp_path, stdin="")
 
     assert result.returncode == 0
+
+
+def test_a_display_name_does_not_hide_which_resource_is_held(tmp_path: Path) -> None:
+    """``display`` にジョブ名が入っても、起動時の通知から資源 ID が消えない。
+
+    ``display`` は「UUID を読みやすくするための資源の別名」であって、資源の
+    同一性を置き換えるものではない。実運用で display が ``malm E017 学習`` に
+    なり、GPU0 が押さえられていることが全セッションの通知から見えなくなった。
+    取得の排他は資源 ID で効くので衝突そのものは起きないが、**掲示板は読まれて
+    初めて意味を持つ**。読めない通知は通知が無いのと変わらない。
+    """
+    board = Board(tmp_path)
+    assert board.try_claim(
+        build_entry(
+            normalize("GPU0"),
+            job="E017 A/B 学習 10 本",
+            session="malm",
+            display="malm E017 学習",
+        )
+    )
+
+    result = run_hook(home=tmp_path)
+
+    assert result.returncode == 0
+    assert "GPU0" in result.stdout
+    assert "malm E017 学習" in result.stdout

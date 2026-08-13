@@ -264,3 +264,54 @@ def test_an_interrupted_command_is_not_reported_as_busy(
 
     assert claim(tmp_path, "GPU0", "学習") == 130
     assert "中断しました" in capsys.readouterr().err
+
+
+# --- 表示名は資源 ID を隠さない ---------------------------------------------------
+
+
+def test_status_shows_the_resource_id_even_with_a_display_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--display`` にジョブ名を入れられても、一覧から資源 ID が消えない。
+
+    実運用で display が ``malm E017 学習`` になり、GPU0 が押さえられていることが
+    一覧から見えなくなった。取得の排他は資源 ID で効くので衝突そのものは
+    起きないが、**掲示板は読まれて初めて意味を持つ**。GPU を使おうとする側は
+    見覚えのないジョブ名しか見えず、空きだと誤読しうる状態だった。
+    """
+    claim(tmp_path, "GPU0", "E017 A/B 学習", "--display", "malm E017 学習")
+    capsys.readouterr()
+
+    assert run(tmp_path, "status") == 0
+    out = capsys.readouterr().out
+
+    assert "GPU0" in out
+    assert "malm E017 学習" in out
+
+
+def test_status_json_exposes_a_label_that_keeps_the_resource_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """JSON でも見出し（label）に資源 ID が含まれる。"""
+    claim(tmp_path, "GPU0", "E017 A/B 学習", "--display", "malm E017 学習")
+    capsys.readouterr()
+
+    assert run(tmp_path, "status", "--json") == 0
+    (row,) = json.loads(capsys.readouterr().out)["resources"]
+
+    assert row["label"] == "GPU0（malm E017 学習）"
+    # display そのものは申告された値のまま残す（意味を変えない）。
+    assert row["display"] == "malm E017 学習"
+
+
+def test_wait_names_the_resource_it_is_waiting_for(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """待機の表示にも資源 ID を出す。何を待っているか分からなくなる。"""
+    claim(tmp_path, "GPU0", "E017 A/B 学習", "--display", "malm E017 学習")
+    capsys.readouterr()
+
+    assert run(tmp_path, "wait", "GPU0", "--timeout", "0") != 0
+    out = capsys.readouterr().out
+
+    assert "GPU0" in out

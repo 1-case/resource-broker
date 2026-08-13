@@ -283,3 +283,27 @@ def test_does_not_depend_on_rb_being_installed(tmp_path: Path) -> None:
     text = run_hook(tmp_path, path=str(tmp_path / "何も無い")).decode("utf-8")
 
     assert "rb 無しでも読める" in text
+
+
+def test_a_display_name_does_not_hide_which_resource_is_held(tmp_path: Path) -> None:
+    """``display`` にジョブ名が入っても、通知から資源 ID が消えない。
+
+    実運用で display が ``malm E017 学習`` になり、GPU0 が押さえられていることが
+    全セッションの通知から見えなくなった。取得の排他は資源 ID で効くので衝突
+    そのものは起きないが、**掲示板は読まれて初めて意味を持つ**。GPU を使おうと
+    する側は見覚えのないジョブ名しか見えず、空きだと誤読しうる状態だった。
+    """
+    board = Board(tmp_path)
+    assert board.try_claim(
+        build_entry(
+            normalize("GPU0"),
+            job="E017 A/B 学習 10 本",
+            session="malm",
+            display="malm E017 学習",
+        )
+    )
+
+    text = run_hook(tmp_path).decode("utf-8")
+
+    assert "GPU0" in text
+    assert "malm E017 学習" in text
