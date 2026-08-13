@@ -195,3 +195,116 @@ def test_history_is_empty_without_claims(
     """履歴が無くてもエラーにしない。"""
     assert run(tmp_path, "history") == 0
     assert "見つかりません" in capsys.readouterr().out
+
+
+# --- 実績（宣言と解放の時刻差）の突き合わせ ---------------------------------------
+
+
+def test_history_shows_the_actual_elapsed_time(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """申告 ETA の横に**実所要**が出る。
+
+    申告だけを並べても「突き合わせろ」と言えるだけで材料が無い。実所要は
+    宣言と解放の時刻差から出す（どちらも機械生成なので、LLM の記憶に頼らない）。
+    """
+    base = clock.now()
+    monkeypatch.setattr(clock, "now", lambda: base)
+    claim(tmp_path, eta="40m")
+
+    # 10 分で終わった、という時間の進み方を作る。
+    monkeypatch.setattr(clock, "now", lambda: base + timedelta(minutes=10))
+    run(tmp_path, "release", "GPU0")
+    capsys.readouterr()
+
+    assert run(tmp_path, "history", "GPU0") == 0
+    out = capsys.readouterr().out
+
+    assert "40m" in out  # 申告
+    assert "10m" in out  # 実績
+    assert "0.25 倍" in out  # 申告に対する比
+
+
+def test_history_reports_the_median_ratio(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """複数件あれば、申告に対する実績の中央値が出る。
+
+    1 件ずつ見ても傾向は掴めない。過大申告が続いているかどうかは要約でしか見えない。
+    """
+    base = clock.now()
+    for index in range(3):
+        start = base + timedelta(hours=index)
+        monkeypatch.setattr(clock, "now", lambda start=start: start)
+        claim(tmp_path, eta="40m")
+        monkeypatch.setattr(clock, "now", lambda start=start: start + timedelta(minutes=20))
+        run(tmp_path, "release", "GPU0")
+    capsys.readouterr()
+
+    assert run(tmp_path, "history", "GPU0") == 0
+    out = capsys.readouterr().out
+
+    assert "3 件" in out
+    assert "0.50 倍" in out
+
+
+def test_history_does_not_invent_an_elapsed_time_for_a_live_claim(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """まだ解放されていない宣言に実績を作らない。
+
+    「解放が記録されていない」を「0 分で終わった」と混同すると、実績が
+    実際より短い方向へ歪み、次の申告を短くしてしまう。
+    """
+    claim(tmp_path, eta="40m")
+    capsys.readouterr()
+
+    assert run(tmp_path, "history", "GPU0") == 0
+    out = capsys.readouterr().out
+
+    assert "解放の記録なし" in out
+    assert "倍" not in out
+
+
+def test_history_json_carries_the_actual_and_stated_seconds(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """JSON でも実績を機械可読な形で返す。"""
+    base = clock.now()
+    monkeypatch.setattr(clock, "now", lambda: base)
+    claim(tmp_path, eta="40m")
+    monkeypatch.setattr(clock, "now", lambda: base + timedelta(minutes=10))
+    run(tmp_path, "release", "GPU0")
+    capsys.readouterr()
+
+    assert run(tmp_path, "history", "GPU0", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    (record,) = payload["claims"]
+    assert record["elapsed_seconds"] == 600
+    assert record["stated_seconds"] == 2400
+    assert record["release_reason"] == "release コマンド"
+
+
+def test_history_does_not_reuse_one_release_for_two_claims(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """1 件の解放を 2 つの宣言に割り当てない。
+
+    取り違えると、古い宣言に新しい解放が付いて実績が実際より長く出る。
+    """
+    base = clock.now()
+    monkeypatch.setattr(clock, "now", lambda: base)
+    claim(tmp_path, eta="40m")
+    monkeypatch.setattr(clock, "now", lambda: base + timedelta(minutes=10))
+    run(tmp_path, "release", "GPU0")
+    monkeypatch.setattr(clock, "now", lambda: base + timedelta(minutes=30))
+    claim(tmp_path, eta="40m")
+    capsys.readouterr()
+
+    assert run(tmp_path, "history", "GPU0", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    first, second = payload["claims"]
+    assert first["elapsed_seconds"] == 600
+    assert second["elapsed_seconds"] is None
