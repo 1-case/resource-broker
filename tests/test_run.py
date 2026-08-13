@@ -20,8 +20,9 @@ from pathlib import Path
 import pytest
 
 from resource_broker import runner
-from resource_broker.board import Board
+from resource_broker.board import Board, build_entry
 from resource_broker.cli import main
+from resource_broker.naming import normalize
 
 
 def run(tmp_path: Path, *args: str) -> int:
@@ -693,3 +694,137 @@ def test_a_command_that_never_started_is_not_recorded_as_success(tmp_path: Path)
     assert rb_run(tmp_path, "この実行ファイルは存在しない") != 0
 
     assert audit_reasons(tmp_path) != ["rb run の終了（exit=0）"]
+
+
+# --- 相乗りでラッパーを使う（rb run --join） ---------------------------------------
+
+
+def hold(tmp_path: Path, *, sharing: str = "可") -> None:
+    """他セッションの主宣言を 1 件置く（cwd を自分の外にして所有を切る）。"""
+    board = Board(tmp_path)
+    entry = build_entry(
+        normalize("GPU0"),
+        job="E061 スモーク",
+        session="folnet",
+        cwd=str(tmp_path / "other-session"),
+        sharing=sharing,
+    )
+    assert board.try_claim(entry)
+
+
+def rb_join_run(tmp_path: Path, *command: str, **flags: str) -> int:
+    """``rb run --join`` を必須項目つきで実行する。"""
+    return run(
+        tmp_path,
+        "run",
+        "--res",
+        "GPU0",
+        "--join",
+        "--job",
+        flags.get("job", "相乗りジョブ"),
+        "--observed",
+        flags.get("observed", "保持者の相乗り方針を読んだ"),
+        "--eta",
+        flags.get("eta", "10m"),
+        "--found",
+        flags.get("found", "busy"),
+        "--",
+        *command,
+    )
+
+
+def joins(tmp_path: Path) -> list[str]:
+    """掲示板に残っている相乗りの資源 ID。"""
+    return [entry.resource for entry in Board(tmp_path).list_all_joins()]
+
+
+def test_the_wrapper_can_join_instead_of_claiming(tmp_path: Path) -> None:
+    """使用中でも相乗りとして入れる。**主宣言は奪わない。**
+
+    実運用で、保持者が相乗り可と申告した GPU に対し malm が claim ではじかれ、
+    CPU へ逃げた。案内を足しても rb join には自動解放が無く、ラッパーの
+    利点（終了時に必ず外れる）が相乗りだけ得られないままだった。
+    """
+    hold(tmp_path)
+
+    assert rb_join_run(tmp_path, sys.executable, "-c", "print('ok')") == 0
+
+    # 主宣言はそのまま残っている。
+    assert entries(tmp_path) == [normalize("GPU0")]
+
+
+def test_a_join_made_by_the_wrapper_is_withdrawn_at_the_end(tmp_path: Path) -> None:
+    """相乗りは終了時に取り下げられる。
+
+    **相乗りの取り下げ忘れは主宣言より危険である。** 幽霊判定が
+    ``since < 起動時刻`` しか無いため、残ると再起動か --force まで消えない。
+    """
+    hold(tmp_path)
+
+    assert rb_join_run(tmp_path, sys.executable, "-c", "raise SystemExit(3)") == 3
+
+    assert joins(tmp_path) == []
+
+
+def test_a_join_is_withdrawn_even_when_the_command_is_missing(tmp_path: Path) -> None:
+    """起動できなくても相乗りは残らない。"""
+    hold(tmp_path)
+
+    assert rb_join_run(tmp_path, "この実行ファイルは存在しない") != 0
+
+    assert joins(tmp_path) == []
+
+
+def test_joining_requires_a_primary_declaration(tmp_path: Path) -> None:
+    """主宣言が無ければ相乗りではなく主宣言を取らせる。"""
+    assert rb_join_run(tmp_path, sys.executable, "-c", "print('ok')") == 2
+
+    assert joins(tmp_path) == []
+    assert entries(tmp_path) == []
+
+
+def test_join_and_force_cannot_be_combined(tmp_path: Path) -> None:
+    """``--join`` と ``--force`` の併用を弾く。
+
+    --force は「他者の主宣言を退けて取る」で、--join は「退けずに入る」。
+    黙ってどちらかに倒すと、相乗りのつもりで他人の宣言を消しうる。
+    """
+    hold(tmp_path)
+
+    code = run(
+        tmp_path,
+        "run",
+        "--res",
+        "GPU0",
+        "--join",
+        "--force",
+        "--job",
+        "併用",
+        "--observed",
+        "調べた",
+        "--eta",
+        "10m",
+        "--",
+        sys.executable,
+        "-c",
+        "print('ok')",
+    )
+
+    assert code == 2
+    assert entries(tmp_path) == [normalize("GPU0")]
+
+
+def test_an_existing_join_is_not_withdrawn_by_the_wrapper(tmp_path: Path) -> None:
+    """自分が作っていない相乗りを消さない。
+
+    同じ場所で別のジョブが相乗りを申告済みのことがある。終了時にそれを外すと、
+    走っているジョブの申告だけが消える。
+    """
+    hold(tmp_path)
+    board = Board(tmp_path)
+    existing = build_entry(normalize("GPU0"), job="先にいた相乗り", session="malm")
+    assert board.add_join(existing, os.getcwd())
+
+    assert rb_join_run(tmp_path, sys.executable, "-c", "print('ok')") == 0
+
+    assert joins(tmp_path) == [normalize("GPU0")]
