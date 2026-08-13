@@ -16,7 +16,9 @@ from pathlib import Path
 import pytest
 
 from resource_broker import clock
+from resource_broker.board import Board, build_entry
 from resource_broker.cli import main
+from resource_broker.naming import normalize
 
 
 def run(tmp_path: Path, *args: str) -> int:
@@ -314,3 +316,93 @@ def test_history_does_not_reuse_one_release_for_two_claims(
     first, second = payload["claims"]
     assert first["elapsed_seconds"] == 600
     assert second["elapsed_seconds"] is None
+
+
+# --- はじいたときに次の一手を示す -------------------------------------------------
+
+
+def hold(tmp_path: Path, *, sharing: str = "") -> None:
+    """他セッションの宣言を 1 件置く（cwd を自分の外にして所有を切る）。"""
+    board = Board(tmp_path)
+    entry = build_entry(
+        normalize("GPU0"),
+        job="E061 スモーク",
+        session="folnet",
+        cwd=str(tmp_path / "other-session"),
+        sharing=sharing,
+    )
+    assert board.try_claim(entry)
+
+
+def test_refusal_shows_the_holders_sharing_flag(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """はじくときに保持者の相乗り申告をそのまま見せる。
+
+    実運用で、保持者が「可（VRAM 残 5GB まで）」と書いた GPU に対し、malm が
+    claim ではじかれ、**相乗りできると気づかずに CPU へ逃げた**。掲示板は
+    その材料を持っていたのに、判断が必要なその場で出していなかった。
+    載せていても出さなければ、載せていないのと同じである。
+    """
+    hold(tmp_path, sharing="可（VRAM 残 5GB まで）")
+    capsys.readouterr()
+
+    assert claim(tmp_path) == 1
+    err = capsys.readouterr().err
+
+    assert "可（VRAM 残 5GB まで）" in err
+    assert "rb join" in err
+    assert "rb wait" in err
+
+
+def test_refusal_does_not_interpret_the_sharing_flag(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """相乗り不可でも案内は同じ形で出す。**旗の中身で分岐しない。**
+
+    可否は当事者が決めるものであり、本ツールは旗を運ぶだけである
+    （CLAUDE.md「Resource Agnosticism」）。中身を読んで案内を出し分けると、
+    そこから「ツールが可否を判断する」への距離が一気に縮む。
+    """
+    hold(tmp_path, sharing="不可（VRAM を使い切る）")
+    capsys.readouterr()
+
+    assert claim(tmp_path) == 1
+    err = capsys.readouterr().err
+
+    assert "不可（VRAM を使い切る）" in err
+    assert "rb join" in err
+
+
+def test_refusal_is_recorded_in_the_audit_log(tmp_path: Path) -> None:
+    """はじいたことを監査ログに残す。
+
+    残さないと「誰がいつ諦めたか」を後から追えない。判定したのに黙るのは、
+    監視が死んだのと区別が付かない（CLAUDE.md「Silence Is Not Success」）。
+    """
+    hold(tmp_path, sharing="可")
+
+    assert claim(tmp_path) == 1
+
+    events = [
+        json.loads(line)
+        for path in sorted((tmp_path / "audit").glob("*.jsonl"))
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    (refused,) = [e for e in events if e.get("event") == "claim_refused"]
+    assert refused["holder"] == "folnet"
+    assert refused["sharing"] == "可"
+
+
+def test_refusal_without_a_sharing_flag_still_points_somewhere(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """相乗りの申告が無くても、次の一手は示す。"""
+    hold(tmp_path)
+    capsys.readouterr()
+
+    assert claim(tmp_path) == 1
+    err = capsys.readouterr().err
+
+    assert "相乗り:" not in err  # 申告が無いものを勝手に作らない
+    assert "rb wait" in err

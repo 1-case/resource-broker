@@ -278,6 +278,8 @@ def acquire(
     # **排他区間の中で I/O をしない。** ここで stderr へ直接書くと、パイプが詰まったときに
     # ロックを 30 秒以上保持し、他セッションに steal される。文言は溜めて区間の外で出す。
     notices: list[str] = []
+    # 監査も同じ理由で溜める。ファイルへの追記は区間の外で行う。
+    deferred_audit: list[tuple[str, dict[str, object]]] = []
 
     def under_lock(lock: LockState) -> Acquisition:
         """ロックを保持したまま行う判断。**正しさはロックではなく CAS に乗る。**
@@ -308,8 +310,33 @@ def acquire(
             notices.append(f"使用中のため宣言できません: {liveness.explain(verdict)}")
             notices.append(f"  宣言者: {entry.session} / {entry.job}")
             notices.append(f"  since : {entry.since}")
+            # **保持者が立てた旗をそのまま見せる。中身は解釈しない。**
+            # ここを出さないと、保持者が「相乗り可」と書いていても、はじかれた側には
+            # 「使用中」しか見えない。実際に malm が相乗り可の GPU を諦めて CPU へ
+            # 逃げた（掲示板には可と書いてあった）。掲示板が持っている材料を
+            # **判断が必要なその場で**出せていなければ、載せていないのと同じである。
+            if entry.sharing:
+                notices.append(f"  相乗り: {entry.sharing}  ※保持者の申告")
             if entry.log:
                 notices.append(f"  log   : {entry.log}")
+            # 可否は当事者が決める（本ツールは判断しない）。**次の一手を必ず示す。**
+            # 分岐しているのは「旗が立っているか」だけで、旗の中身では分岐しない。
+            hint = naming.display_default(resource_id)
+            notices.append(
+                f"  → 相乗りするなら rb join --res {hint} ...、"
+                f"空くまで待つなら rb wait {hint}"
+            )
+            deferred_audit.append(
+                (
+                    "claim_refused",
+                    {
+                        "resource": resource_id,
+                        "verdict": str(verdict),
+                        "holder": entry.session,
+                        "sharing": entry.sharing or "",
+                    },
+                )
+            )
             return Acquisition(None, EXIT_BUSY)
 
         # **相乗りがいることは知らせるが、止めない。** 主宣言の枠が空いていることと、
@@ -383,6 +410,12 @@ def acquire(
     finally:
         for line in notices:
             print(line, file=sys.stderr)
+        # **はじいたことを必ず残す。** 記録が無いと「malm が GPU を諦めた」ことを
+        # 後から追えない（実際に追えなかった）。判定したのに黙るのは、監視が
+        # 死んだのと区別が付かない（CLAUDE.md「Silence Is Not Success」）。
+        # Board.audit は失敗しても黙って諦めるので、finally の中で呼んでよい。
+        for event, fields in deferred_audit:
+            board.audit(event, **fields)
     return result
 
 
