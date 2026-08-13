@@ -85,3 +85,41 @@ def test_normalize_rejects_empty_id() -> None:
     """空の ID は受け付けない。"""
     with pytest.raises(ValueError, match="資源 ID"):
         naming.normalize("   ")
+
+
+# --- 見出しは資源 ID を隠さない ---------------------------------------------------
+
+
+def test_label_keeps_the_resource_id_when_a_display_name_is_given() -> None:
+    """``--display`` は資源 ID を**置き換えない**。
+
+    display は「UUID を読みやすくするための資源の別名」であって、資源の同一性を
+    置き換えるものではない。実運用で display にジョブ名（``malm E017 学習``）が
+    入り、GPU0 が押さえられていることが一覧とフックの通知から消えた。
+    """
+    resource_id = naming.normalize("GPU0")
+
+    assert naming.label(resource_id, "malm E017 学習") == "GPU0（malm E017 学習）"
+
+
+def test_label_falls_back_to_the_resource_id() -> None:
+    """表示名が無ければ資源 ID だけを出す。"""
+    resource_id = naming.normalize("COM5")
+
+    assert naming.label(resource_id, "") == "COM5"
+    assert naming.label(resource_id, None) == "COM5"
+
+
+def test_label_does_not_repeat_a_redundant_display_name() -> None:
+    """表示名が資源 ID と同じなら括弧を付けない（既定はこの形になる）。"""
+    resource_id = naming.normalize("GPU0")
+
+    assert naming.label(resource_id, "GPU0") == "GPU0"
+    assert naming.label(resource_id, resource_id) == "GPU0"
+
+
+def test_label_ignores_a_whitespace_only_display_name() -> None:
+    """空白だけの表示名で括弧を作らない。"""
+    resource_id = naming.normalize("GPU0")
+
+    assert naming.label(resource_id, "   ") == "GPU0"

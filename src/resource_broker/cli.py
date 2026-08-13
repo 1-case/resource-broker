@@ -155,6 +155,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
                 "has_primary": entry is not None,
                 "resource": resource_id,
                 "display": (entry.display if entry else "") or naming.display_default(resource_id),
+                # 一覧の見出し。**資源 ID を必ず含める**（display による置き換えを許さない）。
+                "label": naming.label(resource_id, entry.display if entry else ""),
                 "verdict": str(verdict),
                 "reason": (
                     liveness.explain(verdict)
@@ -187,7 +189,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
     for row in rows:
         # 表示は occupied（誰か 1 人でも宣言しているか）で決める。
         mark = "使用中" if row["occupied"] else "空き"
-        print(f"{row['display']:<24} {mark:<6} {row['reason']}")
+        print(f"{row['label']:<24} {mark:<6} {row['reason']}")
         holder = row["holder"] or {}
         if holder:
             job = holder.get("job") or "(ジョブ未記入)"
@@ -593,7 +595,10 @@ def _cmd_wait(args: argparse.Namespace) -> int:
             f" <- 相乗り {len(joins)} 件（主宣言は無し）"
         )
     else:
-        print(f"待機します: {entry.display} <- {entry.session} / {entry.job}")
+        print(
+            f"待機します: {naming.label(resource_id, entry.display)}"
+            f" <- {entry.session} / {entry.job}"
+        )
         if entry.eta:
             stated = entry.eta.get("stated") if isinstance(entry.eta, dict) else None
             at = entry.eta.get("at") if isinstance(entry.eta, dict) else None
