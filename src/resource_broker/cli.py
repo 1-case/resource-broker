@@ -489,6 +489,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # **宣言を作ったら、次の行から try に入る。** 間に置いた print が
     # `UnicodeEncodeError`（Windows のコンソールは cp932）や閉じたパイプの
     # `OSError` で落ちると、宣言だけが掲示板に残る。
+    # 子の終了コード。**後始末で監査ログに残すために保持する。** 解放の記録が
+    # 「rb run の終了」だけだと、走らずに即死したジョブと完走したジョブが同じ 1 行になり、
+    # 後から振り返ったときに区別できない（CLAUDE.md「Silence Is Not Success」）。
+    # ラッパー自身が落ちて finally だけが通った場合は None のままにする。
+    exit_code: int | None = None
     try:
         # **記録できていないのに「宣言しました」と言わない。** 掲示板が書けなかった場合も
         # 実行は通す（fail-open）が、他セッションから見えない利用を成功した宣言として
@@ -498,28 +503,50 @@ def _cmd_run(args: argparse.Namespace) -> int:
         else:
             _warn_not_declared()
         print(f"ログ: {log_path}")
-        return runner.execute(list(args.trailing), log_path, spawn=SPAWN)
+        exit_code = runner.execute(list(args.trailing), log_path, spawn=SPAWN)
+        return exit_code
     except KeyboardInterrupt:
         print("中断されました", file=sys.stderr)
+        exit_code = EXIT_INTERRUPTED
         return EXIT_INTERRUPTED
     finally:
-        _release_after_run(board, resource_id, entry, declared=result.declared)
+        _release_after_run(
+            board, resource_id, entry, declared=result.declared, exit_code=exit_code
+        )
 
 
-def _release_after_run(board: Board, resource_id: str, entry: Entry, *, declared: bool) -> None:
+def _release_after_run(
+    board: Board,
+    resource_id: str,
+    entry: Entry,
+    *,
+    declared: bool,
+    exit_code: int | None = None,
+) -> None:
     """``rb run`` の後始末。**ここから例外を出さない。**
 
     ``finally`` の中で例外が出ると、子プロセスが 0 で終わっていても呼び出し側には
     ラッパーの故障（126）が返る。print 1 つで終了コードが変わってはならない。
+
+    Parameters
+    ----------
+    exit_code : int, optional
+        子プロセスの終了コード。**解放の理由に添えて監査ログへ残す。**
+        ラッパー自身が落ちた場合は None（「分からない」であって「成功」ではない）。
     """
     try:
         if not declared:
             return  # そもそも掲示板に残っていない。消すものが無い
 
+        # 終了コードを理由に含める。**成否を解釈はしない**（0 が成功とは限らない資源もある）。
+        # 値をそのまま運び、意味づけは振り返る側に任せる。
+        code = "不明" if exit_code is None else str(exit_code)
+        reason = f"rb run の終了（exit={code}）"
+
         # **自分の宣言であることを確かめてから消す。** 実行中に他セッションが --force で
         # 取り直していた場合、無条件に消すと生きた宣言を消してしまう。掲示板は空・資源は
         # 掴まれたままという、最も検出しにくい不整合になる。
-        result = board.remove_if_owned(resource_id, reason="rb run の終了", nonce=entry.nonce)
+        result = board.remove_if_owned(resource_id, reason=reason, nonce=entry.nonce)
         if result is RemovalResult.REMOVED:
             print(f"解放しました: {entry.display}")
         elif result is RemovalResult.ABSENT:
