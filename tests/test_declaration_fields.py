@@ -495,3 +495,98 @@ def test_a_join_records_the_same_fields_as_a_claim(tmp_path: Path) -> None:
     assert joined["eta"]["stated"] == "20m"
     assert joined["usage"]["peak"] == "VRAM 2GB"
     assert joined["sharing"] == "可"
+
+
+# --- 相乗りの合計超過を隠さない ---------------------------------------------------
+
+
+def test_joining_shows_everyone_already_in(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """相乗りした直後に、**今入っている全員**を見積もり付きで出す。
+
+    相乗りには取得の排他が無い。それは欠陥ではなく目的である（何人でも入れるための
+    仕組み）。しかしその帰結として、各自が「空きを確かめてから入る」を守っても、
+    **同時に入れば合計は超過する**。実測: 「残り 5GB まで可」の資源へ 3GB のつもりの
+    4 者が同時に入り、合計 12GB になった。全員が正しく振る舞っている。
+
+    本ツールはこれを防げない（単位も尺度も資源ごとに違い、足し算にはその資源を知る
+    必要がある）。**防げない代わりに隠さない。**
+    """
+    board = Board(tmp_path)
+    assert board.try_claim(
+        build_entry(
+            normalize("GPU0"),
+            job="本命の学習",
+            session="holder",
+            cwd=str(tmp_path / "holder"),
+            peak="VRAM 3GB",
+            sharing="可（VRAM 残 5GB まで）",
+        )
+    )
+    先客 = build_entry(normalize("GPU0"), job="先に入った相乗り", session="first", peak="VRAM 3GB")
+    assert board.add_join(先客, str(tmp_path / "first"))
+    capsys.readouterr()
+
+    assert (
+        run(
+            tmp_path,
+            "join",
+            "--res",
+            "GPU0",
+            "--job",
+            "あとから入る相乗り",
+            "--observed",
+            "nvidia-smi: 残り 5GB",
+            "--eta",
+            "20m",
+            "--peak",
+            "VRAM 3GB",
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+
+    # 主宣言も先客も自分も、見積もり付きで見えること。
+    assert "本命の学習" in out
+    assert "先に入った相乗り" in out
+    assert "あとから入る相乗り" in out
+    assert out.count("VRAM 3GB") >= 3
+
+
+def test_joining_does_not_add_up_the_estimates(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """**足し算をしない**ことを明示する。
+
+    足し算をした瞬間、単位を知ることになる（VRAM の GB、CPU のコア数、
+    API のリクエスト毎分）。judgment はセッションに残す。
+    """
+    board = Board(tmp_path)
+    assert board.try_claim(
+        build_entry(normalize("GPU0"), job="本命", session="holder", peak="VRAM 3GB")
+    )
+    capsys.readouterr()
+
+    assert (
+        run(
+            tmp_path,
+            "join",
+            "--res",
+            "GPU0",
+            "--job",
+            "相乗り",
+            "--observed",
+            "調べた",
+            "--eta",
+            "20m",
+            "--peak",
+            "VRAM 3GB",
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+
+    assert "足し算しない" in out
+    assert "自分で確かめる" in out
+    assert "rb release --join" in out  # 降りる道を示す
