@@ -2,6 +2,9 @@
 name = "resource-broker"
 version = "0.1.0"
 description = "複数の Claude Code セッション間で有限資源の使用状況を共有する掲示板"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.13"
 dependencies = []
 
