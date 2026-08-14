@@ -25,6 +25,17 @@ from resource_broker.naming import normalize
 
 RESOURCE = normalize("GPU0")
 
+
+@pytest.fixture(autouse=True)
+def _my_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """このテストプロセスを「mine」というセッションとして名乗らせる。
+
+    所有判定は cwd だけでは決まらない（同じリポジトリで動く 2 つのセッションは
+    cwd も session 名も一致する）。**誰が打ったコマンドなのか**をテストでも明示する。
+    """
+    monkeypatch.setenv("RESOURCE_BROKER_SESSION_ID", "mine")
+
+
 #: 互いに**無関係な** 2 つの作業ディレクトリ。階層関係を持たせない。
 #:
 #: ネイティブの区切りで組み立てる。以前は ``C:\works\mine`` のような Windows 形式の
@@ -64,9 +75,15 @@ def claim(tmp_path: Path, *extra: str) -> int:
     )
 
 
-def plant(board: Board, cwd: str, *, job: str = "他人のジョブ") -> None:
-    """他セッションの宣言を仕込む。"""
-    assert board.try_claim(build_entry(RESOURCE, job=job, cwd=cwd, session="theirs"))
+def plant(board: Board, cwd: str, *, job: str = "他人のジョブ", session: str = "theirs") -> None:
+    """宣言を仕込む。既定は**他セッションのもの**（``session="mine"`` で自分のものにする）。
+
+    cwd だけでなく ``session_id`` でも身元を分ける。同じ場所で動く 2 つのセッションは
+    cwd では区別できないため、そこが所有判定の主材料になっている。
+    """
+    assert board.try_claim(
+        build_entry(RESOURCE, job=job, cwd=cwd, session=session, session_id=session)
+    )
 
 
 # --- 他人の宣言を消せないこと ---------------------------------------------------
@@ -160,7 +177,7 @@ def test_replace_separates_io_failure_from_conflict(
     失敗しうる。それを競合として説明するのは**事実と違う**（対処も変わる）。
     """
     board = Board(tmp_path)
-    entry = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine")
+    entry = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
     assert board.try_claim(entry)
 
     def refuse(*_args: object, **_kwargs: object) -> None:
@@ -178,7 +195,7 @@ def test_replace_retries_a_sharing_violation(
 ) -> None:
     """置換も ``unlink`` と同じように数回やり直す。1 回で諦めると更新できない。"""
     board = Board(tmp_path)
-    entry = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine")
+    entry = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
     assert board.try_claim(entry)
 
     original = os.replace
@@ -230,7 +247,7 @@ def test_a_subdirectory_still_owns_its_declaration(
     """
     board = Board(tmp_path)
     asset, deeper = places(tmp_path, "works/assets/malm", "works/assets/malm/runs/e008")
-    plant(board, asset, job="自分のジョブ")
+    plant(board, asset, job="自分のジョブ", session="mine")
     monkeypatch.setattr(os, "getcwd", lambda: deeper)
 
     assert run(tmp_path, "release", "GPU0") == 0
@@ -244,7 +261,7 @@ def test_remove_if_owned_refuses_a_reclaimed_declaration(tmp_path: Path) -> None
     掲示板は空・資源は掴まれたままという最も検出しにくい不整合ができる。
     """
     board = Board(tmp_path)
-    mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine")
+    mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
     assert board.try_claim(mine)
 
     # 他セッションが --force で取り直した状況を作る
@@ -271,7 +288,7 @@ def test_remove_if_owned_reports_absence_and_success_separately(tmp_path: Path) 
         RemovalResult.ABSENT
     )
 
-    mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine")
+    mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
     assert board.try_claim(mine)
     assert board.remove_if_owned(RESOURCE, reason="テスト", nonce=mine.nonce) is (
         RemovalResult.REMOVED
@@ -287,7 +304,7 @@ def test_remove_reports_failure_apart_from_absence(
     ``unlink`` が ``PermissionError`` を返すことが実際にある。
     """
     board = Board(tmp_path)
-    mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine")
+    mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
     assert board.try_claim(mine)
 
     def refuse(*_args: object, **_kwargs: object) -> None:
@@ -304,7 +321,7 @@ def test_unlink_is_retried_before_giving_up(
 ) -> None:
     """共有違反は数回やり直す。1 回で諦めると宣言が残る。"""
     board = Board(tmp_path)
-    mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine")
+    mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
     assert board.try_claim(mine)
 
     original = Path.unlink
@@ -533,7 +550,9 @@ def test_lock_wait_has_an_upper_bound(tmp_path: Path) -> None:
 
 def ghost(board: Board, monkeypatch: pytest.MonkeyPatch) -> None:
     """再起動をまたいだ幽霊を仕込む（確定的に退かせる宣言）。"""
-    entry = build_entry(RESOURCE, job="落ちたセッション", cwd=THEIRS, session="theirs")
+    entry = build_entry(
+        RESOURCE, job="落ちたセッション", cwd=THEIRS, session="theirs", session_id="theirs"
+    )
     entry.since = clock.to_iso(clock.now() - timedelta(hours=2))
     assert board.try_claim(entry)
     monkeypatch.setattr(
@@ -600,7 +619,7 @@ def test_two_sessions_seeing_one_ghost_do_not_both_acquire(
 def test_conditional_removal_refuses_a_replaced_declaration(tmp_path: Path) -> None:
     """読んだ宣言と違うものは消さない（CAS の基本性質）。"""
     board = Board(tmp_path)
-    mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine")
+    mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
     assert board.try_claim(mine)
     board.remove(RESOURCE, reason="テスト")
     plant(board, THEIRS)
@@ -616,7 +635,7 @@ def test_conditional_removal_refuses_a_replaced_declaration(tmp_path: Path) -> N
 def test_conditional_removal_removes_a_matching_declaration(tmp_path: Path) -> None:
     """一致していれば消す。「無い」と「消した」を畳まない。"""
     board = Board(tmp_path)
-    mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine")
+    mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
     assert board.try_claim(mine)
 
     assert board.remove_if_nonce(RESOURCE, expect_nonce=mine.nonce, reason="テスト") is (
@@ -637,7 +656,7 @@ def test_conditional_removal_restores_what_it_captured(
     **他人の生きた宣言を消したのと同じ**ことになる。
     """
     board = Board(tmp_path)
-    mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine")
+    mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
     plant(board, THEIRS)  # 実体は他人のもの
 
     # 先読みだけが自分の宣言を返す状況（読んだ直後に入れ替わった）を作る
@@ -841,7 +860,9 @@ def test_future_since_is_uncertain_and_needs_force(tmp_path: Path) -> None:
 def test_future_since_can_only_be_displaced_by_force(tmp_path: Path) -> None:
     """CLI から見ても、未来の since を持つ宣言は ``--force`` でしか退かない。"""
     board = Board(tmp_path)
-    entry = build_entry(RESOURCE, job="時計がずれた宣言", cwd=THEIRS, session="theirs")
+    entry = build_entry(
+        RESOURCE, job="時計がずれた宣言", cwd=THEIRS, session="theirs", session_id="theirs"
+    )
     entry.since = clock.to_iso(clock.now() + timedelta(days=1))
     assert board.try_claim(entry)
 
@@ -873,7 +894,9 @@ def test_joins_only_resource_is_occupied_but_claimable(
     **実際に使っている者がいるのに通知から消える**）。
     """
     board = Board(tmp_path)
-    joiner = build_entry(RESOURCE, job="相乗りのジョブ", cwd=THEIRS, session="theirs")
+    joiner = build_entry(
+        RESOURCE, job="相乗りのジョブ", cwd=THEIRS, session="theirs", session_id="theirs"
+    )
     assert board.add_join(joiner, THEIRS)
 
     run(tmp_path, "status", "GPU0", "--json")
@@ -896,7 +919,9 @@ def test_claim_over_a_joined_resource_warns_but_passes(
     ものを CLI が素通しすることになる。
     """
     board = Board(tmp_path)
-    joiner = build_entry(RESOURCE, job="相乗りのジョブ", cwd=THEIRS, session="theirs")
+    joiner = build_entry(
+        RESOURCE, job="相乗りのジョブ", cwd=THEIRS, session="theirs", session_id="theirs"
+    )
     assert board.add_join(joiner, THEIRS)
     capsys.readouterr()
 
@@ -910,7 +935,9 @@ def test_joins_only_resource_is_listed_without_arguments(
 ) -> None:
     """引数なしの status でも、相乗りだけの資源を取りこぼさない。"""
     board = Board(tmp_path)
-    joiner = build_entry(RESOURCE, job="相乗りのジョブ", cwd=THEIRS, session="theirs")
+    joiner = build_entry(
+        RESOURCE, job="相乗りのジョブ", cwd=THEIRS, session="theirs", session_id="theirs"
+    )
     assert board.add_join(joiner, THEIRS)
 
     run(tmp_path, "status", "--json")
@@ -1037,7 +1064,9 @@ def test_a_join_from_before_the_reboot_is_discarded(
     無効になるため推測を含まない）。
     """
     board = Board(tmp_path)
-    joiner = build_entry(RESOURCE, job="落ちたセッション", cwd=THEIRS, session="theirs")
+    joiner = build_entry(
+        RESOURCE, job="落ちたセッション", cwd=THEIRS, session="theirs", session_id="theirs"
+    )
     assert board.add_join(joiner, THEIRS)
 
     # 起動時刻が宣言より後 = 再起動をまたいでいる（境界の余裕より十分に大きく取る）
@@ -1059,7 +1088,9 @@ def test_a_join_within_the_boot_margin_survives(
     生きている申告を巻き込む余地をゼロにする。失うのは再起動直後の掃除の遅れだけである。
     """
     board = Board(tmp_path)
-    joiner = build_entry(RESOURCE, job="出したばかりの相乗り", cwd=THEIRS, session="theirs")
+    joiner = build_entry(
+        RESOURCE, job="出したばかりの相乗り", cwd=THEIRS, session="theirs", session_id="theirs"
+    )
     assert board.add_join(joiner, THEIRS)
 
     monkeypatch.setattr(
@@ -1077,7 +1108,9 @@ def test_a_stale_join_is_removed_only_when_it_still_matches(tmp_path: Path) -> N
     主宣言で塞いだのと同じ read-delete race である。
     """
     board = Board(tmp_path)
-    old = build_entry(RESOURCE, job="古い相乗り", cwd=THEIRS, session="theirs")
+    old = build_entry(
+        RESOURCE, job="古い相乗り", cwd=THEIRS, session="theirs", session_id="theirs"
+    )
     assert board.add_join(old, THEIRS)
 
     # 読み終えた直後に、同じ場所の申告が取り下げられて出し直された状況を作る
@@ -1103,7 +1136,9 @@ def test_stale_join_cleanup_goes_through_the_cas(
     ここが素通しに戻ると、上のテストが守っている性質は経路ごと迂回される。
     """
     board = Board(tmp_path)
-    joiner = build_entry(RESOURCE, job="落ちたセッション", cwd=THEIRS, session="theirs")
+    joiner = build_entry(
+        RESOURCE, job="落ちたセッション", cwd=THEIRS, session="theirs", session_id="theirs"
+    )
     assert board.add_join(joiner, THEIRS)
     monkeypatch.setattr(
         "resource_broker.platform_info.boot_time", lambda: clock.now() + timedelta(minutes=10)
@@ -1156,7 +1191,9 @@ def test_a_live_join_is_not_discarded(tmp_path: Path, monkeypatch: pytest.Monkey
     （CLAUDE.md「Liveness Judgment」の非対称性）。
     """
     board = Board(tmp_path)
-    joiner = build_entry(RESOURCE, job="生きている相乗り", cwd=THEIRS, session="theirs")
+    joiner = build_entry(
+        RESOURCE, job="生きている相乗り", cwd=THEIRS, session="theirs", session_id="theirs"
+    )
     assert board.add_join(joiner, THEIRS)
 
     monkeypatch.setattr(
@@ -1189,7 +1226,9 @@ def test_force_release_also_clears_the_joins(
 def test_force_release_clears_joins_without_a_primary(tmp_path: Path) -> None:
     """主宣言が無くても、残った相乗りを強制解放で掃除できる。"""
     board = Board(tmp_path)
-    assert board.add_join(build_entry(RESOURCE, job="相乗り", cwd=THEIRS), THEIRS)
+    assert board.add_join(
+        build_entry(RESOURCE, job="相乗り", cwd=THEIRS, session_id="theirs"), THEIRS
+    )
 
     assert run(tmp_path, "release", "GPU0", "--force") == 0
     assert board.list_joins(RESOURCE) == []
@@ -1222,7 +1261,9 @@ def test_release_does_not_remove_another_sessions_join(
     """他セッションの相乗りは ``--force`` 無しでは外せない。"""
     board = Board(tmp_path)
     plant(board, THEIRS)
-    assert board.add_join(build_entry(RESOURCE, job="相乗り", cwd=THEIRS), THEIRS)
+    assert board.add_join(
+        build_entry(RESOURCE, job="相乗り", cwd=THEIRS, session_id="theirs"), THEIRS
+    )
 
     monkeypatch.setattr(os, "getcwd", lambda: MINE)
 
@@ -1435,3 +1476,84 @@ def test_release_still_chooses_automatically_when_only_one_candidate_exists(
     assert run(tmp_path, "release", "GPU0") == 0
     assert board.list_joins(RESOURCE) == []
     assert board.read(RESOURCE) is not None  # 他人の主宣言はそのまま
+
+
+# --- 同じ場所で動く 2 つのセッション ---------------------------------------------
+#
+# ここが cwd では守れない唯一の場所である。同じリポジトリで実装用とレビュー用の
+# セッションを立てると、両者は cwd も `session`（cwd のベース名）も一致する。
+# session_id が無いと、**自分の宣言を消したつもりで他セッションの宣言を消す**。
+
+
+def test_a_second_session_in_the_same_place_cannot_release_my_declaration(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """同じ作業ディレクトリの別セッションは ``--force`` 無しで解放できない。"""
+    board = Board(tmp_path)
+    plant(board, MINE, job="先に始めた側の作業", session="first")
+
+    assert run(tmp_path, "release", "GPU0") == 1  # 自分は "mine"
+    assert board.read(RESOURCE) is not None
+    assert "他セッションの宣言は解放できません" in capsys.readouterr().err
+
+
+def test_a_second_session_in_the_same_place_cannot_update_my_declaration(
+    tmp_path: Path,
+) -> None:
+    """更新も同じ。他セッションの申告を書き換えない。"""
+    board = Board(tmp_path)
+    plant(board, MINE, job="先に始めた側の作業", session="first")
+
+    assert run(tmp_path, "update", "GPU0", "--job", "横取り") == 1
+
+    entry = board.read(RESOURCE)
+    assert entry is not None
+    assert entry.job == "先に始めた側の作業"
+
+
+def test_i_can_still_release_my_own_declaration_from_the_same_place(
+    tmp_path: Path,
+) -> None:
+    """自分の宣言は同じ場所からそのまま解放できる。**厳しくしすぎない。**"""
+    board = Board(tmp_path)
+    plant(board, MINE, job="自分の作業", session="mine")
+
+    assert run(tmp_path, "release", "GPU0") == 0
+    assert board.read(RESOURCE) is None
+
+
+def test_a_declaration_without_a_session_id_falls_back_to_cwd(
+    tmp_path: Path,
+) -> None:
+    """``session_id`` を持たない宣言は従来どおり cwd で判定する。
+
+    古い宣言や Claude Code 以外からの利用を締め出さない（fail-open）。
+    掲示板のスキーマ変更で稼働中のセッションが動かなくなってはならない。
+    """
+    board = Board(tmp_path)
+    assert board.try_claim(build_entry(RESOURCE, job="session_id の無い宣言", cwd=MINE))
+
+    assert run(tmp_path, "release", "GPU0") == 0
+    assert board.read(RESOURCE) is None
+
+
+def test_my_own_session_id_is_recorded_on_the_board(tmp_path: Path) -> None:
+    """宣言に自分の session_id が載る。載らなければ次回の判定材料が無い。"""
+    assert (
+        run(
+            tmp_path,
+            "claim",
+            "GPU0",
+            "--job",
+            "宣言",
+            "--observed",
+            "調べた",
+            "--eta",
+            "10m",
+        )
+        == 0
+    )
+
+    entry = Board(tmp_path).read(RESOURCE)
+    assert entry is not None
+    assert entry.holder["session_id"] == "mine"

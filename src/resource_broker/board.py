@@ -560,18 +560,32 @@ class Board:
             self.audit("entry_malformed", resource=resource_id)
         return entry
 
-    def owns(self, entry: Entry, *, nonce: str | None = None, cwd: str | None = None) -> bool:
-        """そのエントリが自分のものか。
+    def owns(
+        self,
+        entry: Entry,
+        *,
+        nonce: str | None = None,
+        cwd: str | None = None,
+        session_id: str | None = None,
+    ) -> bool:
+        """そのエントリが自分のものか。**材料は 3 段階で、強い順に使う。**
 
-        nonce が一致すれば確実に自分のものである（宣言ごとに一意）。nonce を持たない
-        古いエントリのために cwd での照合も残す。
+        1. **nonce**: 一致すれば確実に自分のものである（宣言ごとに一意）。持っているのは
+           ラッパー（``rb run``）だけで、自分が作った宣言を自分で消す場面に限る
+        2. **session_id**: 両者が持っていれば、それだけで決める。**cwd は見ない。**
+           同じリポジトリで 2 つのセッションを立てるのは日常であり、そのとき cwd も
+           ``session``（cwd のベース名）も一致するため、**cwd では互いを区別できない**。
+           区別しないと、**自分の宣言を消したつもりで他セッションの宣言を消す**
+        3. **cwd**: どちらも無いときの従来の照合。**宣言者の場所が自分の場所と同じか、
+           自分の祖先のとき**だけ自分のものとみなす。宣言したときと解放するときで作業
+           ディレクトリが違うことは普通にある（サブディレクトリへ降りた等）ので、そこで
+           弾くと自分の資源を自分で解放できない。逆方向（自分が宣言者の祖先）は**認めない**。
+           このマシンでは全プロジェクトが 1 つのルートの下にあるため、認めるとハブのルートで
+           動くセッションが全アセットの宣言を ``--force`` 無しで解放・更新できてしまう
 
-        cwd の照合は**宣言者の場所が自分の場所と同じか、自分の祖先のとき**だけ自分のものと
-        みなす。宣言したときと解放するときで作業ディレクトリが違うことは普通にある
-        （サブディレクトリへ降りた等）ので、そこで弾くと自分の資源を自分で解放できない。
-        逆方向（自分が宣言者の祖先）は**認めない**。このマシンでは全プロジェクトが 1 つの
-        ルートの下にあるため、認めるとハブのルートで動くセッションが全アセットの宣言を
-        ``--force`` 無しで解放・更新できてしまう。
+        **session_id が無いことを理由に厳しくしない。** 片方でも欠けていれば cwd へ落とす。
+        古い宣言（session_id を持たない）や Claude Code 以外からの利用を締め出さないためである
+        （CLAUDE.md「Fail-Open」）。
 
         **所有者を確かめずに消してはならない。** 他セッションの生きた宣言を消すと、
         掲示板は空・資源は掴まれたままという最も検出しにくい不整合ができる。
@@ -579,6 +593,9 @@ class Board:
         holder = entry.holder if isinstance(entry.holder, dict) else {}
         if nonce and holder.get("nonce"):
             return str(holder["nonce"]) == nonce
+        declared_session = str(holder.get("session_id") or "")
+        if declared_session and session_id:
+            return declared_session == session_id
         declared = str(holder.get("cwd") or "")
         if cwd and declared:
             return _is_within(cwd, declared)
@@ -750,7 +767,7 @@ class Board:
             entry = self.read(resource_id)
             if entry is None:
                 return RemovalResult.ABSENT
-            if not self.owns(entry, nonce=nonce, cwd=cwd):
+            if not self.owns(entry, nonce=nonce, cwd=cwd, session_id=platform_info.session_id()):
                 self.audit("remove_refused", resource=resource_id, reason="他者の宣言のため")
                 return RemovalResult.NOT_OWNED
             if entry.nonce:
@@ -1031,7 +1048,8 @@ class Board:
         candidates = [
             (path, entry)
             for path, entry in self._load_joins()
-            if entry.resource == resource_id and self.owns(entry, cwd=cwd)
+            if entry.resource == resource_id
+            and self.owns(entry, cwd=cwd, session_id=platform_info.session_id())
         ]
         for path, entry in candidates:
             if path == exact:
@@ -1191,6 +1209,7 @@ def build_entry(
     pid: int | None = None,
     cwd: str | None = None,
     session: str | None = None,
+    session_id: str | None = None,
     observed: dict[str, object] | None = None,
     eta: str = "",
     peak: str = "",
@@ -1216,6 +1235,10 @@ def build_entry(
         holder={
             "session": session or Path(cwd or os.getcwd()).name,
             "cwd": cwd or os.getcwd(),
+            # **同じ場所で動く 2 つのセッションを区別する唯一の材料。** cwd も
+            # `session`（cwd のベース名）も一致するため、これが無いと自分の宣言を
+            # 消したつもりで他人の宣言を消せる。取れなければ空文字（cwd 判定へ落ちる）
+            "session_id": platform_info.session_id() if session_id is None else session_id,
             "pid": pid,
             "job": job,
             # 宣言ごとに一意。所有者の照合に使う。cwd だけでは、同じ場所から

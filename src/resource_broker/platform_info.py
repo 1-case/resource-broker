@@ -51,6 +51,34 @@ def hostname() -> str:
     return (name or "unknown-host").strip().lower()
 
 
+def session_id() -> str:
+    """このセッションを識別する文字列。取れなければ空文字。
+
+    **cwd だけでは所有を判定できない場面がある。** 同じリポジトリで 2 つのセッションを
+    立てるのは日常であり（片方が実装、片方がレビュー等）、そのとき両者は cwd も
+    ``session`` 名（cwd のベース名）も一致する。結果として、**自分の宣言を消したつもりで
+    他セッションの宣言を消せてしまう**。
+
+    ここで返すのは資源の情報ではなく**宣言者の身元**である。cwd や PID と同じ枠であり、
+    資源の種別には一切依存しない（CLAUDE.md「Resource Agnosticism」）。
+
+    取れないときは空文字を返し、呼び出し側は従来どおり cwd で判定する。
+    **無いことを理由に厳しくしない**（CLAUDE.md「Fail-Open」）。
+
+    Returns
+    -------
+    str
+        セッション ID。``RESOURCE_BROKER_SESSION_ID`` を優先し、無ければ Claude Code が
+        渡す ``CLAUDE_CODE_SESSION_ID`` を使う。前者はテストと、Claude Code 以外から
+        使うときの逃げ道である。
+    """
+    for name in ("RESOURCE_BROKER_SESSION_ID", "CLAUDE_CODE_SESSION_ID"):
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return ""
+
+
 def boot_time(*, tick_millis: TickMillis | None = None) -> datetime | None:
     """このマシンが起動した時刻を返す。取得できなければ None。
 
