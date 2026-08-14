@@ -1,15 +1,25 @@
-# CI: GitHub ホストの runner で実行する。
+# CI: 1-case 組織の self-hosted runner（Linux ARM64 / Raspberry Pi CM5）で実行する。
 #
-# **self-hosted runner は使わない。** 公開リポジトリで self-hosted を使うと、fork からの
-# pull request が**自分のマシン上で任意のコードを実行できる**（GitHub が明示的に警告している）。
-# 「他人に CI を触らせない」を満たす方法は、隔離された使い捨ての runner を使うことである。
-# 公開リポジトリなら GitHub ホストの標準 runner は分数制限なしで使える。
+# **private の間は GitHub ホストの runner を使わない。** private リポジトリでは
+# GitHub ホストの実行が Free プランの 2,000 分/月を消費し、しかも windows-latest は
+# 2 倍、macOS は 10 倍で加算される。self-hosted は private でも消費しない。
 #
-# 本ツールは Windows を第一級の対象とする。以前は Linux だけで回しており、Windows 固有の
-# ctypes 経路（GetTickCount64 / OpenProcess）が 1 行も実行されないという既知の穴があった。
-# matrix に windows-latest を入れてその穴を塞ぐ。
+# **公開したら GitHub ホストへ移す。** 理由は 2 つあり、どちらも公開時にだけ成立する。
+#   1. 公開リポジトリなら GitHub ホストの標準 runner は分数を消費しない
+#   2. **公開リポジトリで self-hosted を使うと、fork からの pull request が
+#      自分のマシン上で任意のコードを実行できる**（GitHub が明示的に警告している）。
+#      「他人に CI を触らせない」を満たすのは、隔離された使い捨ての runner のほうである
+# 移行先は ubuntu-latest + windows-latest の matrix とする（2026-08-14 に一度試し、
+# 両方 green を確認済み。windows-latest は下記の穴も塞ぐ）。
 #
-# 本ツールは資源を調べないので、実 GPU・実 COM ポートを要求するテストは原理的に存在しない。
+# 本ツールは Windows を第一級の対象とするが、プラットフォーム依存部分（boot time 取得・
+# PID の生存確認・プロセスツリーの終了）は platform_info.py と runner.py に隔離してあるため、
+# 純粋なロジック（掲示板・幽霊判定・命名・待機）は Linux 上でも検証できる。
+# 本ツールは資源を調べないので、実 GPU・実 COM を要求するテストは原理的に存在しない。
+#
+# 既知の穴: Windows 固有の ctypes 経路（GetTickCount64 / OpenProcess）は CI を通らない。
+# 公開して matrix へ移すまでは、**開発機（Windows）で uv run pytest を回すことが唯一の
+# 検証経路**である。手元で通してからコミットすること。
 name: CI
 
 on:
@@ -22,19 +32,18 @@ permissions:
 
 jobs:
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: [self-hosted, Linux, ARM64]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
+      # uv が runner に無ければ導入する（管理された Python も uv sync が自動取得する）
       - name: Set up uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
+        run: |
+          if ! command -v uv >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/uv" ]; then
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+          fi
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Sync dependencies
         run: uv sync
