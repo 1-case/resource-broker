@@ -1,96 +1,202 @@
-resource-broker 独自ライセンス（全権留保 / All Rights Reserved）
+                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
 
-Copyright (c) 2026 satorunnlg. All rights reserved.
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
 
-本ソフトウェア及び関連文書ファイル（以下「本ソフトウェア」）に関する著作権その他の
-一切の権利は、satorunnlg（以下「著作権者」）に留保される。
+   1. Definitions.
 
---------------------------------------------------------------------------------
-第1条（許諾しない行為）
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
 
-著作権者の書面による事前の許諾なく、本ソフトウェアの全部又は一部について
-次の行為を行うことはできない。
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
 
-  (a) 複製、改変、翻案、翻訳
-  (b) 再配布、公衆送信、譲渡、貸与、販売、サブライセンス
-  (c) 逆コンパイル、逆アセンブル、その他のリバースエンジニアリング
-  (d) 二次的著作物の作成及びその利用
-  (e) 本ソフトウェアを用いた役務の第三者への提供
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
 
-第2条（内部利用）
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
 
-著作権者、及び著作権者が明示的に許可した者は、内部での研究・開発・評価の目的に
-限り、本ソフトウェアを使用することができる。本条は第1条の各行為を許諾するものではない。
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
 
-第3条（生成物）
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
 
-本ソフトウェアが生成する掲示板の内容、監査ログその他の生成物についても、
-本ライセンスの条件が及ぶ。
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
 
-第4条（第三者ソフトウェア）
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
 
-本ソフトウェアは、第三者が権利を有するオープンソースソフトウェアを利用する。
-当該第三者ソフトウェアには、それぞれの提供者が定めるライセンスが適用され、
-本ライセンスの条件は当該第三者ソフトウェアには及ばない。
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
 
-利用する第三者ソフトウェアとそのライセンスは DESIGN.md「Tech Stack」に記載する。
-本ソフトウェアを第三者へ配布する場合は、各ライセンスが要求する著作権表示及び
-ライセンス全文を THIRD_PARTY_NOTICES.md として同梱しなければならない。
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
 
-本ソフトウェアは資源の実測を行わず、そのための外部コマンドを起動しない。
-資源を調べる手段の選択と実行は利用者の責任において行われる。
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
 
-第5条（無保証）
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
 
-本ソフトウェアは「現状有姿（AS IS）」で提供される。著作権者は、商品性、特定目的への
-適合性、非侵害性を含むがこれらに限られない、明示又は黙示のいかなる保証も行わない。
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
 
-第6条（責任の制限）
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
 
-著作権者は、本ソフトウェアの使用又は使用不能に起因して生じた直接的、間接的、
-付随的、特別、懲罰的又は結果的損害（データの損失、事業の中断、計算資源の競合に
-よる作業の失敗を含む）について、契約責任、不法行為責任その他の法的根拠を問わず、
-一切の責任を負わない。
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
 
-本ソフトウェアは開発環境における資源の使用状況の共有を目的とするものであり、
-排他制御の強制を保証しない。本ソフトウェアは設計上、内部エラー時に資源の使用を
-許可する側に倒れる（fail-open）。人身又は財産に危険を及ぼしうる用途、及び
-排他性の保証を要する用途への使用は想定していない。
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
 
-第7条（準拠法及び管轄）
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
 
-本ライセンスは日本法に準拠して解釈される。本ライセンスに関して生じた紛争については、
-著作権者の住所地を管轄する地方裁判所を第一審の専属的合意管轄裁判所とする。
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
 
---------------------------------------------------------------------------------
-English (reference translation)
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
 
-This software and associated documentation files (the "Software") are proprietary.
-All rights are reserved by satorunnlg (the "Copyright Holder").
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
 
-No copying, modification, redistribution, public transmission, sale, sublicensing,
-reverse engineering, or creation of derivative works is permitted without the prior
-written consent of the Copyright Holder. Internal research, development, and
-evaluation use by the Copyright Holder and expressly authorized persons is permitted.
-Board contents, audit logs, and other artifacts produced by the Software are also
-covered by this license.
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
 
-The Software incorporates third-party open source software, which remains governed
-by its own license terms; see DESIGN.md, section "Tech Stack". The Software does
-not probe resources and invokes no external command for that purpose; choosing and
-running such means is the user's responsibility. Any distribution must include
-THIRD_PARTY_NOTICES.md carrying the required notices.
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. THE COPYRIGHT
-HOLDER SHALL NOT BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM
-THE SOFTWARE OR ITS USE. The Software shares resource usage information; it does
-not guarantee mutual exclusion, and by design it fails open.
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
 
-Governed by the laws of Japan. In case of any discrepancy, the Japanese text above
-prevails.
+   END OF TERMS AND CONDITIONS
 
---------------------------------------------------------------------------------
-注記
+   APPENDIX: How to apply the Apache License to your work.
 
-本ライセンス文は法律専門家の作成によるものではない。本ソフトウェアを外部へ
-配布・提供する前に、法務のレビューを受けること。
+      To apply the Apache License to your work, attach the following
+      boilerplate notice, with the fields enclosed by brackets "[]"
+      replaced with your own identifying information. (Don't include
+      the brackets!)  The text should be enclosed in the appropriate
+      comment syntax for the file format. We also recommend that a
+      file or class name and description of purpose be included on the
+      same "printed page" as the copyright notice for easier
+      identification within third-party archives.
+
+   Copyright 2026 satorunnlg
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+

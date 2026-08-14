@@ -238,17 +238,33 @@ def test_notice_tells_the_session_to_investigate(tmp_path: Path) -> None:
     assert "自分で調べる" in result.stdout
 
 
-def test_usage_is_explained_here_not_every_prompt(tmp_path: Path) -> None:
-    """使い方の説明はこのフックが受け持つ。
+def test_usage_gives_the_criterion_instead_of_a_list_of_examples(tmp_path: Path) -> None:
+    """使い方の説明はこのフックが受け持ち、**何を宣言するかの基準**を示す。
 
-    資源の例示とコマンドの書式は、起動時に 1 回言えば足りる。毎プロンプトに入れると
-    その分だけ全ターンの文脈を食い続けるため、``UserPromptSubmit`` 側には置かない。
-    例示を複数種類そろえるのは、「GPU の話だ」と誤解させないためである。
+    以前はここで資源を列挙していた（GPU / COM ポート / ネットワークドライブ …）。
+    列挙は「調べ方を実装に持つ」のと**同じ問題を説明の側で起こす**。挙げた資源だけが
+    一級市民になり、挙げなかった資源は宣言されないまま使われる。何が資源かを判断するのは
+    セッションなので、渡すのは基準に留める。
+
+    毎プロンプトに入れるとその分だけ全ターンの文脈を食い続けるため、
+    ``UserPromptSubmit`` 側には置かない。
     """
     text = run_hook(home=tmp_path).stdout
 
-    for word in ("COM ポート", "ネットワークドライブ", "レート制限", "--observed", "--found"):
+    for word in ("競合", "重大な結果", "資源の種類は問わない", "--observed", "--found"):
         assert word in text, f"{word} が起動時の説明に含まれていない"
+
+
+def test_usage_does_not_name_a_particular_resource(tmp_path: Path) -> None:
+    """特定の資源を名指ししない。
+
+    掲示板が空のときの説明に具体的な資源名が混じると、そこから「この資源の話だ」という
+    枠が生まれる。コマンド例も ``--res <資源ID>`` のままにしておく。
+    """
+    text = run_hook(home=tmp_path).stdout
+
+    for word in ("GPU", "nvidia", "COM"):
+        assert word not in text, f"{word} が説明に名指しで入っている"
 
 
 # --- 文字コード ------------------------------------------------------------------
