@@ -1132,7 +1132,9 @@ def _update_locked(board: Board, resource_id: str, args: argparse.Namespace) -> 
         print("宣言が見つかりませんでした", file=sys.stderr)
         return EXIT_USAGE
 
-    if not args.force and not board.owns(entry, cwd=os.getcwd()):
+    if not args.force and not board.owns(
+        entry, cwd=os.getcwd(), session_id=platform_info.session_id()
+    ):
         print(
             "他セッションの宣言は書き換えられません（--force で上書きできます）", file=sys.stderr
         )
@@ -1287,7 +1289,9 @@ def _release_own(board: Board, resource_id: str, *, prefer: str | None = None) -
     """
     cwd = os.getcwd()
     entry = board.read(resource_id)
-    mine_primary = entry is not None and board.owns(entry, cwd=cwd)
+    mine_primary = entry is not None and board.owns(
+        entry, cwd=cwd, session_id=platform_info.session_id()
+    )
     # 「この場所から出された相乗り」だけを曖昧さの材料にする（上の docstring 参照）。
     has_exact_join = board.join_path(resource_id, cwd).exists()
 
