@@ -90,12 +90,14 @@ def child_environment() -> dict[str, str]:
 #: 間違いはそのまま全セッションへ配られる。
 #: ``tests/test_hooks.py`` が ``cli.build_parser()`` の必須オプションと突き合わせている。
 USAGE = """資源（GPU / COM ポート / ネットワークドライブ / ローカルポート /
-外部 API のレート制限など）を使う前に:
+外部 API のレート制限 / git の作業ツリー・ブランチなど）を使う前に:
   1. その資源の状態を**自分で調べる**（調べ方はあなたが決める。本ツールは資源を知らない）
   2. rb run --res <資源ID> --job "<説明>" --observed "<何を見たか>" --eta "<終わる見込み>"
             --found busy|free|unknown -- <コマンド>
      rb run は宣言・ログ・終了時の自動解放をまとめて行う。手動なら rb claim / rb release
-     --eta は判断には使わない。一度考えさせるために必須にしてある"""
+     --eta は判断には使わない。一度考えさせるために必須にしてある
+資源 ID も申告も自由記述である。同じリポジトリで作業を始めるときも、まず rb status で
+先に誰かが触っていないか確認すること（触っていれば worktree を切るなどの判断ができる）。"""
 
 
 def fetch_status() -> list[dict[str, object]] | None:
