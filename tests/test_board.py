@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import threading
+from pathlib import Path
 
 from resource_broker.board import Board, Entry, build_entry
 
@@ -138,3 +143,61 @@ def test_entry_from_dict_rejects_shapeless_data() -> None:
     assert Entry.from_dict({"holder": {}}) is None
     assert Entry.from_dict("文字列") is None
     assert Entry.from_dict(None) is None
+
+
+# --- 実プロセスで競らせる ---------------------------------------------------------
+
+
+def _race_claim(index: int, home: Path, barrier: threading.Barrier, codes: list[int]) -> None:
+    """バリアで待ち合わせてから ``rb claim`` を打つ。"""
+    env = dict(os.environ)
+    # **それぞれ別のセッションとして名乗る。** 同じ session_id だと所有判定が
+    # 「自分のもの」に倒れ、競争そのものが起きなくなる。
+    env["RESOURCE_BROKER_SESSION_ID"] = f"racer-{index}"
+    argv = [
+        sys.executable,
+        "-m",
+        "resource_broker.cli",
+        "--home",
+        str(home),
+        "claim",
+        "GPU0",
+        "--job",
+        f"競争 {index}",
+        "--observed",
+        "全員が同じ「空き」を見た",
+        "--eta",
+        "10m",
+        "--found",
+        "free",
+    ]
+    barrier.wait()
+    codes[index] = subprocess.run(argv, capture_output=True, env=env, timeout=120).returncode
+
+
+def test_only_one_of_many_simultaneous_claims_wins(tmp_path: Path) -> None:
+    """同時に「空き」を見て一斉に宣言しても、取れるのは 1 人だけである。
+
+    **これは確率で薄める設計ではない。** 掲示板の作成は ``O_EXCL`` が、幽霊の退去は
+    ``os.rename`` による捕獲が決める。どちらも OS が原子性を保証する操作であり、
+    ロックは競り合いを減らす最適化にすぎない（取れても取れなくても結論は変わらない）。
+
+    単体では ``try_claim`` の戻り値を、フェイクではロックの 3 値を検証しているが、
+    **実プロセスを競らせる検証がここまで無かった**。CLAUDE.md が「取得競合の排他性」を
+    性質として名指ししているのに、端から端までは一度も確かめていなかった。
+    """
+    racers = 5
+    codes: list[int] = [-1] * racers
+    barrier = threading.Barrier(racers)
+    threads = [
+        threading.Thread(target=_race_claim, args=(i, tmp_path, barrier, codes))
+        for i in range(racers)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=180)
+
+    assert codes.count(0) == 1, f"取得できたのが 1 人ではない: {codes}"
+    assert codes.count(1) == racers - 1, f"残りが使用中で断られていない: {codes}"
+    assert len(list((tmp_path / "board").glob("*.json"))) == 1
