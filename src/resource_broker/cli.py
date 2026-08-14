@@ -423,6 +423,39 @@ def acquire(
     return result
 
 
+def _print_occupants(board: Board, resource_id: str) -> None:
+    """**今この資源に入っている全員**を出す。相乗りを申告した直後に必ず呼ぶ。
+
+    相乗りには取得の排他が無い。**それは欠陥ではなく目的である**（何人でも入れるための
+    仕組みである）。しかしその帰結として、各自が「空きを確かめてから入る」を守っても、
+    **同時に入れば合計は超過する**。実測: 「残り 5GB まで可」と申告された資源へ、
+    3GB のつもりの 4 者が同時に入り、合計 12GB になった。全員が正しく振る舞っている。
+
+    本ツールはこれを防げない。``--peak`` は単位も尺度も資源ごとに違い（VRAM の GB、
+    CPU のコア数、API のリクエスト毎分）、足し算をするにはその資源を知る必要がある
+    （CLAUDE.md「Resource Agnosticism」）。**防げない代わりに、隠さない。**
+
+    読み直すのが「入れたあと」なのが要点である。入る前に読んでも、ほぼ同時に入った相手は
+    まだ載っていない。**申告し終えてから読めば、相手は必ず見える。** 見えれば降りられる。
+    """
+    primary = board.read(resource_id)
+    joins = board.list_joins(resource_id)
+    if primary is None and not joins:
+        return
+
+    print("  現在この資源に入っている（自分を含む）:")
+    if primary is not None:
+        usage = primary.usage or {}
+        estimate = f"  見積 peak={usage.get('peak') or '-'} avg={usage.get('avg') or '-'}"
+        print(f"    主宣言 {primary.session} / {primary.job}{estimate}")
+    for join in joins:
+        usage = join.usage or {}
+        estimate = f"  見積 peak={usage.get('peak') or '-'} avg={usage.get('avg') or '-'}"
+        print(f"    相乗り {join.session} / {join.job}{estimate}")
+    print("  本ツールは見積もりを足し算しない（単位も尺度も資源ごとに違う）。")
+    print("  合計が収まるかは自分で確かめること。収まらないなら rb release --join で降りる。")
+
+
 def acquire_join(
     board: Board, resource_id: str, args: argparse.Namespace, *, log: str
 ) -> Acquisition:
@@ -489,6 +522,8 @@ def acquire_join(
         print(f"  保持者の相乗り方針: {primary.sharing}")
     else:
         print("  保持者は相乗り可否を書いていません。合意が取れているか確認すること")
+    # **入れたあとに読み直す。** ほぼ同時に入った相手はここで初めて見える。
+    _print_occupants(board, resource_id)
     return Acquisition(entry, EXIT_OK, declared=True)
 
 
@@ -1102,6 +1137,8 @@ def _cmd_join(args: argparse.Namespace) -> int:
         print(f"  保持者の相乗り方針: {primary.sharing}")
     else:
         print("  保持者は相乗り可否を書いていません。合意が取れているか確認すること")
+    # **入れたあとに読み直す。** ほぼ同時に入った相手はここで初めて見える。
+    _print_occupants(board, resource_id)
     return EXIT_OK
 
 
