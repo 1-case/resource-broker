@@ -444,12 +444,12 @@ rb claim GPU0 --job "E009 学習" --observed "nvidia-smi: compute apps なし" -
   "display": "GPU0 / RTX 4060 Laptop 8GB",
   "holder": {
     "session": "malm",
-    "cwd": "c:\\Users\\user\\works\\assets\\malm",
+    "cwd": "c:\\work\\assets\\malm",
     "pid": 16152,
     "job": "E008 sweep 7段連鎖",
     "nonce": "9f2c1ab4e5d74f0a8c3b6e1d92047fa5"
   },
-  "log": "c:\\Users\\user\\works\\assets\\malm\\runs\\e008_logs\\kronos_ctx256.log",
+  "log": "c:\\work\\assets\\malm\\runs\\e008_logs\\train.log",
   "since": "2026-08-12T03:12:15+09:00",
   "boot": "2026-08-12T04:27:53+09:00",
   "observed": {

@@ -1,5 +1,7 @@
 # resource-broker
 
+*[English summary](README.en.md)*
+
 **同じマシンで動く複数の Claude Code セッションが、有限資源を取り合わないための掲示板。**
 
 セッション A が GPU で学習を回している最中に、セッション B が同じ GPU を掴む。
