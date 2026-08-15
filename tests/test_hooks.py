@@ -402,3 +402,17 @@ def test_a_display_name_does_not_hide_which_resource_is_held(tmp_path: Path) -> 
     assert result.returncode == 0
     assert "GPU0" in result.stdout
     assert "malm E017 学習" in result.stdout
+
+
+def test_usage_tells_you_to_read_the_whole_board(tmp_path: Path) -> None:
+    """確認は資源名を指定せず全件で行うよう促す。
+
+    資源 ID は自由記述なので表記は必ず揺れる（``GPU0`` と ``gpu0`` は別資源になる）。
+    名指しで聞くと相手の宣言が見えず「空き」と出る。全件なら見えるので、先に使われて
+    いる表記に合わせられる——**収束はこの経路にしか無い**。実際に ``gpu0`` で
+    7.3 時間押さえられ、その間 ``rb status GPU0`` は「空き」と答える状態だった。
+    """
+    text = run_hook(home=tmp_path).stdout
+
+    assert "引数なし" in text
+    assert "資源名を指定しない" in text
