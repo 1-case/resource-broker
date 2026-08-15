@@ -408,3 +408,22 @@ def test_status_shows_the_elapsed_time(tmp_path: Path, capsys: pytest.CaptureFix
     assert main(["--home", str(tmp_path), "status"]) == 0
 
     assert "7h32m 経過" in capsys.readouterr().out
+
+
+def test_an_internal_error_does_not_look_like_a_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``rb wait`` の内部エラーを 0（＝宣言が減った）に化けさせない。
+
+    wait の 0 は「全宣言が消えた／減った」という**積極的な意味**を持つ。内部エラーで
+    0 を返すと、1 度も待っていないのに「空いた」と読まれ、使用中の資源を掴みにいく。
+    fail-open は「情報が無いなら通す」であって「嘘をつく」ではない。
+    """
+    hold_gpu(tmp_path)
+
+    def explode(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("待機の内部が壊れた")
+
+    monkeypatch.setattr(waiting, "wait_for_room", explode)
+
+    assert main(["--home", str(tmp_path), "wait", "GPU0"]) != 0

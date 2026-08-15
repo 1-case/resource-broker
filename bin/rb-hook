@@ -26,6 +26,13 @@ if command -v cygpath >/dev/null 2>&1; then
     script=$(cygpath -w "$script") || exit 0
 fi
 
+# **Git Bash では日本語が化ける。** Windows の Python は既定でコンソールの
+# コードページ（cp932 等）で書くが、Git Bash の端末は UTF-8 である。実測で確認した。
+# sh から呼ばれる経路だけ UTF-8 を強制する（cmd 側は触らない。cp932 のコンソールで
+# UTF-8 を強制すると、そちらが化ける）。
+PYTHONUTF8=1
+export PYTHONUTF8
+
 for py in py python3 python; do
     path=$(command -v "$py" 2>/dev/null) || continue
     [ -s "$path" ] || continue

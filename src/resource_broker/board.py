@@ -1021,7 +1021,9 @@ class Board:
         self.audit("join_removed", resource=resource_id, cwd=cwd, reason=reason)
         return True
 
-    def find_own_join(self, resource_id: str, cwd: str) -> tuple[Path, Entry] | None:
+    def find_own_join(
+        self, resource_id: str, cwd: str, *, expect_nonce: str | None = None
+    ) -> tuple[Path, Entry] | None:
         """自分の相乗り申告を**探すだけ**。消さない。
 
         照合は主宣言（:meth:`owns`）と**同じ規則**にする。パスの完全一致だけにすると、
@@ -1044,12 +1046,22 @@ class Board:
         tuple of (Path, Entry) or None
             選んだ申告のパスと中身。候補が無ければ None。
         """
+        loaded = [
+            (path, entry) for path, entry in self._load_joins() if entry.resource == resource_id
+        ]
+
+        if expect_nonce:
+            # **nonce を知っているなら、それだけで決める。祖先フォールバックを使わない。**
+            # 祖先まで広げると、別セッションが祖先 cwd から出した申告が候補に入り、
+            # 自分の申告が既に消えている場面（--force や再起動掃除の後）で
+            # **他人の生きた申告を選ぶ**。
+            return next(((p, e) for p, e in loaded if e.nonce == expect_nonce), None)
+
         exact = self.join_path(resource_id, cwd)
         candidates = [
             (path, entry)
-            for path, entry in self._load_joins()
-            if entry.resource == resource_id
-            and self.owns(entry, cwd=cwd, session_id=platform_info.session_id())
+            for path, entry in loaded
+            if self.owns(entry, cwd=cwd, session_id=platform_info.session_id())
         ]
         for path, entry in candidates:
             if path == exact:
@@ -1059,7 +1071,9 @@ class Board:
             return max(candidates, key=lambda item: len(str(item[1].holder.get("cwd") or "")))
         return None
 
-    def remove_own_join(self, resource_id: str, cwd: str, *, reason: str) -> Entry | None:
+    def remove_own_join(
+        self, resource_id: str, cwd: str, *, reason: str, expect_nonce: str | None = None
+    ) -> Entry | None:
         """自分の相乗り申告を取り下げる。選び方は :meth:`find_own_join` と同じ。
 
         Returns
@@ -1070,11 +1084,25 @@ class Board:
             するためである。祖先フォールバックで他人の申告を消したとき、誤爆が
             目視できなければ気づく手段が無い。
         """
-        chosen = self.find_own_join(resource_id, cwd)
+        chosen = self.find_own_join(resource_id, cwd, expect_nonce=expect_nonce)
         if chosen is None:
             return None
 
         path, entry = chosen
+
+        if expect_nonce:
+            # **捕まえてから確かめて消す（CAS）。** 読んでから消すまでの間に、別プロセスが
+            # 同じ名前を消して作り直しうる。無条件の unlink は、そこで**新しい生きた申告**を
+            # 消す。同じ競合を `_load_joins` では塞いでいるのに、利用者が実際に通る経路
+            # （`rb release --join` と `rb run --join` の後始末）だけ素通しだった。
+            result = self._capture_and_remove(
+                path, expect_nonce=expect_nonce, resource_id=resource_id, reason=reason
+            )
+            if result is RemovalResult.REMOVED:
+                self.audit("join_removed", resource=resource_id, cwd=cwd, reason=reason)
+                return entry
+            return None
+
         result, error = _unlink_with_retry(path)
         if result is RemovalResult.FAILED:
             self.audit("join_remove_failed", resource=resource_id, error=error)

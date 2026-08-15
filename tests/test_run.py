@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 import os
 import subprocess
@@ -828,3 +829,55 @@ def test_an_existing_join_is_not_withdrawn_by_the_wrapper(tmp_path: Path) -> Non
     assert rb_join_run(tmp_path, sys.executable, "-c", "print('ok')") == 0
 
     assert joins(tmp_path) == [normalize("GPU0")]
+
+
+# --- 掲示板へ書いた後の出力で、申告を孤児にしない -------------------------------
+
+
+def test_a_failing_print_does_not_orphan_the_join(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """相乗りを申告した直後の出力が落ちても、申告が残らない。
+
+    出す内容は**他セッションが書いた自由記述**である。Windows のコンソールは cp932 なので
+    ``UnicodeEncodeError`` になりうるし、``head`` へパイプすれば ``BrokenPipeError``、
+    ディスクが一杯なら ``OSError`` になる。ここで例外が漏れると、**申告だけが残って
+    ジョブは 1 度も走らない**。相乗りの幽霊判定は ``since < 起動時刻`` しか無いので、
+    残った申告は再起動か --force まで消えない。ラッパーを作った動機の裏返しである。
+    """
+    hold(tmp_path)
+
+    real = builtins.print
+
+    def exploding(*args: object, **kwargs: object) -> None:
+        text = " ".join(str(a) for a in args)
+        if "現在この資源に入っている" in text or "相乗りを申告しました" in text:
+            raise UnicodeEncodeError("cp932", "あ", 0, 1, "模擬的な文字化け")
+        real(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "print", exploding)
+
+    assert rb_join_run(tmp_path, sys.executable, "-c", "print('ok')") == 0
+
+    monkeypatch.setattr(builtins, "print", real)
+    assert joins(tmp_path) == [], "出力が落ちたせいで相乗りが掲示板に残っている"
+
+
+def test_the_wrapper_does_not_remove_another_sessions_join(tmp_path: Path) -> None:
+    """自分の申告が先に消えていても、他人の生きた申告を消さない。
+
+    後始末は nonce を照合する。渡さないと祖先フォールバックが働き、**別セッションが
+    祖先 cwd から出した申告**を選びうる（cwd だけでは区別できない）。自分の申告が
+    --force や再起動掃除で先に消えている場面で、それが現実になる。
+    """
+    hold(tmp_path)
+    board = Board(tmp_path)
+    theirs = build_entry(normalize("GPU0"), job="他人の相乗り", session="theirs", cwd=os.getcwd())
+    assert board.add_join(theirs, os.getcwd())
+
+    # 自分は相乗りを作れない（同じ場所から二重には申告できない）ので declared=False になり、
+    # 後始末は何も消さないのが正しい。
+    assert rb_join_run(tmp_path, sys.executable, "-c", "print('ok')") == 0
+
+    remaining = [entry.job for entry in Board(tmp_path).list_all_joins()]
+    assert remaining == ["他人の相乗り"], "他セッションの生きた申告を消している"

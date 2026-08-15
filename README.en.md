@@ -75,6 +75,10 @@ the package has zero dependencies, so the launcher in `bin/` just works.
 Hooks are a snapshot taken at session start, so **already-running sessions are unaffected**
 until they restart. The only requirement is Python 3.13+.
 
+**If you installed by hand before, remove the three rb hooks from `~/.claude/settings.json` first.**
+Otherwise every hook fires twice, doubling the per-turn injection and printing the board twice
+in a row — which reads as two separate resources. (Observed, not theoretical.)
+
 <details>
 <summary>Installing by hand instead</summary>
 

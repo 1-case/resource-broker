@@ -412,8 +412,9 @@ def acquire(
         with board.locked(resource_id) as lock:
             result = under_lock(lock)
     finally:
+        # **掲示板へ書いた後なので、ここで例外を出さない**（`_say` の docstring 参照）。
         for line in notices:
-            print(line, file=sys.stderr)
+            _say(line, err=True)
         # **はじいたことを必ず残す。** 記録が無いと「malm が GPU を諦めた」ことを
         # 後から追えない（実際に追えなかった）。判定したのに黙るのは、監視が
         # 死んだのと区別が付かない（CLAUDE.md「Silence Is Not Success」）。
@@ -421,6 +422,23 @@ def acquire(
         for event, fields in deferred_audit:
             board.audit(event, **fields)
     return result
+
+
+def _say(text: str, *, err: bool = False) -> None:
+    """**掲示板へ書いた後の出力は、絶対に例外を出さない。**
+
+    宣言や相乗りを掲示板へ書いたあとに ``print`` が落ちると、**申告だけが残って
+    ジョブは 1 度も走らない**。相乗りの幽霊判定は ``since < 起動時刻`` しか無いので、
+    残った申告は再起動か ``--force`` まで消えない。ラッパーを作った動機の裏返しである。
+
+    落ちる経路は現実にある。出す内容は**他セッションが書いた自由記述**で、
+    Windows のコンソールは cp932 なので ``UnicodeEncodeError`` になりうる。
+    ``head`` へパイプすれば ``BrokenPipeError``、ディスクが一杯なら ``OSError``。
+    """
+    try:
+        print(text, file=sys.stderr if err else sys.stdout)
+    except Exception:  # noqa: BLE001 - 出せなかったことが作業の成否に影響してはならない
+        pass
 
 
 def _print_occupants(board: Board, resource_id: str) -> None:
@@ -443,17 +461,17 @@ def _print_occupants(board: Board, resource_id: str) -> None:
     if primary is None and not joins:
         return
 
-    print("  現在この資源に入っている（自分を含む）:")
+    _say("  現在この資源に入っている（自分を含む）:")
     if primary is not None:
         usage = primary.usage or {}
         estimate = f"  見積 peak={usage.get('peak') or '-'} avg={usage.get('avg') or '-'}"
-        print(f"    主宣言 {primary.session} / {primary.job}{estimate}")
+        _say(f"    主宣言 {primary.session} / {primary.job}{estimate}")
     for join in joins:
         usage = join.usage or {}
         estimate = f"  見積 peak={usage.get('peak') or '-'} avg={usage.get('avg') or '-'}"
-        print(f"    相乗り {join.session} / {join.job}{estimate}")
-    print("  本ツールは見積もりを足し算しない（単位も尺度も資源ごとに違う）。")
-    print("  合計が収まるかは自分で確かめること。収まらないなら rb release --join で降りる。")
+        _say(f"    相乗り {join.session} / {join.job}{estimate}")
+    _say("  本ツールは見積もりを足し算しない（単位も尺度も資源ごとに違う）。")
+    _say("  合計が収まるかは自分で確かめること。収まらないなら rb release --join で降りる。")
 
 
 def acquire_join(
@@ -516,12 +534,12 @@ def acquire_join(
         )
         return Acquisition(entry, EXIT_OK, declared=False)
 
-    print(f"相乗りを申告しました: {naming.label(resource_id, entry.display)} / {entry.job}")
-    print(f"  主宣言: {primary.session} / {primary.job}")
+    _say(f"相乗りを申告しました: {naming.label(resource_id, entry.display)} / {entry.job}")
+    _say(f"  主宣言: {primary.session} / {primary.job}")
     if primary.sharing:
-        print(f"  保持者の相乗り方針: {primary.sharing}")
+        _say(f"  保持者の相乗り方針: {primary.sharing}")
     else:
-        print("  保持者は相乗り可否を書いていません。合意が取れているか確認すること")
+        _say("  保持者は相乗り可否を書いていません。合意が取れているか確認すること")
     # **入れたあとに読み直す。** ほぼ同時に入った相手はここで初めて見える。
     _print_occupants(board, resource_id)
     return Acquisition(entry, EXIT_OK, declared=True)
@@ -714,7 +732,12 @@ def _release_after_run(
         if joined:
             # **相乗りの取り下げ忘れは主宣言より危険である。** 幽霊判定が
             # `since < 起動時刻` しか無いため、残ると再起動か --force まで消えない。
-            if board.remove_own_join(resource_id, os.getcwd(), reason=reason) is not None:
+            # **自分が作った申告だけを消す。** nonce を渡さないと祖先フォールバックが
+            # 他セッションの生きた申告を選びうる（cwd だけでは区別できない）。
+            removed_join = board.remove_own_join(
+                resource_id, os.getcwd(), reason=reason, expect_nonce=entry.nonce
+            )
+            if removed_join is not None:
                 print(f"相乗りを取り下げました: {naming.display_default(resource_id)}")
             else:
                 print(
@@ -1685,8 +1708,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         # **run だけは 0 を返さない。** fail-open は「資源アクセスを止めない」原則であって、
         # 「走らなかったジョブを成功と報告してよい」ではない。ここで 0 を返すと、
         # 引数の不備などで 1 度も起動していないのに呼び出し側が成功と読む。
-        if getattr(args, "command", None) == "run":
+        command = getattr(args, "command", None)
+        if command == "run":
             return runner.EXIT_CANNOT_EXECUTE
+        if command == "wait":
+            # **wait の 0 は「宣言が減った」という積極的な意味を持つ。** 内部エラーで
+            # 0 を返すと、1 度も待っていないのに「空いた」と読まれ、使用中の資源を
+            # 掴みにいく。fail-open は「情報が無いなら通す」であって「嘘をつく」ではない。
+            return EXIT_BUSY
         return EXIT_OK
 
 
