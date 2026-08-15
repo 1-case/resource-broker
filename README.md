@@ -1,5 +1,9 @@
 # resource-broker
 
+[![CI](https://github.com/1-case/resource-broker/actions/workflows/ci.yml/badge.svg)](https://github.com/1-case/resource-broker/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.13%2B-blue.svg)](pyproject.toml)
+
 *[English summary](README.en.md)*
 
 **同じマシンで動く複数の Claude Code セッションが、有限資源を取り合わないための掲示板。**
@@ -207,6 +211,21 @@ Claude Code のセッション同士が直接会話できるようになれば�
 - 掲示板や監査ログを**そのまま公開の場に貼らない**（プロジェクト名と作業パスが入る）
 
 掲示板の実体（`board/` `audit/` `*.log`）は `.gitignore` で除外してある。
+
+## どう作られたか
+
+**着想と設計判断は作者（[satorunnlg](https://github.com/satorunnlg)）のもので、
+コード・テスト・文書はすべて Claude Code が書いた。**
+
+「複数セッションで資源を取り合う」という問題設定、資源非依存を貫くという方針、
+deny をやめて注意喚起に留めるという転換、掲示板は全件読むものだという整理 —— これらは
+いずれも作者の判断である。実装は Claude Code（Claude Opus）が行い、レビューは
+独立した Claude エージェントと Codex の二重ループで回した。
+
+設計の多くは**実運用で事故を踏んでから確定した**。表示名が資源 ID を隠していた、
+相乗り可の GPU を諦めて CPU へ逃げたセッションがあった、解放し忘れで 2 時間 48 分
+待たせた、`gpu0` と `GPU0` が別資源になっていた —— [EXPERIMENTS.md](EXPERIMENTS.md) に
+そのすべてが日付つきで残っている。**記録の価値はコードより高いかもしれない。**
 
 ## ライセンス
 

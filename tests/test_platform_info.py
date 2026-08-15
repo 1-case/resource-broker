@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import pytest
+
 from resource_broker import clock, platform_info
 
 #: ``GetTickCount64`` が返しうる 64 bit の値の例（稼働 60 日相当）。
@@ -95,3 +97,83 @@ def test_uptime_sanity_check_keeps_ordinary_values() -> None:
     """正常な範囲の値はそのまま通す。sanity check が実運用を壊さないこと。"""
     assert platform_info._sane_uptime(1.5) == 1.5
     assert platform_info._sane_uptime(platform_info.MAX_UPTIME_S) is not None
+
+
+# --- macOS の起動時刻（実機が無いので注入で検証する） -----------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("{ sec = 1755300000, usec = 123456 } Sat Aug 16 09:00:00 2026", 1755300000),
+        ("{ sec=1755300000, usec=1 }", 1755300000),
+        ("{ sec = 1755300000 }", 1755300000),
+    ],
+)
+def test_boottime_output_is_parsed(text: str, expected: int) -> None:
+    """``sysctl -n kern.boottime`` の出力から epoch 秒を取り出す。"""
+    assert platform_info.parse_boottime(text) == expected
+
+
+@pytest.mark.parametrize("text", ["", "なにこれ", "{ usec = 1 }", None, 123, b"sec = 1"])
+def test_unreadable_boottime_is_not_guessed(text: object) -> None:
+    """読めない出力から値を作らない。**判定材料が無いことは None で表す。**"""
+    assert platform_info.parse_boottime(text) is None
+
+
+def test_darwin_boot_time_is_used_when_injected() -> None:
+    """macOS 経路は起動時刻を直接使う（経過時間からの逆算をしない）。
+
+    macOS には ``/proc/uptime`` が無い。塞がないと boot_time が None を返し続け、
+    幽霊判定 3 根拠のうち**唯一「確定的」な ``since < 起動時刻`` が静かに無効化される**。
+    """
+    epoch = clock.now().timestamp() - 3600  # 1 時間前に起動した
+
+    boot = platform_info.boot_time(boot_epoch=lambda: epoch)
+
+    assert boot is not None
+    assert boot.tzinfo is not None  # 掲示板の時刻は必ずオフセット付き
+    assert abs((clock.now() - boot).total_seconds() - 3600) < 5
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,  # sysctl が無い・失敗した
+        "sec = 1755300000",  # 数値でない
+        0,  # 非正
+        -1,
+        float("nan"),
+        True,  # bool を数値として通さない
+    ],
+)
+def test_a_broken_boot_epoch_yields_no_answer(value: object) -> None:
+    """壊れた値から起動時刻を作らない。
+
+    範囲外を通すと、**生きている宣言が「再起動前の幽霊」として退去されうる**。
+    判定できないときは「退けない」側（None）へ倒す。
+    """
+    assert platform_info.boot_time(boot_epoch=lambda: value) is None
+
+
+def test_a_future_boot_time_is_rejected() -> None:
+    """起動時刻が未来にあるものを受け入れない（時計のずれ・改竄）。"""
+    future = clock.now().timestamp() + 86400
+
+    assert platform_info.boot_time(boot_epoch=lambda: future) is None
+
+
+def test_an_ancient_boot_time_is_rejected() -> None:
+    """10 年より前の起動時刻を受け入れない。"""
+    ancient = clock.now().timestamp() - platform_info.MAX_UPTIME_S - 1
+
+    assert platform_info.boot_time(boot_epoch=lambda: ancient) is None
+
+
+def test_a_raising_boot_epoch_does_not_escape() -> None:
+    """この層は例外を出さない（呼び出し側が fail-open で通せるように）。"""
+
+    def explode() -> object:
+        raise RuntimeError("sysctl が壊れた")
+
+    assert platform_info.boot_time(boot_epoch=explode) is None

@@ -9,8 +9,11 @@
 #   2. **公開リポジトリで self-hosted を使うと、fork からの pull request が
 #      自分のマシン上で任意のコードを実行できる**（GitHub が明示的に警告している）。
 #      「他人に CI を触らせない」を満たすのは、隔離された使い捨ての runner のほうである
-# 移行先は ubuntu-latest + windows-latest の matrix とする（2026-08-14 に一度試し、
-# 両方 green を確認済み。windows-latest は下記の穴も塞ぐ）。
+# 移行先は ubuntu-latest + windows-latest + macos-latest の matrix とする。
+# 2026-08-14 に ubuntu / windows を試して両方 green を確認済み。macos-latest も
+# 公開後なら分数を消費せず回せる（10 倍係数がかかるのは private のときだけである）。
+# macOS の起動時刻取得（sysctl kern.boottime）は実機が無いため注入テストで守っているが、
+# 公開後は実機で回せるようになる。
 #
 # 本ツールは Windows を第一級の対象とするが、プラットフォーム依存部分（boot time 取得・
 # PID の生存確認・プロセスツリーの終了）は platform_info.py と runner.py に隔離してあるため、

@@ -11,7 +11,9 @@
 from __future__ import annotations
 
 import os
+import re
 import socket
+import subprocess
 import sys
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -19,6 +21,7 @@ from datetime import datetime, timedelta
 from . import clock
 
 _WINDOWS = sys.platform == "win32"
+_DARWIN = sys.platform == "darwin"
 
 # Windows API の定数
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -32,6 +35,12 @@ _ERROR_INVALID_PARAMETER = 87
 #: :func:`boot_time` が壊れないことを検証するための注入点である。
 #: CI は Linux で回るため、この経路は注入以外に検証手段が無い。
 TickMillis = Callable[[], object]
+
+#: 起動時刻（epoch 秒）を返すもの。**テストで差し替える。**
+#:
+#: macOS には ``/proc/uptime`` が無いため、そこだけ別経路になる。実機が無い環境
+#: （CI は Linux、開発機は Windows）でも Darwin 経路を検証するための注入点である。
+BootEpoch = Callable[[], object]
 
 #: 起動からの経過時間として受け入れる上限（秒）。約 10 年。
 #:
@@ -79,7 +88,72 @@ def session_id() -> str:
     return ""
 
 
-def boot_time(*, tick_millis: TickMillis | None = None) -> datetime | None:
+#: ``sysctl -n kern.boottime`` の出力から秒を取り出す。
+#: 例: ``{ sec = 1755300000, usec = 123456 } Sat Aug 16 09:00:00 2026``
+#:
+#: **直前に英字が無いことを要求する。** ``usec`` の中の ``sec`` に一致してしまい、
+#: マイクロ秒を起動時刻として読む（テストで踏んだ）。実出力では ``sec`` が先に
+#: 現れるため気づきにくい。
+_BOOTTIME = re.compile(r"(?<![A-Za-z])sec\s*=\s*(\d+)")
+
+
+def parse_boottime(text: object) -> int | None:
+    """``kern.boottime`` の生出力から epoch 秒を取り出す。読めなければ None。
+
+    **解析だけを分けてあるのは、subprocess 無しで検証できるようにするためである。**
+    macOS の実機は CI にも開発機にも無い。
+    """
+    if not isinstance(text, str):
+        return None
+    match = _BOOTTIME.search(text)
+    return int(match.group(1)) if match else None
+
+
+def _darwin_boot_epoch() -> object:
+    """macOS の起動時刻（epoch 秒）。取得できなければ None。
+
+    **macOS には ``/proc/uptime`` が無い。** 塞がないと :func:`boot_time` が None を
+    返し続け、幽霊判定 3 根拠のうち**唯一「確定的」な ``since < 起動時刻`` が
+    静かに無効化される**。壊れ方が静かなのが最も悪い（再起動をまたいだ宣言が
+    ``--force`` でしか消せなくなる）。
+
+    ``sysctl`` は macOS に標準で入っている。無くても失敗は None に畳まれる。
+    """
+    try:
+        completed = subprocess.run(
+            ["sysctl", "-n", "kern.boottime"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_boottime(completed.stdout)
+
+
+def _sane_boot_epoch(seconds: object) -> float | None:
+    """起動時刻（epoch 秒）を sanity check にかける。範囲外なら None。
+
+    :func:`_sane_uptime` と同じ理由である。**範囲外を通すと、生きている宣言を
+    「再起動前の幽霊」として退去させうる。** 未来の起動時刻も弾く。
+    """
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+        return None
+    value = float(seconds)
+    if value != value or value <= 0.0:  # NaN と非正
+        return None
+    present = clock.now().timestamp()
+    if value > present:  # 起動が未来にある
+        return None
+    if present - value > MAX_UPTIME_S:
+        return None
+    return value
+
+
+def boot_time(
+    *, tick_millis: TickMillis | None = None, boot_epoch: BootEpoch | None = None
+) -> datetime | None:
     """このマシンが起動した時刻を返す。取得できなければ None。
 
     掲示板の幽霊判定に使う。エントリの ``since`` がこの時刻より前なら、
@@ -91,12 +165,24 @@ def boot_time(*, tick_millis: TickMillis | None = None) -> datetime | None:
     tick_millis : callable, optional
         起動からの経過ミリ秒を返すもの。渡すと Windows 経路を強制する。
         テスト専用の注入点である（:data:`TickMillis`）。
+    boot_epoch : callable, optional
+        起動時刻（epoch 秒）を返すもの。渡すと macOS 経路を強制する。
+        こちらもテスト専用の注入点である（:data:`BootEpoch`）。
 
     Returns
     -------
     datetime or None
         タイムゾーン付きの起動時刻。取得できなければ None。
     """
+    if boot_epoch is not None or (_DARWIN and tick_millis is None):
+        # macOS だけは起動時刻を直接取れる（経過時間からの逆算より素直である）。
+        try:
+            raw = (boot_epoch or _darwin_boot_epoch)()
+        except Exception:  # noqa: BLE001 - この層は例外を出さない（モジュール docstring）
+            return None
+        seconds = _sane_boot_epoch(raw)
+        return None if seconds is None else datetime.fromtimestamp(seconds).astimezone()
+
     uptime = _uptime_seconds(tick_millis=tick_millis)
     if uptime is None:
         return None

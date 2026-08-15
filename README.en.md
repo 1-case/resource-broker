@@ -1,5 +1,9 @@
 # resource-broker
 
+[![CI](https://github.com/1-case/resource-broker/actions/workflows/ci.yml/badge.svg)](https://github.com/1-case/resource-broker/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.13%2B-blue.svg)](pyproject.toml)
+
 *[日本語版はこちら / Japanese version](README.md) — the Japanese README is canonical.*
 
 **A bulletin board that keeps concurrent Claude Code sessions on one machine from
@@ -188,6 +192,22 @@ Two things are on you:
   working paths.
 
 The board itself (`board/`, `audit/`, `*.log`) is excluded via `.gitignore`.
+
+## How this was built
+
+**The idea and the design calls are the author's ([satorunnlg](https://github.com/satorunnlg));
+every line of code, test and document was written by Claude Code.**
+
+Framing the problem as "concurrent sessions fighting over resources", insisting on resource
+agnosticism, abandoning `deny` in favour of notices, and the reframing that a bulletin board
+is read in full — all of those were the author's calls. Claude Code (Claude Opus) did the
+implementation; review ran as a double loop of an independent Claude agent and Codex.
+
+Most of the design was settled **only after hitting real failures in production use**:
+a display name that hid which resource was held; a session that gave up on a GPU whose holder
+had explicitly allowed sharing; a forgotten release that made another session wait 2 h 48 m;
+`gpu0` and `GPU0` silently becoming different resources. All of it is recorded with dates in
+[EXPERIMENTS.md](EXPERIMENTS.md) (Japanese). **That record may be worth more than the code.**
 
 ## License
 
