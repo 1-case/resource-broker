@@ -1,0 +1,12 @@
+# シェルスクリプトは **必ず LF** で取り出す。
+# Windows で clone すると autocrlf が CRLF に直し、Linux / macOS へ渡ったときに
+# シェバンが `#!/bin/sh\r` になって "bad interpreter" で起動しない。
+# プラグインとして配る以上、取り出す側の OS を選べない。
+bin/rb          text eol=lf
+bin/rb-hook     text eol=lf
+
+# cmd は CRLF を前提にする（古い cmd.exe は LF のみのバッチを誤読することがある）。
+*.cmd           text eol=crlf
+
+# 掲示板のデータと監査ログはテキストとして正規化しない（実行時データ）。
+*.jsonl         -text
