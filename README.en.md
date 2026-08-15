@@ -62,7 +62,23 @@ you can simply redo). A board full of noise dulls the reader's judgement.
 
 ## Install
 
-**Ask Claude Code to do it.** Paste this:
+**Installing it as a plugin is the shortest path** — two lines inside Claude Code:
+
+```
+/plugin marketplace add 1-case/resource-broker
+/plugin install resource-broker@resource-broker
+```
+
+That brings in the three hooks and the `rb` command together. **No `uv tool install` needed**:
+the package has zero dependencies, so the launcher in `bin/` just works.
+
+Hooks are a snapshot taken at session start, so **already-running sessions are unaffected**
+until they restart. The only requirement is Python 3.13+.
+
+<details>
+<summary>Installing by hand instead</summary>
+
+Paste this to Claude Code:
 
 ```
 Install https://github.com/1-case/resource-broker for me.
@@ -77,10 +93,8 @@ Install https://github.com/1-case/resource-broker for me.
 3. Verify that `rb status` works.
 ```
 
-Hooks are a snapshot taken at session start, so **already-running sessions are unaffected**
-until they restart.
-
-Requirements: Python 3.13+ and [uv](https://docs.astral.sh/uv/). There are no dependencies.
+Requires [uv](https://docs.astral.sh/uv/) for this path.
+</details>
 
 ## Use
 

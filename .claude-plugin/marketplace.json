@@ -1,0 +1,28 @@
+{
+  "name": "resource-broker",
+  "owner": {
+    "name": "satorunnlg",
+    "url": "https://github.com/satorunnlg"
+  },
+  "plugins": [
+    {
+      "name": "resource-broker",
+      "source": "./",
+      "description": "同じマシンで動く複数の Claude Code セッションが有限資源を取り合わないための掲示板。使う前に申告させ、他セッションから見えるようにする。",
+      "version": "0.1.0",
+      "author": {
+        "name": "satorunnlg"
+      },
+      "homepage": "https://github.com/1-case/resource-broker",
+      "license": "Apache-2.0",
+      "keywords": [
+        "resource",
+        "coordination",
+        "gpu",
+        "multi-session",
+        "hooks"
+      ]
+    }
+  ],
+  "description": "resource-broker 単体のマーケットプレイス。同じマシンで動く複数の Claude Code セッションが有限資源を取り合わないための掲示板を配る。"
+}

@@ -1,0 +1,14 @@
+{
+  "name": "resource-broker",
+  "displayName": "resource-broker",
+  "version": "0.1.0",
+  "description": "同じマシンで動く複数の Claude Code セッションが有限資源を取り合わないための掲示板。使う前に申告させ、他セッションから見えるようにする。何も止めない / 資源を調べない / 申告を解釈しない。",
+  "author": {
+    "name": "satorunnlg",
+    "url": "https://github.com/satorunnlg"
+  },
+  "homepage": "https://github.com/1-case/resource-broker",
+  "repository": "https://github.com/1-case/resource-broker",
+  "license": "Apache-2.0",
+  "keywords": ["resource", "coordination", "gpu", "multi-session", "hooks"]
+}

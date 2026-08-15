@@ -59,7 +59,22 @@ CPU コア・COM ポート（LiDAR）・外部 API のレート制限・git の�
 
 ## 導入
 
-**Claude Code に頼めばよい。** 以下をそのまま渡す。
+**プラグインとして入れるのが最短である。** Claude Code の中で 2 行打つだけでよい。
+
+```
+/plugin marketplace add 1-case/resource-broker
+/plugin install resource-broker@resource-broker
+```
+
+フック 3 つと `rb` コマンドがまとめて入る。**`uv tool install` は要らない**
+（依存パッケージがゼロなので、`bin/` の起動スクリプトがそのまま動く）。
+
+**既存セッションには効かない**（フック設定は起動時のスナップショット）。反映には再起動が要る。
+
+要件は Python 3.13 以上だけである。依存パッケージは無い。
+
+<details>
+<summary>プラグインを使わず手で入れる場合</summary>
 
 ```
 https://github.com/1-case/resource-broker を導入してください。
@@ -74,9 +89,8 @@ https://github.com/1-case/resource-broker を導入してください。
 3. rb status が動くことを確認する
 ```
 
-**既存セッションには効かない**（フック設定は起動時のスナップショット）。反映には再起動が要る。
-
-要件は Python 3.13 以上と [uv](https://docs.astral.sh/uv/) だけである。依存パッケージは無い。
+この指示文をそのまま Claude Code に渡せばよい。
+</details>
 
 ## 使う
 

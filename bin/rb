@@ -1,0 +1,21 @@
+#!/bin/sh
+# resource-broker の CLI を、インストール無しで起動する。
+#
+# プラグインとして配ったとき、`bin/` は Bash ツールの PATH に載る。ここが動けば
+# `uv tool install` は要らない（依存パッケージがゼロだから成立する）。
+#
+# **python が見つからないときに 0 を返さない。** `rb run` は「走らなかったジョブを
+# 成功と報告しない」という規約を持つ。ここで 0 を返すと、コマンドを 1 度も起動して
+# いないのに成功として扱われる。フック側は非ゼロを黙って無視するので実害は無い。
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
+for py in python3 python py; do
+    if command -v "$py" >/dev/null 2>&1; then
+        exec "$py" "$here/bin/rb.py" "$@"
+    fi
+done
+
+echo "rb: python が見つかりません（resource-broker は Python 3.13 以上を必要とします）" >&2
+exit 127
