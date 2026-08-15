@@ -870,7 +870,67 @@ GPU を掴んだが、その時点で起動時の通知はすでに過去のも�
 調べ方が陳腐化すると「空きに見える」＝危険側に倒れるのに対し、判定表が陳腐化しても
 「一致しなくなる」＝素通しに倒れる。だからこちらは持ってよい。
 
-### Deployment
+### Plugin Distribution
+
+**配布の第一経路は Claude Code のプラグインである。** 手動導入（後述）はフォールバックとして残す。
+
+```
+/plugin marketplace add 1-case/resource-broker
+/plugin install resource-broker@resource-broker
+```
+
+| 置き場 | 役割 |
+|---|---|
+| `.claude-plugin/plugin.json` | プラグインの識別（name / version / license / keywords） |
+| `.claude-plugin/marketplace.json` | 単一プラグインのマーケットプレイス（`source: "./"`） |
+| `hooks/hooks.json` | フック 3 つの登録。`.claude/settings.json` の `hooks` と同じ書式 |
+| `bin/rb`, `bin/rb.cmd` | CLI の起動。**インストール不要**（依存ゼロだから成立する） |
+| `bin/rb-hook`, `bin/rb-hook.cmd` | フックの起動（python の在り処を吸収する） |
+| `bin/rb.py` | `sys.path` に `src` を足して CLI を呼ぶ土台 |
+
+**実測で確認した事実**（Windows + Git Bash、`claude --plugin-dir` 経由）。
+
+- `bin/` は **Bash ツールの PATH に載る**（`command -v rb-hook` がパスを返す）。
+  したがって `uv tool install` は要らない
+- フックは発火する（`SessionStart` の通知を確認）
+- **`${CLAUDE_PLUGIN_ROOT}` は Bash ツールには渡らない**（空になる）。フックのプロセスには渡る。
+  したがって Bash の例でこの変数を使ってはならない
+- 手動登録と併用すると**フックが 2 重に発火する**（掲示板が 2 回出る）
+
+**`PYTHONPATH` を使わない。** 区切り文字が OS で違い（POSIX は `:`、Windows は `;`）、
+Git Bash から Windows の Python を呼ぶ組み合わせで食い違う。`bin/rb.py` が `sys.path` を
+直接触ればその問題が消える。
+
+**python の探索順は `py` → `python3` → `python` で 4 本ともそろえる。** `py` を先に試すのは
+Windows のためである。Windows は `%LOCALAPPDATA%\Microsoft\WindowsApps\` に
+`python.exe` / `python3.exe` の App Execution Alias（0 バイトの実体）を置き PATH に載せる。
+`command -v` / `where` は**成功する**が、起動すると Microsoft Store が開いて 9009 で終わる。
+sh 側はサイズ 0 を弾き、cmd 側は `-c ""` の空実行で本物か確かめる。
+
+**終了コードの方針は `rb` とフックで違う。**
+
+| | python が無い | 子が失敗 |
+|---|---|---|
+| `bin/rb` | **127**（走らなかったジョブを成功と報告しない） | 子の終了コードを素通し |
+| `bin/rb-hook` | **0** | **0**（`exec` しない） |
+
+`rb-hook` が `exec` しないのは意図である。`exec` すると `hooks/*.py` の非ゼロ（古い python の
+`SyntaxError` 等）がそのままフックの終了コードになる。`PreToolUse` の非ゼロは stderr が
+利用者へ提示されるため、**Bash を叩くたびに traceback が出続ける**。プロセス 1 つ分より
+約束（フックは作業を止めない）を守るほうが上位である。
+
+`bin/rb.cmd` は `setlocal enabledelayedexpansion` + `!ERRORLEVEL!` を使う。cmd は `for` の
+本体をまとめて解析するため、遅延展開なしの `%ERRORLEVEL%` は**ループに入る前の値（通常 0）に
+固定される**。実測で確認した（子が 7 で終了しても 0 が返った）。この 1 点で
+「走らなかったジョブを成功と報告しない」が cmd 経路だけ裏返っていた。
+
+`bin/rb` は `${1+"$@"}` を使う。macOS の `/bin/sh` は bash 3.2 で、`set -u` 下の `"$@"` が
+引数 0 個のとき unbound variable になる（`rb` だけ打つと落ちる）。
+
+sh ランチャは `PYTHONUTF8=1` を立てる。Windows の Python はコンソールのコードページで書くが、
+Git Bash の端末は UTF-8 なので日本語が化ける（実測）。cmd 側は触らない。
+
+### Deployment (Manual Fallback)
 
 他セッションから使えるようにするには 2 つが要る。掲示板自体はマシン全体で 1 箇所にあるため、
 **共有の仕組みは最初から出来ている**。足りないのは「呼べること」と「気づくこと」である。
