@@ -1,20 +1,26 @@
 #!/bin/sh
 # resource-broker の CLI を、インストール無しで起動する。
 #
-# プラグインとして配ったとき、`bin/` は Bash ツールの PATH に載る。ここが動けば
-# `uv tool install` は要らない（依存パッケージがゼロだから成立する）。
-#
 # **python が見つからないときに 0 を返さない。** `rb run` は「走らなかったジョブを
 # 成功と報告しない」という規約を持つ。ここで 0 を返すと、コマンドを 1 度も起動して
-# いないのに成功として扱われる。フック側は非ゼロを黙って無視するので実害は無い。
+# いないのに成功として扱われる。
 set -eu
 
-here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd) || {
+    echo "rb: 自分の場所を特定できません" >&2
+    exit 127
+}
 
-for py in python3 python py; do
-    if command -v "$py" >/dev/null 2>&1; then
-        exec "$py" "$here/bin/rb.py" "$@"
-    fi
+# 探索順は bin/ の 4 本すべてでそろえる。**py を先に試す**のは Windows のためである。
+# Windows は %LOCALAPPDATA%\Microsoft\WindowsApps\ に python.exe / python3.exe の
+# App Execution Alias（0 バイトの実体）を置き、PATH に載せている。command -v は
+# 成功するが、起動すると Microsoft Store が開いて 9009 で終わる。サイズで弾く。
+for py in py python3 python; do
+    path=$(command -v "$py" 2>/dev/null) || continue
+    [ -s "$path" ] || continue
+    # ${1+"$@"} を使う。macOS の /bin/sh は bash 3.2 で、set -u 下の "$@" が
+    # 引数 0 個のとき unbound variable になる（`rb` だけ打つと落ちる）。
+    exec "$py" "$here/bin/rb.py" ${1+"$@"}
 done
 
 echo "rb: python が見つかりません（resource-broker は Python 3.13 以上を必要とします）" >&2

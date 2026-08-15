@@ -1,26 +1,35 @@
 #!/bin/sh
 # フックを、python の在り処を気にせず起動する。
 #
-# 直に `python hooks/xxx.py` と書けない理由が 2 つある。macOS には `python` が無い
-# ことがあり（`python3` だけ）、Windows では `python3` が無い。ここで吸収する。
+# **必ず 0 で戻る。** フックはユーザーの作業を止めてはならない（CLAUDE.md「Fail-Open」）。
+# rb 本体と方針が違うのは、フックが「注意を出すだけ」であり、出せなかったことが
+# 作業の成否に影響しないためである。
 #
-# **失敗しても 0 で戻る。** フックはユーザーの作業を止めてはならない
-# （CLAUDE.md「Fail-Open」）。`rb` 本体と方針が違うのは、フックが「注意を出すだけ」で
-# あり、出せなかったことが作業の成否に影響しないためである。
+# **exec しない。** exec すると hooks/*.py の非ゼロ（古い python の SyntaxError、
+# MemoryError 等）がそのままフックの終了コードになり、この約束が破れる。
+# PreToolUse の非ゼロは stderr がユーザーへ提示されるので、Bash を叩くたびに
+# traceback が出続けることになる。プロセス 1 つ分より約束を守るほうが上位である。
 set -u
 
 name=${1:-}
-if [ -z "$name" ]; then
-    exit 0
-fi
+case "$name" in
+    "" | *[!a-z0-9_]*) exit 0 ;;
+esac
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd) || exit 0
 script="$here/hooks/$name.py"
 [ -f "$script" ] || exit 0
 
-for py in python3 python py; do
-    if command -v "$py" >/dev/null 2>&1; then
-        exec "$py" "$script"
-    fi
+# Git Bash から Windows の python を呼ぶとき、POSIX パスは開けない。通常は MSYS の
+# argv 変換が効くが、MSYS2_ARG_CONV_EXCL を設定している環境では効かない。
+if command -v cygpath >/dev/null 2>&1; then
+    script=$(cygpath -w "$script") || exit 0
+fi
+
+for py in py python3 python; do
+    path=$(command -v "$py" 2>/dev/null) || continue
+    [ -s "$path" ] || continue
+    "$py" "$script" || true
+    exit 0
 done
 exit 0
