@@ -112,6 +112,45 @@ free text, so spellings drift — `GPU0` and `gpu0` are *different resources* �
 lookup silently answers "free" while someone holds the other spelling. This actually happened:
 a job held `gpu0` for 7.3 hours while `rb status GPU0` reported it free.
 
+## The cost (it eats context every turn)
+
+This tool **interposes on every prompt and every Bash call**. Here is what you pay, not just
+what you get.
+
+| Hook | Fires | Injection |
+|---|---|---|
+| `UserPromptSubmit` | **every prompt** | ~40 chars when nothing is declared; one line per declaration otherwise, capped at 8 entries / 1200 bytes |
+| `PreToolUse`(Bash) | only Bash commands matching a small pattern table | exits immediately on no match |
+| `SessionStart` | once per session | the longest, since it carries the usage explanation |
+
+**Only `UserPromptSubmit` accumulates turn after turn.** It is deliberately minimal — the usage
+explanation was moved to `SessionStart`, cutting it from 182 to 45 characters — but it is not
+zero, and a long conversation pays it once per turn.
+
+You pay latency too. A hook's floor is Python's startup (measured 68-75 ms on an idle machine);
+the hook's own work is lost in the noise. Every Bash call costs that.
+
+**Whether it is worth it depends entirely on how often your resources actually collide.**
+If you run one session at a time, you pay and get nothing. It pays off only when several
+sessions share one machine's resources and a collision costs you hours of rework.
+
+## Why it still matters once agents can talk to each other
+
+If Claude Code sessions could message each other directly, would this board become obsolete?
+**I don't think so.**
+
+- **Communication needs something to talk *about*.** Knowing who currently holds the GPU
+  requires shared state somewhere. The board is that state; messages flow on top of it.
+- **It works without a live counterpart.** The board is readable whether the other session
+  crashed, or hasn't started yet. Messaging assumes someone is alive to answer.
+- **It persists asynchronously.** "Started at 19:05, expected to take 9 hours" stays there
+  without anyone asking. A conversation only exists for the two parties who had it.
+- **Humans can read it.** `rb status` is for people too.
+
+What changes when messaging arrives is how you *wait*: instead of `rb wait` polling for the
+holder set to shrink, you identify the holder from the board and ask them directly.
+**The board isn't replaced — it becomes what supplies the reason to reach out.**
+
 ## Design notes
 
 - **Measurement is treated asymmetrically.** "Busy" is decisive on its own. "Free" **never**
