@@ -97,7 +97,7 @@ def label(resource_id: str, display: str | None = None) -> str:
     置き換えるものではない。置き換えを許すと、掲示板を読んだ側が
     **その宣言がどの資源を押さえているのか判断できなくなる。**
 
-    実運用で ``display`` にジョブ名（``malm E017 学習``）が入り、一覧と
+    実運用で ``display`` にジョブ名（``E017 学習``）が入り、一覧と
     フックの通知から ``GPU0`` の文字が消えた。取得の排他は資源 ID で効いていたため
     衝突は起きなかったが、GPU を使おうとする側は「見覚えのないジョブ名」しか
     見えず、空きだと誤読しうる状態だった。掲示板は読まれて初めて意味を持つので、
@@ -113,7 +113,7 @@ def label(resource_id: str, display: str | None = None) -> str:
     Returns
     -------
     str
-        ``GPU0`` または ``GPU0（malm E017 学習）``。
+        ``GPU0`` または ``GPU0（E017 学習）``。
     """
     base = display_default(resource_id)
     text = (display or "").strip()

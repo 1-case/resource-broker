@@ -30,7 +30,10 @@ GPU0                     使用中    実測で使用を確認、または宣言
 
 The character of this tool is easiest to see from what it refuses to do.
 
-- **It never inspects a resource.** No `nvidia-smi`, no serial-port probing, nothing.
+- **It never inspects a resource.** No `nvidia-smi`, no serial-port probing — there is no
+  branch on resource ID anywhere in the source. (It does read OS-level facts about the
+  *declarer*: machine boot time and whether a PID is alive. Those are how a stale declaration
+  is proven stale; they are not probes of any resource.)
   Investigating is the session's job. The tool only makes the session *declare what it saw*
   and stamps a machine-generated timestamp on it.
 - **It never blocks a command.** The hooks print a notice; they never `deny`.
@@ -43,8 +46,14 @@ The character of this tool is easiest to see from what it refuses to do.
   information: all exit 0. It reports "busy" only when it positively confirmed busy.
 
 The consequence: **adding a resource requires no code change.** In practice, resources nobody
-designed for — CPU cores, a serial port (LiDAR), an external API rate limit, a SQLite file,
-a TCP port, a git working tree — all landed on the board unmodified.
+designed for — CPU cores, a serial port (LiDAR), an external API rate limit,
+a git working tree — all landed on the board unmodified.
+
+**But it cannot stop anyone who does not declare.** A session that grabs a resource without
+going through the board — or any non-Claude-Code process — is invisible to this tool and
+cannot be stopped. **This has been observed** (a job held the GPU while the board was empty).
+All that can be claimed is "collisions are avoidable if everyone follows the convention".
+It does not make accidents impossible. Having chosen not to enforce, that is by design.
 
 ## What counts as a resource
 
@@ -173,6 +182,18 @@ What changes when messaging arrives is how you *wait*: instead of `rb wait` poll
 holder set to shrink, you identify the holder from the board and ask them directly.
 **The board isn't replaced — it becomes what supplies the reason to reach out.**
 
+`PreToolUse` **prints nothing unless a pattern table (`guard.json`) exists**, and none is
+shipped — so out of the box the third hook stays silent. You decide what deserves a notice:
+
+```jsonc
+// %LOCALAPPDATA%
+esource-broker\guard.json  (elsewhere: ~/.resource-broker/guard.json)
+{ "schema": 1, "patterns": [
+    { "pattern": "run_e\d+\.py", "resource": "GPU0", "note": "training scripts" } ] }
+```
+
+A stale table is harmless: it stops matching, so notices stop — nothing is ever blocked.
+
 ## Design notes
 
 - **Measurement is treated asymmetrically.** "Busy" is decisive on its own. "Free" **never**
@@ -184,8 +205,8 @@ holder set to shrink, you identify the holder from the board and ask them direct
   dead) all three together, or an explicit `release` / `--force`.
 - **Every timestamp is machine-generated.** An LLM is never asked to write or estimate a time.
 - **Exclusion rests on a nonce compare-and-swap, not on a lock.** The lock is a performance
-  optimization; correctness is identical whether or not it is acquired. Verified by racing
-  12 real processes: exactly one wins.
+  optimization; correctness is identical whether or not it is acquired. Verified end-to-end by racing
+  5 real processes against one board: exactly one wins.
 - **One file per resource.** Damage stays local and `O_EXCL` settles acquisition races.
 
 Design rationale lives in [DESIGN.md](DESIGN.md); the record of failures actually hit — which
@@ -193,6 +214,13 @@ is arguably more useful than the code — lives in [EXPERIMENTS.md](EXPERIMENTS.
 Both are in Japanese.
 
 ## Trust boundary and security
+
+The board and the audit log live in **`%LOCALAPPDATA%
+esource-broker\`** (`~/.resource-broker/`
+elsewhere); `RESOURCE_BROKER_HOME` moves them. They hold `board/` (declarations), `audit/`
+(the audit log) and `logs/` (`rb run` output), and are **never created inside the repository**.
+`logs/` is pruned after 7 days; **`audit/` is never pruned** (`rb wait` appends a line every
+10 seconds, so it grows monotonically). Delete it by hand when you no longer need it.
 
 **The board is plaintext and is not encrypted.** Every session that reads or writes it runs as
 the same OS user on the same machine, so any process that can read the ciphertext can read the
@@ -213,8 +241,10 @@ The board itself (`board/`, `audit/`, `*.log`) is excluded via `.gitignore`.
 
 ## How this was built
 
-**The idea and the design calls are the author's ([satorunnlg](https://github.com/satorunnlg));
-every line of code, test and document was written by Claude Code.**
+**The problem framing and the design calls are the author's
+([satorunnlg](https://github.com/satorunnlg)); the code, tests and documents were drafted by
+Claude Code (Claude Opus) under the author's direction, review and selection.**
+The author is responsible for what ships.
 
 Framing the problem as "concurrent sessions fighting over resources", insisting on resource
 agnosticism, abandoning `deny` in favour of notices, and the reframing that a bulletin board
@@ -228,5 +258,8 @@ had explicitly allowed sharing; a forgotten release that made another session wa
 [EXPERIMENTS.md](EXPERIMENTS.md) (Japanese). **That record may be worth more than the code.**
 
 ## License
+
+This is an unofficial, third-party tool and is not affiliated with or endorsed by
+Anthropic. Claude and Claude Code are trademarks of Anthropic, PBC.
 
 Apache License 2.0 ([LICENSE](LICENSE)).

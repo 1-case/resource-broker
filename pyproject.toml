@@ -7,13 +7,19 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.13"
 dependencies = []
+authors = [{ name = "satorunnlg" }]
+
+[project.urls]
+Homepage = "https://github.com/1-case/resource-broker"
+Repository = "https://github.com/1-case/resource-broker"
+Issues = "https://github.com/1-case/resource-broker/issues"
 
 [project.scripts]
 resource-broker = "resource_broker.cli:main"
 rb = "resource_broker.cli:main"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]  # PEP 639 の license / license-files 対応
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
@@ -27,8 +33,7 @@ target-version = "py313"
 line-length = 99
 # src レイアウトで `resource_broker` を first-party と認識させる（import 並び順の判定に使う）
 src = ["src"]
-# 除外は置かない。tools/speak.py は folnet で育った版を引き継いでおり共有バンドルとは既に別物で、
-# hooks も含めて lint / format を通す（folnet と同じ方針）
+# 除外は置かない。tools/ と hooks/ も含めて lint / format を通す。
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
