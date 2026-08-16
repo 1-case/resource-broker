@@ -880,8 +880,10 @@ def test_the_wrapper_only_removes_the_join_it_created(
     """
     hold(tmp_path)
     board = Board(tmp_path)
-    ancestor = os.getcwd()
-    mine = os.path.join(ancestor, "配下")
+    # **リポジトリを汚さない。** 以前ここで `os.getcwd()` の配下にディレクトリを作っており、
+    # 作業ツリーに空フォルダが残った。テストが書いてよいのは tmp_path の中だけである。
+    ancestor = str(tmp_path / "session")
+    mine = str(tmp_path / "session" / "配下")
     os.makedirs(mine, exist_ok=True)
 
     theirs = build_entry(
