@@ -12,3 +12,10 @@ build/
 board/
 audit/
 *.log
+
+# 読み上げヘルパ（VOICEVOX 前提の日本語 TTS）。**本ツールとは無関係な開発運用の道具**で、
+# 掲示板の実装にも配布物にも関わらない。手元には残す（作者の運用で使い続ける）が、
+# 公開物には含めない。
+tools/speak.py
+tools/speak_dict.json
+tests/test_speak.py
