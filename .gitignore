@@ -19,3 +19,13 @@ audit/
 tools/speak.py
 tools/speak_dict.json
 tests/test_speak.py
+
+# 作者の作業文書。**公開物には含めない**（手元には残す）。
+# CLAUDE.md はこのリポジトリでの Claude Code の運用規則、STATUS.md はセッションのしおり、
+# EXPERIMENTS.md は時系列の作業ログ、.claude/ は skill とフックの設定である。
+# いずれも「普通のリポジトリ」には無いものなので、公開の形からは外す。
+# 設計判断そのものは docs/DESIGN.md に集約してある。
+CLAUDE.md
+STATUS.md
+EXPERIMENTS.md
+.claude/
