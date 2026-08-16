@@ -1,22 +1,24 @@
 @echo off
-rem resource-broker の CLI を、インストール無しで起動する（cmd.exe 用）。詳細は bin/rb を参照。
+rem Launch the resource-broker CLI without installing it (cmd.exe). See bin/rb for the rationale.
 rem
-rem **enabledelayedexpansion を使わない。** 使うと %* の展開結果が `!...!` として再走査され、
-rem 引数に含まれる `!` が変数展開されて**痕跡なく消える**。--observed は本ツール唯一の
-rem 強制点であり、そこが黙って壊れる（`--observed "0MiB! まだ空き!"` の中身が失われる）。
-rem 終了コードは、for を抜けてから素の %ERRORLEVEL% を返せば正しく取れる。
-rem （for の本体内では %ERRORLEVEL% がブロック解析時に固定される。実測で確認済み。）
+rem ASCII only. cmd.exe reads batch files in the console code page (cp932 on Japanese
+rem Windows), so UTF-8 comments get mangled and stray bytes are executed as commands.
+rem
+rem Do NOT use `setlocal enabledelayedexpansion`: `%*` is expanded into the block first and
+rem then rescanned for `!...!`, so a `!` inside an argument is silently eaten. `--observed`
+rem is the one thing this tool enforces; it must not break quietly.
+rem Reading %ERRORLEVEL% after the loop (not inside it) returns the real exit code.
 setlocal
 set "RBPY="
 for %%P in (py.exe python3.13.exe python3.12.exe python3.11.exe python3.exe python.exe) do (
     if not defined RBPY (
-        rem Microsoft Store の App Execution Alias は 0 バイトの実体で where に当たるが、
-        rem 起動すると Store が開いて 9009 で終わる。版を聞いて本物かどうか確かめる。
+        rem A Microsoft Store alias is a 0-byte stub that `where` finds but cannot run.
+        rem Asking for the version proves it is real and new enough in one step.
         where %%P >nul 2>&1 && %%P -c "import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)" >nul 2>&1 && set "RBPY=%%P"
     )
 )
 if not defined RBPY (
-    echo rb: Python 3.11 以上が見つかりません 1>&2
+    echo rb: no Python 3.11+ found 1>&2
     exit /b 127
 )
 %RBPY% "%~dp0rb.py" %*
