@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -317,12 +316,52 @@ def test_japanese_from_rb_survives(tmp_path: Path) -> None:
 # --- fail-open ------------------------------------------------------------------
 
 
-def test_missing_rb_is_silent(tmp_path: Path) -> None:
-    """``rb`` が入っていなくても、静かに 0 で通す。"""
+def test_missing_rb_still_delivers_the_board(tmp_path: Path) -> None:
+    """``rb`` が入っていなくても掲示板と使い方を届ける（exit 0 は保つ）。"""
+    declare(tmp_path, "GPU0", job="E059 eval")
     result = run_hook(home=tmp_path, path=str(tmp_path / "何も無い"))
 
     assert result.returncode == 0
-    assert result.stdout.strip() == ""
+    assert "GPU0" in result.stdout
+    assert "rb run" in result.stdout
+
+
+def test_the_board_can_be_read_without_rb(tmp_path: Path) -> None:
+    """``rb`` を経ずに掲示板を直接読める（最後の砦）。
+
+    ``rb`` が動かない環境（Python が古い、PATH に載っていない）でも、掲示板の中身と
+    使い方は届けなければならない。ここで黙ると、このフックが唯一配っている使い方が
+    丸ごと消え、しかも fail-open なので誰も気づかない。実際に WSL 上のプラグイン導入で
+    その状態を実測した。
+    """
+    declare(tmp_path, "GPU0", job="E059 eval")
+    module = load_hook_module()
+    os.environ["RESOURCE_BROKER_HOME"] = str(tmp_path)
+    try:
+        rows = module.read_entries_directly()
+    finally:
+        os.environ.pop("RESOURCE_BROKER_HOME", None)
+
+    assert rows is not None
+    assert len(rows) == 1
+    assert rows[0]["resource"] == normalize("GPU0")
+    assert rows[0]["holder"]["job"] == "E059 eval"
+    assert rows[0]["occupied"] is True
+
+
+def test_reading_the_board_directly_survives_corruption(tmp_path: Path) -> None:
+    """壊れたファイルがあっても飛ばして読む（例外を出さない）。"""
+    declare(tmp_path, "GPU0", job="E059 eval")
+    (tmp_path / "board" / "壊れている.json").write_text("{ これは JSON ではない", encoding="utf-8")
+    module = load_hook_module()
+    os.environ["RESOURCE_BROKER_HOME"] = str(tmp_path)
+    try:
+        rows = module.read_entries_directly()
+    finally:
+        os.environ.pop("RESOURCE_BROKER_HOME", None)
+
+    assert rows is not None
+    assert len(rows) == 1  # 壊れた 1 件は飛ばし、正常な 1 件は読めている
 
 
 def make_fake_rb(directory: Path, payload: str, code: int = 0) -> str:
@@ -351,13 +390,20 @@ def test_broken_output_does_not_break_startup(tmp_path: Path, payload: str) -> N
     assert result.returncode == 0
 
 
-def test_failing_rb_is_silent(tmp_path: Path) -> None:
-    """``rb`` が異常終了しても黙って通す。"""
-    payload = json.dumps({"resources": [{"display": "GPU0", "free": False}]}, ensure_ascii=False)
-    result = run_hook(home=tmp_path, path=make_fake_rb(tmp_path / "bin", payload, code=1))
+def test_failing_rb_still_delivers_the_board(tmp_path: Path) -> None:
+    """``rb`` が異常終了しても**黙らない**。掲示板を直接読んで届ける。
+
+    以前はここで黙っていた。だが**このフックは唯一「使い方」を配る場所**であり、
+    黙るとそれが丸ごと消える。しかも fail-open なので誰も気づかない
+    （CLAUDE.md「Silence Is Not Success」）。実際、WSL 上のプラグイン導入で
+    ``rb`` が解決できず、このフックだけが何も出さない状態を実測した。
+    """
+    declare(tmp_path, "GPU0", job="E059 eval")
+    result = run_hook(home=tmp_path, path=make_fake_rb(tmp_path / "bin", "", code=1))
 
     assert result.returncode == 0
-    assert result.stdout.strip() == ""
+    assert "GPU0" in result.stdout, "掲示板の内容が届いていない"
+    assert "rb run" in result.stdout, "使い方が届いていない"
 
 
 def test_corrupt_board_does_not_break_startup(tmp_path: Path) -> None:

@@ -22,13 +22,17 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd) || {
 PYTHONUTF8=1
 export PYTHONUTF8
 
-for py in py python3 python; do
+# **「見つかった最初の python」ではなく「使える python」を選ぶ。** 別プロジェクトの venv が
+# 有効だと python3 がそちらに解決される（実測: WSL で ~/django-mfa/.venv の 3.10 に当たった）。
+# 版付きの名前も候補に入れ、実際に 3.11 以上かを聞いてから採用する。
+for py in python3.13 python3.12 python3.11 py python3 python; do
     path=$(command -v "$py" 2>/dev/null) || continue
     [ -s "$path" ] || continue
+    "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null || continue
     # ${1+"$@"} を使う。macOS の /bin/sh は bash 3.2 で、set -u 下の "$@" が
     # 引数 0 個のとき unbound variable になる（`rb` だけ打つと落ちる）。
     exec "$py" "$here/bin/rb.py" ${1+"$@"}
 done
 
-echo "rb: python が見つかりません（resource-broker は Python 3.13 以上を必要とします）" >&2
+echo "rb: python が見つかりません（resource-broker は Python 3.11 以上を必要とします）" >&2
 exit 127

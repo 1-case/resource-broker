@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/1-case/resource-broker/actions/workflows/ci.yml/badge.svg)](https://github.com/1-case/resource-broker/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.13%2B-blue.svg)](pyproject.toml)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
 
 *[English summary](README.en.md)*
 
@@ -81,7 +81,7 @@ Claude Code 以外のプロセスも、本ツールからは見えないし止�
 消さないとフックが 2 重に発火し、毎ターンの注入が 2 倍になる。掲示板の内容も 2 回続けて
 出るため、読む側が「別の資源が 2 つある」と誤読しうる（実測で確認した）。
 
-要件は Python 3.13 以上だけである。依存パッケージは無い。
+要件は Python 3.11 以上だけである。依存パッケージは無い。
 
 <details>
 <summary>プラグインを使わず手で入れる場合</summary>

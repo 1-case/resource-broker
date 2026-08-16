@@ -13,12 +13,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# **import の前に版を確かめる。** macOS の /usr/bin/python3 は 3.9、Debian 12 は 3.11 で、
-# そのまま import すると `from enum import StrEnum` が ImportError になり、利用者が受け取るのは
-# 内部を指す生の traceback である。原因（python が古い）にたどり着けない。
-if sys.version_info < (3, 13):
+# **import の前に版を確かめる。** 下限は StrEnum が入った 3.11 である。それより古い
+# python（macOS の /usr/bin/python3 は 3.9、Ubuntu 22.04 は 3.10）でそのまま import すると
+# `from enum import StrEnum` が ImportError になり、利用者が受け取るのは内部を指す生の
+# traceback である。原因（python が古い）にたどり着けない。
+if sys.version_info < (3, 11):
     sys.stderr.write(
-        f"rb: Python 3.13 以上が要ります"
+        f"rb: Python 3.11 以上が要ります"
         f"（見つかったのは {sys.version.split()[0]}: {sys.executable}）\n"
     )
     raise SystemExit(127)

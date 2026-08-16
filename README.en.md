@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/1-case/resource-broker/actions/workflows/ci.yml/badge.svg)](https://github.com/1-case/resource-broker/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.13%2B-blue.svg)](pyproject.toml)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
 
 *[日本語版はこちら / Japanese version](README.md) — the Japanese README is canonical.*
 
@@ -82,7 +82,7 @@ That brings in the three hooks and the `rb` command together. **No `uv tool inst
 the package has zero dependencies, so the launcher in `bin/` just works.
 
 Hooks are a snapshot taken at session start, so **already-running sessions are unaffected**
-until they restart. The only requirement is Python 3.13+.
+until they restart. The only requirement is Python 3.11+.
 
 **If you installed by hand before, remove the three rb hooks from `~/.claude/settings.json` first.**
 Otherwise every hook fires twice, doubling the per-turn injection and printing the board twice

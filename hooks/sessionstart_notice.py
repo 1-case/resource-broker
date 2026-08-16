@@ -24,6 +24,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 #: ``rb status`` の待ち時間。超えたら黙って諦める。
 TIMEOUT_S = 5.0
@@ -105,30 +106,115 @@ USAGE = """**何を資源として宣言するかの基準**: その処理が他
 作業を始めるときも読むこと（先に誰かが触っていれば別の進め方を選べる）。"""
 
 
+def board_root() -> Path:
+    """掲示板のルートを返す。本体の platform_info と同じ規則。
+
+    :func:`clip` と同じ理由で、各フックへ意図的に重複させてある（フックは他プロジェクトから
+    素の ``python`` で単体起動されるため、互いを import できない）。
+    """
+    override = os.environ.get("RESOURCE_BROKER_HOME")
+    if override:
+        return Path(override)
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "resource-broker"
+    return Path.home() / ".resource-broker"
+
+
+def rb_candidates() -> list[list[str]]:
+    """``rb status --json`` を起動する argv の候補を、確からしい順に返す。
+
+    **素の ``rb`` だけに頼ってはならない。** プラグインとして入れた場合、``bin/`` が
+    PATH に載るのは Claude Code の **Bash ツール**の中だけで、フックのプロセスに
+    載る保証は無い。実際、WSL 上のプラグイン導入で ``rb`` が解決できず、
+    **このフックだけが黙って何も出さない**状態を実測した（同じセッションで
+    ``UserPromptSubmit`` は出ていた。あちらは掲示板を直接読むためである）。
+
+    ``CLAUDE_PLUGIN_ROOT`` はフックのプロセスには環境変数として渡る（Bash ツールには
+    渡らない）。それが無ければ自分の隣を見る。``sys.executable`` を使うのは、
+    このフックを起動した python がそのまま使えるからである。
+    """
+    argv: list[list[str]] = []
+    root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    bases = [Path(root)] if root else []
+    bases.append(Path(__file__).resolve().parent.parent)
+    for base in bases:
+        launcher = base / "bin" / "rb.py"
+        if launcher.is_file():
+            argv.append([sys.executable, str(launcher), "status", "--json"])
+    argv.append(["rb", "status", "--json"])
+    return argv
+
+
 def fetch_status() -> list[dict[str, object]] | None:
     """``rb status --json`` を呼んで資源の一覧を返す。取れなければ None。"""
-    try:
-        completed = subprocess.run(
-            ["rb", "status", "--json"],
-            capture_output=True,
-            text=True,
-            encoding=ENCODING,
-            errors="replace",
-            timeout=TIMEOUT_S,
-            check=False,
-            env=child_environment(),
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if completed.returncode != 0 or not completed.stdout:
-        return None
+    for command in rb_candidates():
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding=ENCODING,
+                errors="replace",
+                timeout=TIMEOUT_S,
+                check=False,
+                env=child_environment(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if completed.returncode != 0 or not completed.stdout:
+            continue
+        try:
+            payload = json.loads(completed.stdout)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        resources = payload.get("resources") if isinstance(payload, dict) else None
+        if isinstance(resources, list):
+            return resources
+    return None
 
+
+def read_entries_directly() -> list[dict[str, object]] | None:
+    """``rb`` を経ずに掲示板のファイルを直接読む。**最後の砦。**
+
+    ``rb`` が動かない環境（Python が古い、PATH に載っていない）でも、**使い方の説明と
+    掲示板の中身は届けなければならない**。ここで黙ると、このフックが唯一配っている
+    使い方が丸ごと消える。しかも fail-open なので誰も気づかない——
+    CLAUDE.md「Silence Is Not Success」が戒めている壊れ方そのものである。
+
+    ``rb status --json`` と同じ形（``resource`` / ``holder`` / ``since`` …）に整えて返す。
+    ただし**判定（幽霊かどうか）はできない**。ここは資源の状態を判断する場所ではなく、
+    「誰が何を宣言しているか」をそのまま見せる場所である。
+    """
+    directory = board_root() / "board"
     try:
-        payload = json.loads(completed.stdout)
-    except (json.JSONDecodeError, ValueError):
+        paths = sorted(directory.glob("*.json"))
+    except OSError:
         return None
-    resources = payload.get("resources") if isinstance(payload, dict) else None
-    return resources if isinstance(resources, list) else None
+    rows: list[dict[str, object]] = []
+    for path in paths:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        rows.append(
+            {
+                "resource": data.get("resource"),
+                "display": data.get("display"),
+                "holder": data.get("holder"),
+                "since": data.get("since"),
+                "log": data.get("log"),
+                "observed": data.get("observed"),
+                "eta": data.get("eta"),
+                "usage": data.get("usage"),
+                "sharing": data.get("sharing"),
+                "occupied": True,
+                "joins": [],
+            }
+        )
+    return rows
 
 
 def clip(value: object, limit: int) -> str:
@@ -316,9 +402,22 @@ def main() -> int:
 
     try:
         resources = fetch_status()
+        degraded = False
         if resources is None:
-            return 0  # rb が無い・壊れている。黙って通す
-        emit(build_notice(resources))
+            # **黙らない。** ここはこのフックが唯一「使い方」を配る場所である。
+            resources = read_entries_directly()
+            degraded = True
+        if resources is None:
+            return 0  # 掲示板そのものが読めない。これは本当に情報が無い
+        notice = build_notice(resources)
+        if degraded:
+            notice += (
+                "\n注意: rb コマンドを起動できませんでした"
+                "（PATH に無い、または Python が 3.13 未満）。\n"
+                "掲示板は直接読んでいるので上の内容は正しいが、rb status / rb run は"
+                "打てない状態である。"
+            )
+        emit(notice)
     except Exception:  # noqa: BLE001 - fail-open。起動を妨げない
         return 0
     return 0

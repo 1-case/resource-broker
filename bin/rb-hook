@@ -33,6 +33,7 @@ fi
 PYTHONUTF8=1
 export PYTHONUTF8
 
+# フックは stdlib のみなので古い python でも動く。版は問わない。
 for py in py python3 python; do
     path=$(command -v "$py" 2>/dev/null) || continue
     [ -s "$path" ] || continue
