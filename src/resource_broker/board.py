@@ -648,7 +648,13 @@ class Board:
         )
 
     def _capture_and_remove(
-        self, path: Path, *, expect_nonce: str, resource_id: str, reason: str
+        self,
+        path: Path,
+        *,
+        expect_nonce: str,
+        resource_id: str,
+        reason: str,
+        audit_as: str | None = "removed",
     ) -> RemovalResult:
         """**捕まえてから確かめて消す**（CAS の 2〜3 段目）。先読みは呼び出し側の仕事。
 
@@ -684,7 +690,12 @@ class Board:
             # 掲示板からは既に消えている（名前を外した）。残骸は掲示板に載らない名前なので
             # 実害は無いが、消せなかった事実は残す。
             self.audit("tombstone_left", resource=resource_id, error=error)
-        self.audit("removed", resource=resource_id, reason=reason)
+        # **相乗りの取り下げでは書かない。** `removed` は rb history と audit_report の
+        # 双方で**主宣言の解放**として読まれる。相乗り 1 人の離脱が保持者の claimed を
+        # 閉じてしまい、まだ走っている宣言が「解放済み」に見える（掲示板は正しいのに
+        # 監査だけが嘘をつく）。呼び出し側が join_removed を書くのでここは黙る。
+        if audit_as:
+            self.audit(audit_as, resource=resource_id, reason=reason)
         return RemovalResult.REMOVED
 
     def _restore(self, tombstone: Path, path: Path, resource_id: str) -> None:
@@ -989,6 +1000,7 @@ class Board:
                     expect_nonce=entry.nonce,
                     resource_id=entry.resource,
                     reason="再起動をまたいだ相乗り",
+                    audit_as=None,  # join_stale_removed を呼び出し側が書く
                 )
                 if removed is RemovalResult.REMOVED:
                     self.audit("join_stale_removed", resource=entry.resource, since=entry.since)
@@ -1090,13 +1102,21 @@ class Board:
 
         path, entry = chosen
 
-        if expect_nonce:
-            # **捕まえてから確かめて消す（CAS）。** 読んでから消すまでの間に、別プロセスが
-            # 同じ名前を消して作り直しうる。無条件の unlink は、そこで**新しい生きた申告**を
-            # 消す。同じ競合を `_load_joins` では塞いでいるのに、利用者が実際に通る経路
-            # （`rb release --join` と `rb run --join` の後始末）だけ素通しだった。
+        # **捕まえてから確かめて消す（CAS）。** 読んでから消すまでの間に、別プロセスが
+        # 同じ名前を消して作り直しうる。無条件の unlink は、そこで**新しい生きた申告**を
+        # 消す。同じ競合を `_load_joins` では塞いでいるのに、利用者が実際に通る経路
+        # （`rb release --join` と `rb run --join` の後始末）だけ素通しだった。
+        #
+        # **分岐は `expect_nonce` の有無ではなく、選んだ候補が nonce を持つかで行う。**
+        # 手動の `rb release --join` は nonce を知らないが、選んだ候補は持っている。
+        # 前者で分けると、候補選択を変えずに原子性だけ足すことができない。
+        if entry.nonce:
             result = self._capture_and_remove(
-                path, expect_nonce=expect_nonce, resource_id=resource_id, reason=reason
+                path,
+                expect_nonce=entry.nonce,
+                resource_id=resource_id,
+                reason=reason,
+                audit_as=None,
             )
             if result is RemovalResult.REMOVED:
                 self.audit("join_removed", resource=resource_id, cwd=cwd, reason=reason)

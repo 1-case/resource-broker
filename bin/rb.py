@@ -24,9 +24,36 @@ if sys.version_info < (3, 11):
     )
     raise SystemExit(127)
 
+# **自分の出力だけを UTF-8 にする。** Windows の Python はコンソールのコードページ
+# （cp932 等）で書くが、Git Bash の端末は UTF-8 なので日本語が化ける（実測）。
+#
+# **環境変数（PYTHONUTF8）で解決してはならない。** `rb run -- python train.py` の子が
+# それを継承し、`open()` の既定エンコーディングが cp932 から UTF-8 に変わる。
+# それまで動いていたジョブが UnicodeDecodeError で落ちうるし、「Git Bash から
+# rb run した時だけ落ちる」ので原因にたどり着けない。**利用者のジョブの挙動を
+# 変えることは目的ではない。**
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - 直せなくても実行は続ける
+        pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from resource_broker.cli import main  # noqa: E402 - sys.path を整えた後でなければ import できない
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _code = main()
+    # **終了前に自分で flush する。** 小さい出力は print の時点では例外にならず、
+    # インタプリタ終了時の flush で失敗する。CPython は最終化が失敗すると
+    # **終了コードを 120 に差し替える**ため、`rb run ... | head` が子の終了コードを
+    # 返さなくなる（「走らなかったジョブを成功と報告しない」が別の形で破れる）。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.flush()
+        except Exception:  # noqa: BLE001 - 出せなかったことで終了コードを変えない
+            try:
+                _stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+    raise SystemExit(_code)

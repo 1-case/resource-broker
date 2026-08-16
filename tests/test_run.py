@@ -863,21 +863,61 @@ def test_a_failing_print_does_not_orphan_the_join(
     assert joins(tmp_path) == [], "出力が落ちたせいで相乗りが掲示板に残っている"
 
 
-def test_the_wrapper_does_not_remove_another_sessions_join(tmp_path: Path) -> None:
-    """自分の申告が先に消えていても、他人の生きた申告を消さない。
+def test_the_wrapper_only_removes_the_join_it_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """後始末は**自分が作った申告だけ**を消す。祖先の他人の申告に手を出さない。
 
-    後始末は nonce を照合する。渡さないと祖先フォールバックが働き、**別セッションが
-    祖先 cwd から出した申告**を選びうる（cwd だけでは区別できない）。自分の申告が
-    --force や再起動掃除で先に消えている場面で、それが現実になる。
+    **前のテストは修正に到達していなかった。** 同じ cwd に他人の申告を置いてから
+    ``rb run --join`` すると ``JoinResult.EXISTS`` になり ``declared=False``、
+    後始末は早期 return して ``remove_own_join`` を 1 度も呼ばなかった。nonce 照合を
+    丸ごと消しても通るテストだった。
+
+    ここでは (a) 子ディレクトリから走らせてラッパー自身に申告を作らせ、
+    (b) 走行中にその申告が外部から消え（``--force`` や再起動掃除で現実に起きる）、
+    (c) 祖先 cwd に他人の生きた申告がある、という並びを作る。nonce 照合が無ければ
+    祖先フォールバックが他人の申告を選んで消す。
     """
     hold(tmp_path)
     board = Board(tmp_path)
-    theirs = build_entry(normalize("GPU0"), job="他人の相乗り", session="theirs", cwd=os.getcwd())
-    assert board.add_join(theirs, os.getcwd())
+    ancestor = os.getcwd()
+    mine = os.path.join(ancestor, "配下")
+    os.makedirs(mine, exist_ok=True)
 
-    # 自分は相乗りを作れない（同じ場所から二重には申告できない）ので declared=False になり、
-    # 後始末は何も消さないのが正しい。
-    assert rb_join_run(tmp_path, sys.executable, "-c", "print('ok')") == 0
+    theirs = build_entry(
+        normalize("GPU0"), job="祖先にいる他人の相乗り", session="theirs", cwd=ancestor
+    )
+    assert board.add_join(theirs, ancestor)
+
+    def run_and_vanish(argv: list[str], log_path: Path, env: dict[str, str]) -> int:
+        # 走行中に自分の申告だけが外部から消える。
+        assert board.remove_join(normalize("GPU0"), mine, reason="外部から消えた")
+        return 0
+
+    monkeypatch.setattr(os, "getcwd", lambda: mine)
+    monkeypatch.setattr("resource_broker.cli.SPAWN", run_and_vanish)
+
+    assert rb_join_run(tmp_path, "なんでもよい") == 0
 
     remaining = [entry.job for entry in Board(tmp_path).list_all_joins()]
-    assert remaining == ["他人の相乗り"], "他セッションの生きた申告を消している"
+    assert remaining == ["祖先にいる他人の相乗り"], f"祖先の他人の申告を消している: {remaining}"
+
+
+def test_the_wrapper_withdraws_its_own_join_via_cas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """正常時は自分の申告を捕獲型 CAS で取り下げる（nonce を照合している）。"""
+    hold(tmp_path)
+    seen: list[str] = []
+    original = Board._capture_and_remove
+
+    def spy(self: Board, path: Path, **kwargs: object) -> object:
+        seen.append(str(kwargs.get("expect_nonce")))
+        return original(self, path, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Board, "_capture_and_remove", spy)
+
+    assert rb_join_run(tmp_path, sys.executable, "-c", "print('ok')") == 0
+
+    assert joins(tmp_path) == []
+    assert seen, "相乗りの取り下げが CAS を通っていない"

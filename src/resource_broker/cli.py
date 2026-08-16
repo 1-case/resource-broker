@@ -740,10 +740,13 @@ def _release_after_run(
             if removed_join is not None:
                 print(f"相乗りを取り下げました: {naming.display_default(resource_id)}")
             else:
-                print(
-                    "相乗りを取り下げられませんでした"
-                    "（掲示板に残っています。rb release --join で外すこと）",
-                    file=sys.stderr,
+                # **「消さなかった」を「消せなかった」と混ぜない。** 走行中に外部から
+                # 消えている場合（--force、再起動掃除）に「掲示板に残っています」と
+                # 出すと嘘になり、しかもその助言（rb release --join）へ誘導してしまう。
+                _say(
+                    "相乗りを取り下げませんでした"
+                    "（既に掲示板に無いか、自分の申告ではありません）",
+                    err=True,
                 )
             return
 
@@ -1154,12 +1157,15 @@ def _cmd_join(args: argparse.Namespace) -> int:
         print("  掲示板が作れない・書けない可能性がある（監査ログを参照）", file=sys.stderr)
         return EXIT_OK
 
-    print(f"相乗りを申告しました: {entry.display} / {entry.job}")
-    print(f"  主宣言: {primary.session} / {primary.job}")
+    # **掲示板へ書いた後なので `_say` を通す。** ここは `rb run --join` と違って
+    # try/finally が無く、print が落ちると申告だけが残って何も撤収されない。
+    # しかも `claim` の拒否メッセージがこの経路へ利用者を誘導している。
+    _say(f"相乗りを申告しました: {entry.display} / {entry.job}")
+    _say(f"  主宣言: {primary.session} / {primary.job}")
     if primary.sharing:
-        print(f"  保持者の相乗り方針: {primary.sharing}")
+        _say(f"  保持者の相乗り方針: {primary.sharing}")
     else:
-        print("  保持者は相乗り可否を書いていません。合意が取れているか確認すること")
+        _say("  保持者は相乗り可否を書いていません。合意が取れているか確認すること")
     # **入れたあとに読み直す。** ほぼ同時に入った相手はここで初めて見える。
     _print_occupants(board, resource_id)
     return EXIT_OK

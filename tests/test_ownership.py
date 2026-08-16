@@ -1148,7 +1148,13 @@ def test_stale_join_cleanup_goes_through_the_cas(
     original = Board._capture_and_remove
 
     def spy(
-        self: Board, path: Path, *, expect_nonce: str, resource_id: str, reason: str
+        self: Board,
+        path: Path,
+        *,
+        expect_nonce: str,
+        resource_id: str,
+        reason: str,
+        **rest: object,
     ) -> RemovalResult:
         seen.append(expect_nonce)
         return original(
