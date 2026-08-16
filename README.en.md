@@ -209,9 +209,9 @@ A stale table is harmless: it stops matching, so notices stop — nothing is eve
   5 real processes against one board: exactly one wins.
 - **One file per resource.** Damage stays local and `O_EXCL` settles acquisition races.
 
-Design rationale — and the failures that produced it — lives in
-[docs/DESIGN.md](docs/DESIGN.md) (Japanese). Most of its paragraphs were written after
-hitting the problem in production, not before.
+The method, spec and constraints as they currently stand live in
+[docs/DESIGN.md](docs/DESIGN.md) (Japanese). It documents **the end state only** — the road
+that led there is deliberately not in it.
 
 ## Trust boundary and security
 
@@ -254,7 +254,11 @@ implementation; review ran as a double loop of an independent Claude agent and C
 Most of the design was settled **only after hitting real failures in production use**:
 a display name that hid which resource was held; a session that gave up on a GPU whose holder
 had explicitly allowed sharing; a forgotten release that made another session wait 2 h 48 m;
-`gpu0` and `GPU0` silently becoming different resources. Each of those is recorded in [docs/DESIGN.md](docs/DESIGN.md) as *why the design is what it is*.
+`gpu0` and `GPU0` silently becoming different resources.
+
+**Every "this actually happened" in this README refers to one of those.** The chronological
+log itself is not published (it is the author's working record);
+[docs/DESIGN.md](docs/DESIGN.md) keeps only the conclusions and a sentence or two of rationale.
 
 ## License
 
