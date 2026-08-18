@@ -181,6 +181,10 @@ stopped an edit to this tool's own documentation). `allow` is worse: it bypasses
 prompt itself, so a hook meant to *warn* would end up auto-approving every command. Getting a
 notice wrong costs one extra line of text; getting `allow` wrong costs the permission model.
 
+**Any of this can be turned off without uninstalling.** Set `RESOURCE_BROKER_DISABLE` to any
+non-empty value and all three hooks return immediately, injecting nothing. `rb` itself keeps
+working, so you can still read and write the board by hand.
+
 **No hook waits.** Blocking inside a hook freezes the session in a way the user cannot escape
 with Esc, and nothing appears on screen. Waiting is `rb wait`: visible as a tool call,
 interruptible, and every poll lands in the audit log.
@@ -203,7 +207,7 @@ what you get.
 
 | Hook | Fires | Injection |
 |---|---|---|
-| `UserPromptSubmit` | **every prompt** | ~40 chars when nothing is declared; one line per declaration otherwise, capped at 8 entries / 1200 bytes |
+| `UserPromptSubmit` | **every prompt** | 45 chars when nothing is declared; one line per declaration otherwise, capped at 8 entries / 1200 bytes |
 | `PreToolUse`(Bash) | only Bash commands matching a small pattern table | exits immediately on no match |
 | `SessionStart` | once per session | the longest, since it carries the usage explanation |
 
@@ -259,10 +263,12 @@ that led there is deliberately not in it.
 The board and the audit log live in **`%LOCALAPPDATA%\resource-broker\`** (`~/.resource-broker/`
 elsewhere); `RESOURCE_BROKER_HOME` moves them. They hold `board/` (declarations), `audit/`
 (the audit log) and `logs/` (`rb run` output), and are **never created inside the repository**.
-`logs/` is pruned after 7 days and `audit/` after 90; pruning happens on the first write of
-each day. The audit log holds job descriptions and the working directory of each declaration,
-so it is a record of what you were doing and when — it is not allowed to grow without bound.
-Deleting either directory by hand is safe at any time.
+`logs/` is pruned after 7 days, on `rb run` startup; `audit/` after 90, on the first write of
+each day (measured from the filename's date, so restoring a backup does not reset the clock).
+The audit log holds job descriptions and the working directory of each declaration, so it is a
+record of what you were doing and when. **Both only get pruned while you are using the tool** —
+stop using it, or uninstall the plugin, and whatever is left stays there. Deleting either
+directory by hand is safe at any time.
 
 **The board is plaintext and is not encrypted.** Every session that reads or writes it runs as
 the same OS user on the same machine, so any process that can read the ciphertext can read the
@@ -279,9 +285,12 @@ Four properties you can check quickly, because they are what a reviewer will wan
 - **No network access anywhere.** There is no `urllib`, `http`, `socket` client or third-party
   HTTP library in the tree; the single `socket` call is `gethostname()`. Nothing is uploaded,
   reported or phoned home.
-- **No `shell=True`, ever.** `subprocess` appears in exactly three places: spawning your job in
-  `rb run` (argv straight through, no shell re-parsing), reading `kern.boottime` on macOS, and
-  the `SessionStart` hook invoking this repository's own `bin/rb.py`.
+- **No `shell=True`, ever.** `subprocess` appears in exactly four places, each with a fixed
+  argv: spawning your job in `rb run` (your argv straight through, no shell re-parsing);
+  `taskkill /F /T /PID <pid>` on Windows to end that job's process tree when `rb run` is
+  interrupted, with a PID this tool recorded itself; reading `kern.boottime` on macOS; and the
+  `SessionStart` hook invoking this repository's own `bin/rb.py`. `grep -rn subprocess src hooks`
+  shows all four.
 - **No resource-specific code path.** Nothing branches on a resource ID and there is no probe
   module; the tool never inspects a GPU, a port or anything else. It records what *you* say you
   observed, with a machine-generated timestamp beside it.
