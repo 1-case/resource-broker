@@ -349,6 +349,62 @@ def test_the_board_can_be_read_without_rb(tmp_path: Path) -> None:
     assert rows[0]["occupied"] is True
 
 
+def test_reading_the_board_directly_shows_joiners(tmp_path: Path) -> None:
+    """``rb`` を経ない経路でも**相乗りを読む**。
+
+    主宣言が先に解放されて相乗りだけが残った資源は、``board/`` を見ただけでは消える。
+    この経路は ``rb`` を起動できなかったときの最後の砦であり、そこで「掲示板は空です」
+    と告げるのは、無言より悪い——実際に使っている者がいるのに空きだと報告する。
+    """
+    board = Board(tmp_path)
+    place = str(tmp_path / "works" / "malm")
+    joiner = build_entry(
+        normalize("GPU0"),
+        job="相乗りのジョブ",
+        cwd=place,
+        session="malm",
+        log="C:\\logs\\j.log",
+    )
+    assert board.add_join(joiner, place)
+    module = load_hook_module()
+    os.environ["RESOURCE_BROKER_HOME"] = str(tmp_path)
+    try:
+        rows = module.read_entries_directly()
+    finally:
+        os.environ.pop("RESOURCE_BROKER_HOME", None)
+
+    assert rows is not None
+    assert len(rows) == 1, rows
+    assert rows[0]["resource"] == normalize("GPU0")
+    assert rows[0]["holder"] is None, "主宣言が無いのに holder が埋まっている"
+    assert [j["holder"]["session"] for j in rows[0]["joins"]] == ["malm"]
+    assert "相乗りのジョブ" in module.build_notice(rows)
+
+
+def test_reading_the_board_directly_attaches_joiners_to_the_primary(tmp_path: Path) -> None:
+    """主宣言と相乗りが同居していれば、1 行にまとめる（資源を 2 回並べない）。"""
+    declare(tmp_path, "GPU0", job="E059 eval")
+    board = Board(tmp_path)
+    place = str(tmp_path / "works" / "malm")
+    joiner = build_entry(normalize("GPU0"), job="相乗りのジョブ", cwd=place, session="malm")
+    assert board.add_join(joiner, place)
+    module = load_hook_module()
+    os.environ["RESOURCE_BROKER_HOME"] = str(tmp_path)
+    try:
+        rows = module.read_entries_directly()
+    finally:
+        os.environ.pop("RESOURCE_BROKER_HOME", None)
+
+    assert rows is not None
+    assert len(rows) == 1, rows
+    assert rows[0]["holder"]["job"] == "E059 eval"
+    assert len(rows[0]["joins"]) == 1
+
+    notice = module.build_notice(rows)
+    assert "E059 eval" in notice
+    assert "相乗りのジョブ" in notice
+
+
 def test_reading_the_board_directly_survives_corruption(tmp_path: Path) -> None:
     """壊れたファイルがあっても飛ばして読む（例外を出さない）。"""
     declare(tmp_path, "GPU0", job="E059 eval")

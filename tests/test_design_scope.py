@@ -73,8 +73,23 @@ def test_design_does_not_narrate_history() -> None:
 
 PUBLIC_DOCS = ("README.md", "README.en.md", "docs/DESIGN.md", ".github/SECURITY.md")
 
+#: 生の CR が混じると壊れるテキストを**すべて**さらう。列挙にすると、次に事故が起きる
+#: ファイルはたいてい列挙の外にある（実際 ``.gitattributes`` のコメントと、この番人を
+#: 置いたテスト自身で起きた）。``.cmd`` は CRLF が正当なので、畳んでから見る。
+CR_SENSITIVE = sorted(
+    str(path.relative_to(ROOT)).replace("\\", "/")
+    for pattern in ("*.md", "*.toml", "*.json", "*.py", "*.yml", ".gitattributes", "bin/*")
+    for path in ROOT.glob(pattern)
+    if path.is_file()
+) + sorted(
+    str(path.relative_to(ROOT)).replace("\\", "/")
+    for folder in ("src", "tests", "hooks", "docs", ".github", ".claude-plugin")
+    for path in (ROOT / folder).rglob("*")
+    if path.is_file() and path.suffix in {".py", ".md", ".json", ".yml", ".yaml"}
+)
 
-@pytest.mark.parametrize("name", PUBLIC_DOCS)
+
+@pytest.mark.parametrize("name", CR_SENSITIVE)
 def test_public_documents_have_no_stray_control_characters(name: str) -> None:
     """公開文書に制御文字（タブ・改行以外）を混ぜない。
 
@@ -85,7 +100,12 @@ def test_public_documents_have_no_stray_control_characters(name: str) -> None:
     """
     raw = (ROOT / name).read_bytes()
 
-    offenders = [(i, b) for i, b in enumerate(raw) if b < 32 and b not in (9, 10, 13)]
+    # **CRLF を先に畳んでから CR を探す。** 単に 0x0D を許すと、守るはずだった事故
+    # （CR 1 つが行の途中へ紛れる）がそのまま通る。CRLF は ``.cmd`` などで正当なので
+    # 一律には禁じられない。畳んだあとに残る CR だけが事故である。
+    raw = raw.replace(b"\r\n", b"\n")
+
+    offenders = [(i, b) for i, b in enumerate(raw) if b < 32 and b not in (9, 10)]
     assert not offenders, (
         f"{name} に制御文字がある（先頭 {offenders[0][0]} バイト目に {offenders[0][1]:#04x}）"
     )
@@ -108,3 +128,28 @@ def test_public_documents_do_not_split_a_windows_path(name: str) -> None:
     assert not broken, "環境変数の直後でパスが切れている:\n" + "\n".join(
         f"  {n}: {line[-50:]}" for n, line in broken
     )
+
+
+# --- self-hosted runner に fork の pull request を通さない -------------------------
+
+
+def test_a_self_hosted_runner_never_accepts_a_fork_pull_request() -> None:
+    """self-hosted を使う job は、fork からの pull request を必ず弾く。
+
+    公開リポジトリで self-hosted runner に fork のコードを渡すと、**pull request を
+    投げるだけで作者のマシン上で任意のコードが走る**（``pyproject.toml`` の解決も
+    ``tests/*.py`` も）。GitHub 自身が警告している構成である。
+
+    「公開したら GitHub ホストへ移す」という手順に頼らない。手順は忘れられるし、
+    忘れたことが分かるのは踏まれた後である。公開の瞬間に危険になる設定は、
+    private のうちから置かない。
+    """
+    guard = "github.event.pull_request.head.repo.full_name == github.repository"
+
+    for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+        text = path.read_text(encoding="utf-8")
+        if "self-hosted" not in text:
+            continue
+        assert "pull_request" not in text or guard in text, (
+            f"{path.name}: self-hosted を使うのに fork の pull request を弾いていない"
+        )

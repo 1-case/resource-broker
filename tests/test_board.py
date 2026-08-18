@@ -9,7 +9,7 @@ import sys
 import threading
 from pathlib import Path
 
-from resource_broker.board import Board, Entry, build_entry
+from resource_broker.board import SCHEMA, Board, Entry, build_entry
 
 
 def test_claim_is_exclusive(board: Board) -> None:
@@ -230,3 +230,65 @@ def test_a_known_key_with_an_unexpected_type_is_not_silently_dropped() -> None:
 
     # 書き戻しても失われない
     assert entry.to_dict()["x-sharing"] == {"allowed": True, "limit": "5GB"}
+
+
+def test_reading_and_writing_twice_is_a_fixed_point() -> None:
+    """読んで書き戻す往復を 2 周しても、退避した値が増えも減りもしない。
+
+    片道だけ確かめても、**2 周目で ``x-sharing`` がさらに ``x-x-sharing`` へ包まれる**
+    ような実装は通ってしまう。掲示板は版が混ざったまま何度も読み書きされる。
+    """
+    original = {
+        "schema": 2,
+        "resource": "pc-a::GPU0",
+        "sharing": {"allowed": True},
+        "未知のキー": 1,
+    }
+
+    first = Entry.from_dict(original)
+    assert first is not None
+    once = first.to_dict()
+
+    second = Entry.from_dict(once)
+    assert second is not None
+    twice = second.to_dict()
+
+    assert twice == once, "往復のたびに形が変わっている"
+
+
+def test_a_newer_schema_marker_is_not_downgraded() -> None:
+    """新しい版が書いたスキーマ番号を、古い版が読んで書き戻しても下げない。
+
+    未知のフィールドは ``extra`` が保つのに版の印だけ消すと、次に読む側は
+    「古い形のエントリに知らない鍵が混じっている」と見ることになる。
+    """
+    entry = Entry.from_dict({"schema": 99, "resource": "pc-a::GPU0", "未来の鍵": "値"})
+
+    assert entry is not None
+    assert entry.to_dict()["schema"] == 99
+    assert entry.to_dict()["未来の鍵"] == "値"
+
+
+def test_a_broken_schema_marker_falls_back_to_the_current_version() -> None:
+    """壊れた版番号は現行版として扱う（bool は int の派生なので明示的に除く）。"""
+    for broken in (True, "2", None, 0, -1, [2]):
+        entry = Entry.from_dict({"schema": broken, "resource": "pc-a::GPU0"})
+        assert entry is not None
+        assert entry.to_dict()["schema"] == SCHEMA, broken
+
+
+def test_salvage_does_not_overwrite_an_existing_extension_field() -> None:
+    """``x-`` は拡張フィールドの慣例接頭辞である。既にある値を退避で潰さない。
+
+    潰せば、この仕組みが防ごうとしている取りこぼしを自分で起こす。
+    """
+    entry = Entry.from_dict(
+        {
+            "resource": "pc-a::GPU0",
+            "sharing": {"allowed": True},
+            "x-sharing": "別の版が書いた値",
+        }
+    )
+
+    assert entry is not None
+    assert entry.extra["x-sharing"] == "別の版が書いた値", "既存の拡張を潰している"

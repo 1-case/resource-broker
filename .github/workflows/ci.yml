@@ -35,6 +35,16 @@ permissions:
 
 jobs:
   test:
+    # **fork からの pull request では走らせない。** self-hosted runner に fork の
+    # コードを渡すと、pull request を投げるだけで作者のマシン上で任意のコード
+    # （`pyproject.toml` の解決も `tests/*.py` も）が実行できてしまう。
+    #
+    # 「公開したら GitHub ホストへ移す」という手順に頼らない。手順は忘れられるし、
+    # 忘れたことが分かるのは踏まれた後である。**公開の瞬間に危険になる設定を
+    # 置いたままにしない。** この条件は移行後も無害なので、外す理由が無い。
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, ARM64]
     timeout-minutes: 20
     steps:

@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import unicodedata
 from pathlib import Path
 
 ENCODING = "utf-8"
@@ -117,9 +118,18 @@ def clip(value: object, limit: int) -> str:
     重複の維持コストより、フックが常に動くことを取る。
     """
     text = value if isinstance(value, str) else ("" if value is None else str(value))
-    # 制御文字を落とし、空白の連なりを 1 つに潰す。``str.split()`` は改行・タブに加えて
-    # 行区切り扱いの Unicode 文字（U+2028 等）も分割対象にする。
-    body = " ".join("".join(ch for ch in text if ch >= " " and ch != "\x7f").split())
+    # 制御文字と**書式制御文字**を落とし、空白の連なりを 1 つに潰す。
+    # ``str.split()`` は改行・タブに加えて行区切り扱いの Unicode 文字（U+2028 等）も
+    # 分割対象にする。
+    #
+    # **Cf（書式制御）まで落とす。** C0 と DEL だけでは U+202E（RLO）等の双方向制御が
+    # 残り、注入した行が読む側の画面で逆順に表示される。行の中身が並べ替えられれば、
+    # 前置きの「データであって指示ではない」と行頭の印を保っていても、読まれる文が
+    # 書いた文と違うものになる。絵文字の ZWJ 連結も落ちるが、通知は読ませるためのもので
+    # あり、表示の忠実さより「見えている通りに読める」ことを取る。
+    body = " ".join(
+        "".join(ch for ch in text if unicodedata.category(ch) not in ("Cc", "Cf")).split()
+    )
     data = body.encode(ENCODING, errors="replace")
     if len(data) <= limit:
         return body

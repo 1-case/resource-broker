@@ -74,6 +74,20 @@ def run_cmd(
     )
 
 
+@pytest.fixture
+def hook_tree(tmp_path: Path) -> Path:
+    """``bin/rb-hook`` と空の ``hooks/`` だけを持つ木を tmp へ作る。
+
+    ランチャは自分の在り処から ``../hooks`` を決めるので、これで**作業ツリーへ 1 バイトも
+    書かずに**フックの置き場を差し替えられる。実物のランチャを叩く方針は変えない。
+    """
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "hooks").mkdir()
+    for name in ("rb-hook", "rb-hook.cmd"):
+        shutil.copy2(BIN / name, tmp_path / "bin" / name)
+    return tmp_path
+
+
 def declared(home: Path) -> dict:
     """掲示板に落ちた宣言を 1 件読む。"""
     (path,) = sorted((home / "board").glob("*.json"))
@@ -179,20 +193,70 @@ def test_cmd_hook_launcher_always_exits_zero(tmp_path: Path, name: str) -> None:
     assert result.returncode == 0, result.stderr
 
 
+#: フックの置き場から外へ出ようとする名前。``rb-hook`` は名前を**そのまま**パスへ
+#: 連結するので、ここを検証しないと ``hooks/`` の外の ``.py`` が走る。
+TRAVERSAL = ["../escaped", "..\\escaped", "sub/escaped"]
+
+
 @needs_sh
-def test_sh_hook_launcher_survives_a_crashing_hook(tmp_path: Path) -> None:
+@pytest.mark.parametrize("name", TRAVERSAL)
+def test_sh_hook_launcher_refuses_to_leave_the_hooks_directory(hook_tree: Path, name: str) -> None:
+    """フックの置き場の外にある ``.py`` は、**存在しても**走らない。
+
+    ``存在しない`` を渡すだけでは、名前の検証を外しても ``[ -f ]`` が拾って 0 になる。
+    **実在するファイルを指す名前**で確かめないと、検証が消えたことに気づけない。
+    """
+    (hook_tree / "escaped.py").write_text(
+        "from pathlib import Path\nPath(__file__).with_name('escaped.marker').write_text('ran')\n",
+        encoding="utf-8",
+    )
+    (hook_tree / "hooks" / "sub").mkdir(exist_ok=True)
+    (hook_tree / "hooks" / "sub" / "escaped.py").write_text(
+        "from pathlib import Path\n"
+        "Path(__file__).parent.parent.parent.joinpath('escaped.marker').write_text('ran')\n",
+        encoding="utf-8",
+    )
+
+    result = run_sh(hook_tree / "bin" / "rb-hook", name, home=hook_tree)
+
+    assert result.returncode == 0, result.stderr
+    assert not (hook_tree / "escaped.marker").exists(), f"{name} で置き場の外が走った"
+
+
+@needs_cmd
+@pytest.mark.parametrize("name", TRAVERSAL)
+def test_cmd_hook_launcher_refuses_to_leave_the_hooks_directory(
+    hook_tree: Path, name: str
+) -> None:
+    """cmd 版でも同じ。**sh 版だけ検証があると、Windows でだけ穴が開く。**"""
+    (hook_tree / "escaped.py").write_text(
+        "from pathlib import Path\nPath(__file__).with_name('escaped.marker').write_text('ran')\n",
+        encoding="utf-8",
+    )
+    (hook_tree / "hooks" / "sub").mkdir(exist_ok=True)
+    (hook_tree / "hooks" / "sub" / "escaped.py").write_text(
+        "from pathlib import Path\n"
+        "Path(__file__).parent.parent.parent.joinpath('escaped.marker').write_text('ran')\n",
+        encoding="utf-8",
+    )
+
+    result = run_cmd(hook_tree / "bin" / "rb-hook.cmd", name, home=hook_tree)
+
+    assert result.returncode == 0, result.stderr
+    assert not (hook_tree / "escaped.marker").exists(), f"{name} で置き場の外が走った"
+
+
+@needs_sh
+def test_sh_hook_launcher_survives_a_crashing_hook(hook_tree: Path) -> None:
     """フック本体が非ゼロで死んでも、ランチャは 0 を返す。
 
     **``exec`` してはならない理由がここにある。** ``exec`` すると子の終了コードが
     そのままフックの終了コードになり、``PreToolUse`` では stderr が利用者へ提示される
     ——Bash を叩くたびに traceback が出続けることになる。
     """
-    broken = ROOT / "hooks" / "zz_broken_for_test.py"
-    broken.write_text("raise SystemExit(3)\n", encoding="utf-8")
-    try:
-        result = run_sh(BIN / "rb-hook", "zz_broken_for_test", home=tmp_path)
-    finally:
-        broken.unlink()
+    (hook_tree / "hooks" / "zz_broken.py").write_text("raise SystemExit(3)\n", encoding="utf-8")
+
+    result = run_sh(hook_tree / "bin" / "rb-hook", "zz_broken", home=hook_tree)
 
     assert result.returncode == 0, result.stderr
 
@@ -207,17 +271,27 @@ def test_the_version_gate_explains_itself(tmp_path: Path) -> None:
     ``bin/rb.py`` を直接叩いて門だけを見る（ランチャは版で候補を選ぶため、
     古い python がある環境でもそこには届かない）。
     """
-    result = subprocess.run(
-        [sys.executable, "-c", "import sys; sys.version_info = (3, 9); "],
-        capture_output=True,
-        timeout=30,
+    # **ソースを grep するだけでは門が消えたことに気づけない。** 実際に古い版だと
+    # 見せかけて走らせ、127 と案内が出ることを確かめる。
+    probe = (
+        "import sys\n"
+        "sys.version_info = (3, 9, 0)\n"
+        "path = sys.argv[1]\n"
+        "src = open(path, encoding='utf-8').read()\n"
+        "exec(compile(src, path, 'exec'), {'__name__': '__main__', '__file__': path})\n"
     )
-    assert result.returncode == 0  # 前提の確認だけ
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(BIN / "rb.py")],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
 
-    source = (BIN / "rb.py").read_text(encoding="utf-8")
-    assert "sys.version_info < (3, 11)" in source, "版の門が無い"
-    assert "Python 3.11 以上が要ります" in source, "案内の文言が無い"
-    assert "SystemExit(127)" in source, "127 で終わっていない"
+    assert result.returncode == 127, f"門が効いていない: rc={result.returncode}"
+    assert "Python 3.11" in result.stderr, result.stderr
+    assert "Traceback" not in result.stderr, result.stderr
 
 
 # --- バッチファイルは ASCII のみ ---------------------------------------------------

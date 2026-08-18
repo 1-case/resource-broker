@@ -10,6 +10,7 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd) || {
     echo "rb: 自分の場所を特定できません" >&2
     exit 127
 }
+posix_script="$here/bin/rb.py"
 
 # 探索順は bin/ の 4 本すべてでそろえる。**py を先に試す**のは Windows のためである。
 # Windows は %LOCALAPPDATA%\Microsoft\WindowsApps\ に python.exe / python3.exe の
@@ -24,13 +25,24 @@ for py in py python3.13 python3.12 python3.11 python3 python; do
     "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null || continue
     # ${1+"$@"} を使う。macOS の /bin/sh は bash 3.2 で、set -u 下の "$@" が
     # 引数 0 個のとき unbound variable になる（`rb` だけ打つと落ちる）。
+    script=$posix_script
     # Git Bash から Windows の python を呼ぶとき、POSIX パスは開けない。通常は MSYS の
     # argv 変換が効くが、MSYS2_ARG_CONV_EXCL を設定している環境では効かない。
-    # rb-hook と同じ扱いにそろえる（片方だけ直すと、次に触った人が理由を探す）。
-    script="$here/bin/rb.py"
-    if command -v cygpath >/dev/null 2>&1; then
-        script=$(cygpath -w "$script") || script="$here/bin/rb.py"
-    fi
+    #
+    # **変換するのは Windows ネイティブの python を選んだときだけ。** cygpath の有無で
+    # 決めると、Cygwin / MSYS2(msys) の POSIX python にも Windows パスを渡してしまう。
+    # そちらは受け取ったパスを区切りの無い 1 要素として扱うため、sys.path が壊れる。
+    # 見分けは在り処でつく。POSIX ネイティブの実行体はエミュレーション根（/usr, /bin）に
+    # あり、ドライブ経由（/c/...）や /mingw64 から見えるものは Windows ネイティブである。
+    # sys.platform を聞けば確実だが、python の起動が 1 回増える。フックは毎ターン走る。
+    case "$path" in
+        /usr/* | /bin/* | /sbin/*) ;;
+        *)
+            if command -v cygpath >/dev/null 2>&1; then
+                script=$(cygpath -w "$script") || script=$posix_script
+            fi
+            ;;
+    esac
     exec "$py" "$script" ${1+"$@"}
 done
 

@@ -278,6 +278,11 @@ class Entry:
     usage: dict[str, object] | None = None
     sharing: str = ""
     extra: dict[str, object] = field(default_factory=dict)
+    #: 読んだときのスキーマ版。**書き戻しても下げない。**
+    #: 新しい版が書いた未知のフィールドは ``extra`` が保つのに、それが新スキーマ由来だと
+    #: いう印だけを消すと、次に読む側は「古い形のエントリに知らない鍵が混じっている」と
+    #: 見ることになる。保った値は前方互換の最後の 1 マスである。
+    schema: int = SCHEMA
 
     @property
     def since_dt(self) -> datetime | None:
@@ -319,7 +324,7 @@ class Entry:
         data: dict[str, object] = dict(self.extra)
         data.update(
             {
-                "schema": SCHEMA,
+                "schema": self.schema,
                 "resource": self.resource,
                 "display": self.display,
                 "holder": self.holder,
@@ -362,7 +367,19 @@ class Entry:
             usage=usage if isinstance(usage, dict) else None,
             sharing=data["sharing"] if isinstance(data.get("sharing"), str) else "",
             extra=cls._salvage(data),
+            schema=cls._read_schema(data),
         )
+
+    @staticmethod
+    def _read_schema(data: dict[str, object]) -> int:
+        """読んだスキーマ版。壊れていれば現行版とみなす。
+
+        ``bool`` は ``int`` の派生なので明示的に除く。
+        """
+        value = data.get("schema")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            return SCHEMA
+        return value
 
     @staticmethod
     def _salvage(data: dict[str, object]) -> dict[str, object]:
@@ -389,7 +406,10 @@ class Entry:
         extra: dict[str, object] = {k: v for k, v in data.items() if k not in _KNOWN_KEYS}
         for key, kind in expected.items():
             if key in data and data[key] is not None and not isinstance(data[key], kind):
-                extra[f"x-{key}"] = data[key]
+                # **既にある ``x-`` を潰さない。** ``x-`` は拡張フィールドの慣例接頭辞で、
+                # 別の版がその名前を使っている可能性がある。退避のために別の値を消せば、
+                # この関数が防ごうとしている取りこぼしを自分で起こす。
+                extra.setdefault(f"x-{key}", data[key])
         return extra
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 from . import clock
@@ -22,6 +23,17 @@ from . import clock
 #: ``O_APPEND`` の write が他プロセスと交錯しないのは、POSIX で ``PIPE_BUF``
 #: （多くの環境で 4096 バイト）以下のときだけである。ここはその内側に収める。
 MAX_LINE_BYTES = 4000
+
+#: 監査ログを残す日数。
+#:
+#: **単調増加させない。** ここには ``job`` の自由記述と宣言元の ``cwd`` が入る——
+#: つまり利用者がいつ何の作業をしていたかの履歴である。``rb wait`` は 10 秒ごとに
+#: 1 行足すので、放っておけば増え続ける。用途は「なぜそう判定したか」を後から辿ること
+#: であり、その必要が生じるのはたいてい直後である。長く持つ理由が無い。
+#:
+#: ログ（7 日）より長いのは、監査が**判定の履歴**であり、事故に気づくまでの間が
+#: 長くなりうるためである。
+AUDIT_RETENTION_DAYS = 90
 
 
 def audit_dir(root: Path) -> Path:
@@ -47,6 +59,11 @@ def append(root: Path, event: str, **fields: object) -> None:
         directory.mkdir(parents=True, exist_ok=True)
         target = directory / f"{clock.now().strftime('%Y-%m-%d')}.jsonl"
 
+        # **その日の最初の 1 行を書くときだけ掃除する。** 毎回さらうと、追記 1 回ごとに
+        # ディレクトリ全体を走査することになる。日付が変わった瞬間は必ず来るので、
+        # 掃除の機会は 1 日 1 回確実に訪れる。
+        stale = not target.exists()
+
         data = _encode(record)
 
         # マシン上の全セッションが同じファイルへ追記する。テキスト層のバッファ越しに書くと、
@@ -63,6 +80,34 @@ def append(root: Path, event: str, **fields: object) -> None:
             os.close(handle)
     except Exception:  # noqa: BLE001 - 監査の失敗で本処理を止めない
         return
+
+    if stale:
+        prune(root)
+
+
+def prune(root: Path, *, max_age_days: float = AUDIT_RETENTION_DAYS) -> int:
+    """古い監査ログを消す。消せた件数を返す。
+
+    今日のファイルは書き込みが続いているので mtime が新しく、対象にならない。
+
+    **失敗は全て無視する。** 掃除は付随的な仕事であり、ここで例外を出すのでは
+    「掃除できないから宣言できない」という本末転倒になる。
+    """
+    cutoff = time.time() - max_age_days * 86400.0
+    try:
+        paths = list(audit_dir(root).glob("*.jsonl"))
+    except OSError:
+        return 0
+
+    removed = 0
+    for path in paths:
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def _encode(record: dict[str, object]) -> bytes:
