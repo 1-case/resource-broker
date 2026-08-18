@@ -411,8 +411,15 @@ class Entry:
         }
         extra: dict[str, object] = {k: v for k, v in data.items() if k not in _KNOWN_KEYS}
         for key, kind in expected.items():
-            # ``bool`` は ``int`` の派生なので、``schema: true`` を通さないよう明示的に除く。
-            broken = isinstance(data.get(key), bool) and kind is int
+            # **``_read_schema`` が拒む条件とそろえる。** そちらが「壊れている」と見た値を
+            # ここが「型は合っている」と見ると、既定値へ倒れた元の値が退避されずに消える。
+            # ``bool`` は ``int`` の派生なので明示的に除く（``kind`` が tuple でも効くよう
+            # ``int in kinds`` の形で見る）。
+            kinds = kind if isinstance(kind, tuple) else (kind,)
+            value = data.get(key)
+            broken = int in kinds and isinstance(value, bool)
+            if key == "schema" and isinstance(value, int) and not isinstance(value, bool):
+                broken = broken or value < 1
             if (
                 key in data
                 and data[key] is not None
@@ -656,8 +663,13 @@ class Board:
         掲示板は空・資源は掴まれたままという最も検出しにくい不整合ができる。
         """
         holder = entry.holder if isinstance(entry.holder, dict) else {}
-        if nonce and holder.get("nonce"):
-            return str(holder["nonce"]) == nonce
+        if nonce:
+            # **呼び出し側が nonce を持っているなら、そこで決める。** 相手に nonce が
+            # 無いことを「照合できないので次へ」と読むと、自分の宣言が外部から
+            # 強制解放された後に同じ場所へ出た**別人の古い形式の宣言**を、後始末が
+            # 自分のものとして消す。nonce を持たない操作（手動の release）だけが
+            # 下のフォールバックへ落ちる。
+            return str(holder.get("nonce") or "") == nonce
         declared_session = str(holder.get("session_id") or "")
         if declared_session and session_id:
             return declared_session == session_id
@@ -964,9 +976,23 @@ class Board:
         """
         return self.entries_dir / "joins"
 
-    def join_path(self, resource_id: str, cwd: str) -> Path:
-        """相乗り申告のパス。作業ディレクトリごとに 1 つ。"""
-        key = naming.safe_filename(f"{resource_id}|{os.path.normcase(cwd)}")
+    def join_path(self, resource_id: str, cwd: str, session_id: str = "") -> Path:
+        """相乗り申告のパス。**セッションごとに 1 つ**（取れないときは作業ディレクトリごと）。
+
+        **cwd だけを鍵にすると、同じ場所の 2 セッション目が掲示板から消える。** 同じ
+        リポジトリで 2 つのセッションを立てるのは日常であり、両方が同じ資源へ
+        ``rb run --join`` すると 2 人目は ``EXISTS`` を受けて申告を残せない。1 人目が
+        先に終わって申告を取り下げると、**まだ資源を使っている 2 人目が掲示板から
+        完全に消える**。相乗りは「見えるようにする」ためだけの仕組みなのに、
+        見えなくなる方向へ倒れていた。
+
+        ``session_id`` が取れないときは従来どおり cwd だけを鍵にする。**無いことを
+        理由に厳しくしない**（:func:`platform_info.session_id` と同じ方針）。
+        """
+        parts = [resource_id, os.path.normcase(cwd)]
+        if session_id:
+            parts.append(session_id)
+        key = naming.safe_filename("|".join(parts))
         return self.joins_dir / f"{key}.json"
 
     def add_join(self, entry: Entry, cwd: str) -> bool:
@@ -992,7 +1018,8 @@ class Board:
         本ツールは可否を決めない。可否は当事者の合意事項であり、ここでやるのは
         「入ったことを見えるようにする」ことだけである。黙って入られるより遥かによい。
         """
-        path = self.join_path(entry.resource, cwd)
+        holder = entry.holder if isinstance(entry.holder, dict) else {}
+        path = self.join_path(entry.resource, cwd, str(holder.get("session_id") or ""))
         try:
             self.joins_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -1047,7 +1074,12 @@ class Board:
         boot = platform_info.boot_time()
         # **境界に余裕を持たせる。** boot は起動からの経過時間から逆算した値なので、
         # NTP が時計を前方へ飛ばすと、直前に出したばかりの相乗りが起動より前に見える。
-        # 1 分引いておけばその窓がゼロになる。失うのは再起動直後の掃除の遅れだけである。
+        # 1 分引いておけばその窓がゼロになる。
+        #
+        # **代償は「遅れ」ではなく「免除」である。** 再起動の直前 1 分間に出た相乗りは
+        # cutoff より新しいので、その起動中ずっと自動では消えない（`rb release --join`
+        # か `--force` か次の再起動で消える）。生きた申告を消さないほうを取る、という
+        # 実測の非対称性そのものの選択であり、残す側へ倒すのは意図である。
         cutoff = boot - timedelta(seconds=JOIN_BOOT_MARGIN_S) if boot is not None else None
         loaded: list[tuple[Path, Entry]] = []
         for path in paths:
@@ -1090,7 +1122,9 @@ class Board:
 
     def remove_join(self, resource_id: str, cwd: str, *, reason: str) -> bool:
         """指定した作業ディレクトリの相乗り申告を取り下げる（パスの完全一致）。"""
-        result, error = _unlink_with_retry(self.join_path(resource_id, cwd))
+        result, error = _unlink_with_retry(
+            self.join_path(resource_id, cwd, platform_info.session_id())
+        )
         if result is RemovalResult.FAILED:
             self.audit("join_remove_failed", resource=resource_id, error=error)
         if result is not RemovalResult.REMOVED:
@@ -1134,7 +1168,7 @@ class Board:
             # **他人の生きた申告を選ぶ**。
             return next(((p, e) for p, e in loaded if e.nonce == expect_nonce), None)
 
-        exact = self.join_path(resource_id, cwd)
+        exact = self.join_path(resource_id, cwd, platform_info.session_id())
         candidates = [
             (path, entry)
             for path, entry in loaded
@@ -1398,4 +1432,7 @@ def _stamp_observed(observed: dict[str, object] | None) -> dict[str, object] | N
     """
     if observed is None:
         return None
-    return {"at": clock.now_iso(), **observed}
+    # **機械の値を後に置く。** 先に置くと申告側の ``at`` が上書きし、LLM が書いた時刻が
+    # そのまま掲示板に載る。「時刻はすべて機械生成」（DESIGN.md「Time Handling」）は
+    # 引数の順序 1 つで破れる。
+    return {**observed, "at": clock.now_iso()}

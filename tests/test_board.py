@@ -276,6 +276,14 @@ def test_a_broken_schema_marker_falls_back_to_the_current_version() -> None:
         assert entry is not None
         assert entry.to_dict()["schema"] == SCHEMA, broken
 
+    # **倒した元の値は捨てない。** 退避しないと、書き戻した瞬間に黙って消える
+    # ——この仕組みが防ごうとしている当のことを自分でやることになる。
+    # （``None`` は「書かれていない」であって壊れた値ではないので対象外。）
+    for broken in (True, "2", 0, -1, [2]):
+        entry = Entry.from_dict({"schema": broken, "resource": "pc-a::GPU0"})
+        assert entry is not None
+        assert entry.to_dict().get("x-schema") == broken, broken
+
 
 def test_salvage_does_not_overwrite_an_existing_extension_field() -> None:
     """``x-`` は拡張フィールドの慣例接頭辞である。既にある値を退避で潰さない。
