@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -147,9 +148,51 @@ def test_a_self_hosted_runner_never_accepts_a_fork_pull_request() -> None:
     guard = "github.event.pull_request.head.repo.full_name == github.repository"
 
     for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
-        text = path.read_text(encoding="utf-8")
-        if "self-hosted" not in text:
+        # コメントは落とす。**この workflow は自分の危険をコメントで説明している**ので、
+        # 素朴に探すと説明文そのものに反応する。
+        lines = [
+            "" if line.lstrip().startswith("#") else line
+            for line in path.read_text(encoding="utf-8").split("\n")
+        ]
+        if not any("self-hosted" in line for line in lines):
             continue
-        assert "pull_request" not in text or guard in text, (
-            f"{path.name}: self-hosted を使うのに fork の pull request を弾いていない"
+
+        # **トリガごと禁じる。** `pull_request_target` は fork の PR で走りながら
+        # 書き込み権限を持つ。self-hosted と組み合わせてよい理由が無い。
+        assert not any(line.strip().startswith("pull_request_target:") for line in lines), (
+            f"{path.name}: self-hosted と pull_request_target を同居させている"
         )
+
+        # **job 単位で見る。** ファイルのどこかに guard があるだけでは、それが
+        # self-hosted の job に付いているかどうか分からない。
+        for i, line in enumerate(lines):
+            if "self-hosted" not in line:
+                continue
+            start = next(
+                (j for j in range(i, -1, -1) if re.fullmatch(r"  [A-Za-z0-9_-]+:", lines[j])),
+                None,
+            )
+            assert start is not None, f"{path.name}:{i + 1} の job が見つからない"
+            assert any(guard in lines[j] for j in range(start, i)), (
+                f"{path.name}:{i + 1} の self-hosted job が fork の pull request を弾いていない"
+            )
+
+
+# --- 版番号は 3 か所に手書きされている ---------------------------------------------
+
+
+def test_the_version_is_the_same_everywhere() -> None:
+    """``pyproject.toml`` / ``plugin.json`` / ``marketplace.json`` の版が一致している。
+
+    3 か所に手書きされていて、ずれても誰も気づかない。マーケットプレイス側だけ古い版が
+    出る、あるいは入れた版と名乗る版が食い違う、という形で表に出る。
+    """
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r'^version = "([^"]+)"', pyproject, re.M)
+    assert match, "pyproject.toml に version が無い"
+    expected = match.group(1)
+
+    for name in ("plugin.json", "marketplace.json"):
+        data = json.loads((ROOT / ".claude-plugin" / name).read_text(encoding="utf-8"))
+        found = data.get("version") or data["plugins"][0]["version"]
+        assert found == expected, f"{name} の版 {found} が pyproject の {expected} と違う"

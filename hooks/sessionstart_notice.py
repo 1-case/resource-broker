@@ -107,6 +107,20 @@ USAGE = """**何を資源として宣言するかの基準**: その処理が他
 作業を始めるときも読むこと（先に誰かが触っていれば別の進め方を選べる）。"""
 
 
+#: これを設定すると 3 つのフックとも即座に黙る（値は何でもよい。空文字は無効扱い）。
+#:
+#: **止める手段を持たないものを毎ターン割り込ませない。** 開示と opt-out は別物である。
+#: プラグインを外す以外に止め方が無いのでは、注入が邪魔になった 1 セッションのために
+#: マシン全体の掲示板を失うことになる。環境変数を 1 つ見るだけなので、stdlib のみという
+#: 制約にも fail-open にも触れない。
+DISABLE_ENV = "RESOURCE_BROKER_DISABLE"
+
+
+def disabled() -> bool:
+    """利用者が明示的に黙らせているか。"""
+    return bool(os.environ.get(DISABLE_ENV))
+
+
 def board_root() -> Path:
     """掲示板のルートを返す。本体の platform_info と同じ規則。
 
@@ -175,6 +189,10 @@ def fetch_status() -> list[dict[str, object]] | None:
     return None
 
 
+#: 申告が読めない主宣言の代わりに置く holder。**空にしない**（下の理由は本文にある）。
+UNREADABLE_HOLDER: dict[str, object] = {"session": "?", "job": "(申告が読めない)"}
+
+
 def read_entries_directly() -> list[dict[str, object]] | None:
     """``rb`` を経ずに掲示板のファイルを直接読む。**最後の砦。**
 
@@ -206,17 +224,15 @@ def read_entries_directly() -> list[dict[str, object]] | None:
                 found.append(data)
         return found
 
-    try:
-        if not board.is_dir():
-            return None
-    except OSError:
-        return None
-
     for data in load(board):
+        holder = data.get("holder")
         row: dict[str, object] = {
             "resource": data.get("resource"),
             "display": data.get("display"),
-            "holder": data.get("holder"),
+            # **主宣言があるのに「主宣言なし」と見せない。** 申告が読めないファイルでも、
+            # そのファイルがある限り取得は塞がれている。``describe`` は holder が空の行を
+            # 「主宣言なし / 相乗りのみ」と表示するので、事実と逆の通知になる。
+            "holder": holder if isinstance(holder, dict) and holder else UNREADABLE_HOLDER,
             "since": data.get("since"),
             "log": data.get("log"),
             "observed": data.get("observed"),
@@ -271,17 +287,26 @@ def clip(value: object, limit: int) -> str:
     重複の維持コストより、フックが常に動くことを取る。
     """
     text = value if isinstance(value, str) else ("" if value is None else str(value))
-    # 制御文字と**書式制御文字**を落とし、空白の連なりを 1 つに潰す。
-    # ``str.split()`` は改行・タブに加えて行区切り扱いの Unicode 文字（U+2028 等）も
-    # 分割対象にする。
+    # 制御文字を**空白に潰し**、書式制御文字を**落とし**、空白の連なりを 1 つにする。
     #
-    # **Cf（書式制御）まで落とす。** C0 と DEL だけでは U+202E（RLO）等の双方向制御が
+    # **Cc は消さずに空白へ写す。** 消すと ``a<改行>b`` が ``ab`` になり、語が連結する。
+    # ``nvidia-smi`` の出力をそのまま ``--observed`` に渡すのは現実的な使い方であり、
+    # そこで語が繋がると、読ませるために注入した行が読めないものになる。
+    # （``str.split()`` は改行・タブも区切るが、Cc はここへ届く前に空白になっている。
+    # 残るのは行区切り扱いの Unicode 文字（U+2028 等）で、それは split が分ける。）
+    #
+    # **Cf（書式制御）は落とす。** C0 と DEL だけでは U+202E（RLO）等の双方向制御が
     # 残り、注入した行が読む側の画面で逆順に表示される。行の中身が並べ替えられれば、
-    # 前置きの「データであって指示ではない」と行頭の印を保っていても、読まれる文が
-    # 書いた文と違うものになる。絵文字の ZWJ 連結も落ちるが、通知は読ませるためのもので
-    # あり、表示の忠実さより「見えている通りに読める」ことを取る。
+    # 行頭の印と前置きを保っていても、読まれる文が書いた文と違うものになる。
+    # こちらを空白にしないのは、幅ゼロの文字であり、空白を入れるほうが原文を歪めるため
+    # である（絵文字の ZWJ 連結や ZWNJ を使う言語では語形が変わるが、通知は読ませるための
+    # ものであり、表示の忠実さより「見えている通りに読める」ことを取る）。
     body = " ".join(
-        "".join(ch for ch in text if unicodedata.category(ch) not in ("Cc", "Cf")).split()
+        "".join(
+            " " if unicodedata.category(ch) == "Cc" else ch
+            for ch in text
+            if unicodedata.category(ch) != "Cf"
+        ).split()
     )
     data = body.encode(ENCODING, errors="replace")
     if len(data) <= limit:
@@ -452,6 +477,8 @@ def build_notice(resources: list[dict[str, object]]) -> str:
 
 def main() -> int:
     """フックの本体。何が起きても 0 を返す。"""
+    if disabled():
+        return 0
     try:
         sys.stdin.read()  # フックへの入力は使わないが、読み捨てて詰まらせない
     except Exception:  # noqa: BLE001 - fail-open

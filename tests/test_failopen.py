@@ -83,11 +83,60 @@ def test_pruning_does_not_touch_recent_audit_logs(tmp_path: Path) -> None:
     """期限内のログは消さない。**掃除が証拠を消してはならない。**"""
     directory = audit.audit_dir(tmp_path)
     directory.mkdir(parents=True)
-    recent = directory / "2020-01-02.jsonl"
+    recent = directory / f"{clock.now().date().isoformat()}.jsonl"
     recent.write_text("{}\n", encoding="utf-8")
 
     assert audit.prune(tmp_path) == 0
     assert recent.exists()
+
+
+def test_the_age_of_an_audit_log_comes_from_its_name_not_its_mtime(tmp_path: Path) -> None:
+    """複製で mtime が新しくなっても、保持期限は効く。
+
+    バックアップからの復元・``robocopy``・クラウド同期・``git checkout`` はいずれも
+    mtime を現在時刻へ書き換える。mtime で測ると、**90 日を過ぎた作業履歴が期限を
+    跨いで生き残る**。README が「90 日で消える」と書いたことが嘘になる。
+    """
+    directory = audit.audit_dir(tmp_path)
+    directory.mkdir(parents=True)
+    copied = directory / "2020-01-01.jsonl"
+    copied.write_text("{}\n", encoding="utf-8")  # mtime は今
+
+    assert audit.prune(tmp_path) == 1
+    assert not copied.exists()
+
+
+def test_pruning_records_what_it_deleted(tmp_path: Path) -> None:
+    """消したことを 1 行残す。**唯一の追跡手段を無記録で削らない。**
+
+    後日 ``audit/`` の穴を見つけた人が「期限で消えた」「そもそも書かれていない」
+    「誰かが手で消した」を区別できるようにする。
+    """
+    directory = audit.audit_dir(tmp_path)
+    directory.mkdir(parents=True)
+    (directory / "2020-01-01.jsonl").write_text("{}\n", encoding="utf-8")
+
+    assert audit.prune(tmp_path) == 1
+
+    written = "".join(path.read_text(encoding="utf-8") for path in directory.glob("*.jsonl"))
+    assert "audit_pruned" in written, written
+
+
+def test_pruning_and_recording_do_not_recurse(tmp_path: Path) -> None:
+    """記録が次の掃除を呼び、それがまた記録する——という往復にならない。
+
+    記録は 1 件でも消したときだけ行う。2 回目の掃除では消すものが残っていないので、
+    そこで必ず止まる。
+    """
+    directory = audit.audit_dir(tmp_path)
+    directory.mkdir(parents=True)
+    (directory / "2020-01-01.jsonl").write_text("{}\n", encoding="utf-8")
+
+    audit.append(tmp_path, "test_event")
+
+    today = directory / f"{clock.now().date().isoformat()}.jsonl"
+    lines = [line for line in today.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert sum("audit_pruned" in line for line in lines) == 1, lines
 
 
 def test_pruning_a_missing_audit_directory_is_not_an_error(tmp_path: Path) -> None:

@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import io
 import os
 import subprocess
 import sys
@@ -33,7 +34,11 @@ sys.exit({code})
 
 
 def run_hook(
-    *, home: Path | None = None, path: str | None = None, stdin: str = "{}"
+    *,
+    home: Path | None = None,
+    path: str | None = None,
+    stdin: str = "{}",
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """フックをサブプロセスとして起動する。"""
     env = dict(os.environ)
@@ -41,6 +46,7 @@ def run_hook(
         env["RESOURCE_BROKER_HOME"] = str(home)
     if path is not None:
         env["PATH"] = path
+    env.update(extra_env or {})
     return subprocess.run(
         [sys.executable, str(HOOK)],
         input=stdin,
@@ -326,7 +332,95 @@ def test_missing_rb_still_delivers_the_board(tmp_path: Path) -> None:
     assert "rb run" in result.stdout
 
 
-def test_the_board_can_be_read_without_rb(tmp_path: Path) -> None:
+def test_a_board_that_was_never_created_reads_as_empty_not_as_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """掲示板ディレクトリがまだ無いのは「空の掲示板」であって「読めない」ではない。
+
+    ``None`` は ``main()`` が「本当に情報が無い」と解釈して**何も出さずに終わる**合図
+    である。まだ誰も ``claim`` していないだけの状態にそれを返してはならない。
+    """
+    assert not (tmp_path / "board").exists()
+    module = load_hook_module()
+    monkeypatch.setenv("RESOURCE_BROKER_HOME", str(tmp_path))
+
+    assert module.read_entries_directly() == []
+
+
+def test_a_fresh_install_still_delivers_the_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """``rb`` が起動できず、掲示板もまだ無い——その組み合わせでも使い方は届く。
+
+    プラグインを入れた直後がまさにこの状態である。そこで黙ると、**このフックが唯一
+    配っている使い方が、いちばん要る瞬間に消える**。しかも fail-open（exit 0）なので
+    誰も気づかない。
+
+    実際、相乗りを読むための改修で ``board.is_dir()`` の早期 return が入り、この経路が
+    沈黙するようになっていた。
+    """
+    module = load_hook_module()
+    monkeypatch.setenv("RESOURCE_BROKER_HOME", str(tmp_path))
+    monkeypatch.setattr(module, "fetch_status", lambda: None)
+    monkeypatch.setattr(module.sys, "stdin", io.StringIO("{}"))
+
+    assert module.main() == 0
+
+    out = capfd.readouterr().out
+    assert out.strip(), "何も出していない"
+    assert "rb run" in out, out
+
+
+def test_the_hook_can_be_silenced_without_uninstalling(tmp_path: Path) -> None:
+    """環境変数 1 つで黙る。**止める手段を持たないものを毎ターン割り込ませない。**
+
+    注入が邪魔になった 1 セッションのために、マシン全体の掲示板を失う必要は無い。
+    """
+    declare(tmp_path, "GPU0", job="E059 eval")
+
+    result = run_hook(home=tmp_path, extra_env={"RESOURCE_BROKER_DISABLE": "1"})
+
+    assert result.returncode == 0
+    assert result.stdout == "", result.stdout
+
+
+def test_an_empty_disable_value_does_not_silence_the_hook(tmp_path: Path) -> None:
+    """空文字は「設定していない」と同じに扱う。
+
+    シェルによっては空の変数が意図せず残る。空で黙ると、**気づけない形で掲示板が消える**。
+    """
+    declare(tmp_path, "GPU0", job="E059 eval")
+
+    result = run_hook(home=tmp_path, extra_env={"RESOURCE_BROKER_DISABLE": ""})
+
+    assert result.returncode == 0
+    assert "GPU0" in result.stdout
+
+
+def test_a_primary_declaration_is_never_reported_as_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """申告が読めない主宣言を「主宣言なし」と出さない。
+
+    ファイルがある限り取得は塞がれている。「主宣言なし / 相乗りのみ」と表示すれば、
+    通知が事実と逆になる。
+    """
+    (tmp_path / "board").mkdir(parents=True)
+    (tmp_path / "board" / "gpu0.json").write_text(
+        '{"resource": "pc::GPU0", "holder": "壊れている"}', encoding="utf-8"
+    )
+    module = load_hook_module()
+    monkeypatch.setenv("RESOURCE_BROKER_HOME", str(tmp_path))
+
+    rows = module.read_entries_directly()
+
+    assert rows is not None
+    assert len(rows) == 1
+    assert isinstance(rows[0]["holder"], dict) and rows[0]["holder"], rows[0]
+    assert "主宣言なし" not in module.build_notice(rows)
+
+
+def test_the_board_can_be_read_without_rb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """``rb`` を経ずに掲示板を直接読める（最後の砦）。
 
     ``rb`` が動かない環境（Python が古い、PATH に載っていない）でも、掲示板の中身と
@@ -336,11 +430,8 @@ def test_the_board_can_be_read_without_rb(tmp_path: Path) -> None:
     """
     declare(tmp_path, "GPU0", job="E059 eval")
     module = load_hook_module()
-    os.environ["RESOURCE_BROKER_HOME"] = str(tmp_path)
-    try:
-        rows = module.read_entries_directly()
-    finally:
-        os.environ.pop("RESOURCE_BROKER_HOME", None)
+    monkeypatch.setenv("RESOURCE_BROKER_HOME", str(tmp_path))
+    rows = module.read_entries_directly()
 
     assert rows is not None
     assert len(rows) == 1
@@ -349,7 +440,9 @@ def test_the_board_can_be_read_without_rb(tmp_path: Path) -> None:
     assert rows[0]["occupied"] is True
 
 
-def test_reading_the_board_directly_shows_joiners(tmp_path: Path) -> None:
+def test_reading_the_board_directly_shows_joiners(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """``rb`` を経ない経路でも**相乗りを読む**。
 
     主宣言が先に解放されて相乗りだけが残った資源は、``board/`` を見ただけでは消える。
@@ -367,11 +460,8 @@ def test_reading_the_board_directly_shows_joiners(tmp_path: Path) -> None:
     )
     assert board.add_join(joiner, place)
     module = load_hook_module()
-    os.environ["RESOURCE_BROKER_HOME"] = str(tmp_path)
-    try:
-        rows = module.read_entries_directly()
-    finally:
-        os.environ.pop("RESOURCE_BROKER_HOME", None)
+    monkeypatch.setenv("RESOURCE_BROKER_HOME", str(tmp_path))
+    rows = module.read_entries_directly()
 
     assert rows is not None
     assert len(rows) == 1, rows
@@ -381,7 +471,9 @@ def test_reading_the_board_directly_shows_joiners(tmp_path: Path) -> None:
     assert "相乗りのジョブ" in module.build_notice(rows)
 
 
-def test_reading_the_board_directly_attaches_joiners_to_the_primary(tmp_path: Path) -> None:
+def test_reading_the_board_directly_attaches_joiners_to_the_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """主宣言と相乗りが同居していれば、1 行にまとめる（資源を 2 回並べない）。"""
     declare(tmp_path, "GPU0", job="E059 eval")
     board = Board(tmp_path)
@@ -389,11 +481,8 @@ def test_reading_the_board_directly_attaches_joiners_to_the_primary(tmp_path: Pa
     joiner = build_entry(normalize("GPU0"), job="相乗りのジョブ", cwd=place, session="malm")
     assert board.add_join(joiner, place)
     module = load_hook_module()
-    os.environ["RESOURCE_BROKER_HOME"] = str(tmp_path)
-    try:
-        rows = module.read_entries_directly()
-    finally:
-        os.environ.pop("RESOURCE_BROKER_HOME", None)
+    monkeypatch.setenv("RESOURCE_BROKER_HOME", str(tmp_path))
+    rows = module.read_entries_directly()
 
     assert rows is not None
     assert len(rows) == 1, rows
@@ -405,16 +494,15 @@ def test_reading_the_board_directly_attaches_joiners_to_the_primary(tmp_path: Pa
     assert "相乗りのジョブ" in notice
 
 
-def test_reading_the_board_directly_survives_corruption(tmp_path: Path) -> None:
+def test_reading_the_board_directly_survives_corruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """壊れたファイルがあっても飛ばして読む（例外を出さない）。"""
     declare(tmp_path, "GPU0", job="E059 eval")
     (tmp_path / "board" / "壊れている.json").write_text("{ これは JSON ではない", encoding="utf-8")
     module = load_hook_module()
-    os.environ["RESOURCE_BROKER_HOME"] = str(tmp_path)
-    try:
-        rows = module.read_entries_directly()
-    finally:
-        os.environ.pop("RESOURCE_BROKER_HOME", None)
+    monkeypatch.setenv("RESOURCE_BROKER_HOME", str(tmp_path))
+    rows = module.read_entries_directly()
 
     assert rows is not None
     assert len(rows) == 1  # 壊れた 1 件は飛ばし、正常な 1 件は読めている

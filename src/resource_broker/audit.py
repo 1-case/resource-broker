@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import date
 from pathlib import Path
 
 from . import clock
@@ -88,12 +89,21 @@ def append(root: Path, event: str, **fields: object) -> None:
 def prune(root: Path, *, max_age_days: float = AUDIT_RETENTION_DAYS) -> int:
     """古い監査ログを消す。消せた件数を返す。
 
-    今日のファイルは書き込みが続いているので mtime が新しく、対象にならない。
+    **年齢はファイル名の日付で測る。** mtime は容易に現在時刻へ書き換わる（バックアップ
+    からの復元、``robocopy``、クラウド同期、``git checkout``）。そうなると保持期限を
+    過ぎた作業履歴が期限を跨いで生き残り、README が「90 日で消える」と書いたことが
+    嘘になる。ファイル名は書いたときの日付そのものなので、複製では変わらない。
+    名前から日付が読めないものだけ mtime へ落とす。
+
+    **消したことを 1 行残す。** このモジュールは「握りつぶした失敗を後から追う唯一の
+    手段」だと宣言している。その唯一の手段を無記録で削れば、後日 ``audit/`` の穴を
+    見つけた人は「期限で消えた」「そもそも書かれていない」「誰かが手で消した」を
+    区別できない。記録は 1 件でも消したときだけ行う——これで :func:`append` との
+    往復が 2 段で必ず止まる（2 回目の :func:`prune` では消すものが残っていない）。
 
     **失敗は全て無視する。** 掃除は付随的な仕事であり、ここで例外を出すのでは
     「掃除できないから宣言できない」という本末転倒になる。
     """
-    cutoff = time.time() - max_age_days * 86400.0
     try:
         paths = list(audit_dir(root).glob("*.jsonl"))
     except OSError:
@@ -102,12 +112,24 @@ def prune(root: Path, *, max_age_days: float = AUDIT_RETENTION_DAYS) -> int:
     removed = 0
     for path in paths:
         try:
-            if path.stat().st_mtime < cutoff:
+            if _age_days(path) > max_age_days:
                 path.unlink()
                 removed += 1
         except OSError:
             continue
+
+    if removed:
+        append(root, "audit_pruned", removed=removed, retention_days=max_age_days)
     return removed
+
+
+def _age_days(path: Path) -> float:
+    """ファイルの古さ（日）。ファイル名の日付を優先し、読めなければ mtime。"""
+    try:
+        stamp = date.fromisoformat(path.stem)
+    except ValueError:
+        return (time.time() - path.stat().st_mtime) / 86400.0
+    return float((clock.now().date() - stamp).days)
 
 
 def _encode(record: dict[str, object]) -> bytes:

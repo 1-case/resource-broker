@@ -17,12 +17,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from resource_broker.board import Board, build_entry
+from resource_broker.naming import normalize
 
 ROOT = Path(__file__).resolve().parent.parent
 BIN = ROOT / "bin"
@@ -261,11 +265,77 @@ def test_sh_hook_launcher_survives_a_crashing_hook(hook_tree: Path) -> None:
     assert result.returncode == 0, result.stderr
 
 
-# --- 版の門は生の traceback を出さない ---------------------------------------------
+# --- ランチャの正常系（壊れたら沈黙するので、ここだけは動作で確かめる） -------------
 
 
 @needs_sh
-def test_the_version_gate_explains_itself(tmp_path: Path) -> None:
+def test_sh_hook_launcher_actually_runs_the_hook(tmp_path: Path) -> None:
+    """フックが**実際に出力する**ことを確かめる。
+
+    ``rb-hook`` は必ず 0 で戻る設計なので、**壊れたときの症状は必ず沈黙**である。
+    終了コードだけを見るテストは、ランチャを空ファイルにしても全部通る。配布層は
+    実際に cp932 でそうやって壊れた。ここだけは「出た」ことを見る。
+    """
+    board = Board(tmp_path)
+    assert board.try_claim(build_entry(normalize("GPU0"), job="E059 eval", session="folnet"))
+
+    result = run_sh(BIN / "rb-hook", "prompt_board_reminder", home=tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "GPU0" in result.stdout, result.stdout
+
+
+@needs_cmd
+def test_cmd_hook_launcher_actually_runs_the_hook(tmp_path: Path) -> None:
+    """cmd 版でも同じ。**Windows でだけ沈黙する壊れ方を許さない。**"""
+    board = Board(tmp_path)
+    assert board.try_claim(build_entry(normalize("GPU0"), job="E059 eval", session="folnet"))
+
+    result = run_cmd(BIN / "rb-hook.cmd", "prompt_board_reminder", home=tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "GPU0" in result.stdout, result.stdout
+
+
+def test_every_hook_named_in_hooks_json_exists_and_is_launchable() -> None:
+    """``hooks.json`` の名前・``hooks/*.py`` の実ファイル・ランチャの制約が一致している。
+
+    フックを 1 つ改名すると ``hooks.json`` の指す先が消え、``rb-hook`` は ``[ -f ]`` で
+    0 を返して**沈黙する**。三者がずれたことに気づく手段が他に無い。
+    """
+    spec = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    commands = [
+        hook["command"]
+        for groups in spec["hooks"].values()
+        for group in groups
+        for hook in group["hooks"]
+    ]
+    assert commands, spec
+
+    for command in commands:
+        name = command.rsplit(" ", 1)[-1]
+        assert re.fullmatch(r"[a-z0-9_]+", name), f"{name} はランチャの制約に合わない"
+        assert (ROOT / "hooks" / f"{name}.py").is_file(), f"hooks/{name}.py が無い"
+
+
+def test_every_hook_declares_an_upper_bound_on_its_own_runtime() -> None:
+    """フックに上限時間が書いてある。
+
+    ``PreToolUse`` が返らないと**全 Bash 呼び出しが待たされる**。``guard.json`` に
+    指数時間の正規表現を 1 本置けば起こる。上限は 1 行で確定できる。
+    """
+    spec = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+
+    for groups in spec["hooks"].values():
+        for group in groups:
+            for hook in group["hooks"]:
+                assert isinstance(hook.get("timeout"), int), hook
+
+
+# --- 版の門は生の traceback を出さない ---------------------------------------------
+
+
+def test_the_version_gate_explains_itself() -> None:
     """古い python で起動しても、内部を指す traceback ではなく案内が出る。
 
     ``bin/rb.py`` を直接叩いて門だけを見る（ランチャは版で候補を選ぶため、
