@@ -510,11 +510,22 @@ def acquire_join(
         return Acquisition(None, EXIT_USAGE)
 
     # claim と違い `--found busy` でも止めない。相乗りは使われていることが前提である。
+    #
+    # **PID を記録する。** ラッパーはジョブと同じ寿命を持つので、生存確認が意味を持つ
+    # （手動の `rb join` は記録しない。あちらを実行するのは CLI プロセスであり、
+    # すぐ終わるので生存確認が「死んでいる」を返すだけになる）。
+    #
+    # **記録するだけで、判定は増やさない。** 退去の根拠は 3 つだけである
+    # （DESIGN.md「Liveness Judgment」）。`pid_alive` は「単独の根拠にしてはならない」と
+    # 自分で宣言している材料なので、これを 4 つ目の根拠に格上げしない。
+    # ラッパーが強制終了された相乗りは `rb status` に PID が出るので、
+    # 読んだ側が `rb release --join` か `--force` を選べる。
     entry = build_entry(
         resource_id,
         job=args.job,
         display=args.display or "",
         log=log,
+        pid=os.getpid(),
         observed={"note": args.observed, "found": args.found},
         eta=args.eta,
         peak=args.peak or "",

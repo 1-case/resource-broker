@@ -923,3 +923,33 @@ def test_the_wrapper_withdraws_its_own_join_via_cas(
 
     assert joins(tmp_path) == []
     assert seen, "相乗りの取り下げが CAS を通っていない"
+
+
+def test_a_wrapper_join_records_its_pid(tmp_path: Path) -> None:
+    """``rb run --join`` は PID を記録する。**判定には使わないが、読めば分かる。**
+
+    ラッパーはジョブと同じ寿命を持つ。強制終了されると相乗りは同一ブート中残るので、
+    どの申告が死んでいるかを読む側が見分けられる必要がある。
+
+    ジョブが終わると申告は取り下げられるので、**走っている最中に子から覗く**。
+    """
+    hold(tmp_path)
+    snapshot = tmp_path / "snapshot.json"
+    peek = (
+        "import glob, sys\n"
+        "paths = sorted(glob.glob(sys.argv[1]))\n"
+        "open(sys.argv[2], 'w', encoding='utf-8').write(open(paths[0], encoding='utf-8').read())\n"
+    )
+
+    code = rb_join_run(
+        tmp_path,
+        sys.executable,
+        "-c",
+        peek,
+        str(tmp_path / "board" / "joins" / "*.json"),
+        str(snapshot),
+    )
+
+    assert code == 0
+    declared = json.loads(snapshot.read_text(encoding="utf-8"))
+    assert isinstance(declared["holder"].get("pid"), int), declared["holder"]
