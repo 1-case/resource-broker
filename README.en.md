@@ -99,7 +99,8 @@ silently does not hold is worse than being split.**
 ```
 
 That brings in the three hooks and the `rb` command together. **No `uv tool install` needed**:
-the package has zero dependencies, so the launcher in `bin/` just works.
+a plugin's `bin/` is [added to the Bash tool's PATH](https://code.claude.com/docs/en/plugins-reference)
+by Claude Code itself, and the package has zero dependencies, so the launcher just works.
 
 Hooks are a snapshot taken at session start, so **already-running sessions are unaffected**
 until they restart. The only requirement is Python 3.11+.
@@ -163,6 +164,38 @@ free text, so spellings drift — `GPU0` and `gpu0` are *different resources* �
 lookup silently answers "free" while someone holds the other spelling. This actually happened:
 a job held `gpu0` for 7.3 hours while `rb status GPU0` reported it free.
 
+## Hooks
+
+Three hooks, and **none of them blocks anything.** They put the facts where the decision is
+being made; the decision stays yours.
+
+| Hook | Role |
+|---|---|
+| `SessionStart` | the current board plus how to use it (criterion, command shapes) |
+| `UserPromptSubmit` | the list of declarations only (45 chars when nothing is declared) |
+| `PreToolUse`(Bash) | before a command that matches the pattern table, the state of that resource |
+
+**No hook ever returns `permissionDecision`.** `deny` is not used because the tool cannot know
+whether a given command touches a resource — guessing wrong stops work that was fine (it once
+stopped an edit to this tool's own documentation). `allow` is worse: it bypasses the permission
+prompt itself, so a hook meant to *warn* would end up auto-approving every command. Getting a
+notice wrong costs one extra line of text; getting `allow` wrong costs the permission model.
+
+**No hook waits.** Blocking inside a hook freezes the session in a way the user cannot escape
+with Esc, and nothing appears on screen. Waiting is `rb wait`: visible as a tool call,
+interruptible, and every poll lands in the audit log.
+
+`PreToolUse` **prints nothing unless a pattern table (`guard.json`) exists**, and none is
+shipped — so out of the box the third hook stays silent. You decide what deserves a notice:
+
+```jsonc
+// %LOCALAPPDATA%\resource-broker\guard.json  (elsewhere: ~/.resource-broker/guard.json)
+{ "schema": 1, "patterns": [
+    { "pattern": "run_e\\d+\\.py", "resource": "GPU0", "note": "training scripts" } ] }
+```
+
+A stale table is harmless: it stops matching, so notices stop — nothing is ever blocked.
+
 ## The cost (it eats context every turn)
 
 This tool **interposes on every prompt and every Bash call**. Here is what you pay, not just
@@ -202,17 +235,6 @@ What changes when messaging arrives is how you *wait*: instead of `rb wait` poll
 holder set to shrink, you identify the holder from the board and ask them directly.
 **The board isn't replaced — it becomes what supplies the reason to reach out.**
 
-`PreToolUse` **prints nothing unless a pattern table (`guard.json`) exists**, and none is
-shipped — so out of the box the third hook stays silent. You decide what deserves a notice:
-
-```jsonc
-// %LOCALAPPDATA%\resource-broker\guard.json  (elsewhere: ~/.resource-broker/guard.json)
-{ "schema": 1, "patterns": [
-    { "pattern": "run_e\\d+\\.py", "resource": "GPU0", "note": "training scripts" } ] }
-```
-
-A stale table is harmless: it stops matching, so notices stop — nothing is ever blocked.
-
 ## Design notes
 
 - **Measurement is treated asymmetrically.** "Busy" is decisive on its own. "Free" **never**
@@ -237,8 +259,10 @@ that led there is deliberately not in it.
 The board and the audit log live in **`%LOCALAPPDATA%\resource-broker\`** (`~/.resource-broker/`
 elsewhere); `RESOURCE_BROKER_HOME` moves them. They hold `board/` (declarations), `audit/`
 (the audit log) and `logs/` (`rb run` output), and are **never created inside the repository**.
-`logs/` is pruned after 7 days; **`audit/` is never pruned** (`rb wait` appends a line every
-10 seconds, so it grows monotonically). Delete it by hand when you no longer need it.
+`logs/` is pruned after 7 days and `audit/` after 90; pruning happens on the first write of
+each day. The audit log holds job descriptions and the working directory of each declaration,
+so it is a record of what you were doing and when — it is not allowed to grow without bound.
+Deleting either directory by hand is safe at any time.
 
 **The board is plaintext and is not encrypted.** Every session that reads or writes it runs as
 the same OS user on the same machine, so any process that can read the ciphertext can read the
@@ -247,7 +271,23 @@ i.e. every session stops, and the audit log would no longer be readable with ord
 
 The real attack surface is **prompt injection**: free text from other sessions flows directly
 into your context. Injected lines are marked as data rather than instructions, truncated by
-byte length, and stripped of newlines and control characters.
+byte length, and stripped of newlines, control characters and bidirectional format characters
+(so an injected line cannot reorder itself on screen).
+
+Four properties you can check quickly, because they are what a reviewer will want to know:
+
+- **No network access anywhere.** There is no `urllib`, `http`, `socket` client or third-party
+  HTTP library in the tree; the single `socket` call is `gethostname()`. Nothing is uploaded,
+  reported or phoned home.
+- **No `shell=True`, ever.** `subprocess` appears in exactly three places: spawning your job in
+  `rb run` (argv straight through, no shell re-parsing), reading `kern.boottime` on macOS, and
+  the `SessionStart` hook invoking this repository's own `bin/rb.py`.
+- **No resource-specific code path.** Nothing branches on a resource ID and there is no probe
+  module; the tool never inspects a GPU, a port or anything else. It records what *you* say you
+  observed, with a machine-generated timestamp beside it.
+- **No binaries.** `bin/` holds five dependency-free launcher scripts (two `sh`, two `.cmd`,
+  one Python); everything else is Python source you can read. Nothing is downloaded at install
+  time, so there is no fetched artifact to pin a hash against.
 
 Two things are on you:
 

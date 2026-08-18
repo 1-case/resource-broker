@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-- **名前**: resource-broker（CLI 名は `resource-broker`、短縮エイリアス `rb`）。**言語**: Python 3.13 / uv。ただしフックとラッパーは
+- **名前**: resource-broker（CLI 名は `resource-broker`、短縮エイリアス `rb`）。**言語**: Python 3.11 以上 / uv。ただしフックとラッパーは
   **stdlib のみ**で単体動作する
 - **概要**: 同一マシン上で独立に動く複数の Claude Code セッションが、有限資源の使用状況を共有するための**掲示板**。ロックによる強制では
   なく、宣言と参照によって事故を防ぐ。**資源の種別を実装に持たない** — 調べるのは資源を使おうとするセッションであり、本ツールは
@@ -49,7 +49,7 @@
 
 | カテゴリ | 技術 | バージョン | ライセンス | 備考 |
 |---|---|---|---|---|
-| 言語 | Python | 3.13 | PSF | フック/ラッパーは stdlib のみ |
+| 言語 | Python | 3.11 以上 | PSF | フック/ラッパーは stdlib のみ |
 | パッケージ管理 | uv | - | - | 開発・テスト用。実行時には要求しない |
 | 掲示板形式 | JSON (`json`) | stdlib | PSF | 資源ごとに 1 ファイル |
 | テスト / Lint | pytest / ruff | - | MIT | |
@@ -476,7 +476,7 @@ resource-broker@resource-broker`）。手動導入はフォールバックとし
 | `bin/rb-hook`, `bin/rb-hook.cmd` | フックの起動（python の在り処を吸収する） |
 | `bin/rb.py` | `sys.path` に `src` を足して CLI を呼ぶ土台。**`PYTHONPATH` は使わない**（区切り文字が OS で違う） |
 
-- `bin/` は **Bash ツールの PATH に載る**ので `uv tool install` は要らない。ただし**`${CLAUDE_PLUGIN_ROOT}` は Bash ツールには渡らない**
+- `bin/` は **Bash ツールの PATH に載る**ので `uv tool install` は要らない（[plugins-reference](https://code.claude.com/docs/en/plugins-reference) が「`bin/` — Executables added to the Bash tool's `PATH`」と定める公式の仕組みである）。ただし**`${CLAUDE_PLUGIN_ROOT}` は Bash ツールには渡らない**
   （フックのプロセスには渡る）ため、Bash の例でこの変数を使ってはならない。プラグインと手動登録を併用すると**フックが 2 重に発火する**
 - **python の探索順は `py` を先頭にして 4 本のランチャすべてでそろえる**。Windows の App Execution Alias は `command -v` に**成功する**の
   に起動すると Microsoft Store が開くため、各ランチャが実体を検証する（詳細は `bin/`）
