@@ -1,28 +1,14 @@
-# CI: 1-case 組織の self-hosted runner（Linux ARM64 / Raspberry Pi CM5）で実行する。
+# CI: GitHub ホストの runner で実行する。
 #
-# **private の間は GitHub ホストの runner を使わない。** private リポジトリでは
-# GitHub ホストの実行が Free プランの 2,000 分/月を消費し、しかも windows-latest は
-# 2 倍、macOS は 10 倍で加算される。self-hosted は private でも消費しない。
+# **self-hosted は使わない。** 公開リポジトリで self-hosted を使うと、fork からの
+# pull request が**自分のマシン上で任意のコードを実行できる**（GitHub が明示的に警告している）。
+# 「他人に CI を触らせない」を満たすのは、隔離された使い捨ての runner のほうである。
+# 公開リポジトリなら GitHub ホストの標準 runner は分数を消費しない
+# （2,000 分/月の制限と windows 2 倍・macOS 10 倍の係数は private のときだけ）。
 #
-# **公開したら GitHub ホストへ移す。** 理由は 2 つあり、どちらも公開時にだけ成立する。
-#   1. 公開リポジトリなら GitHub ホストの標準 runner は分数を消費しない
-#   2. **公開リポジトリで self-hosted を使うと、fork からの pull request が
-#      自分のマシン上で任意のコードを実行できる**（GitHub が明示的に警告している）。
-#      「他人に CI を触らせない」を満たすのは、隔離された使い捨ての runner のほうである
-# 移行先は ubuntu-latest + windows-latest + macos-latest の matrix とする。
-# 2026-08-14 に ubuntu / windows を試して両方 green を確認済み。macos-latest も
-# 公開後なら分数を消費せず回せる（10 倍係数がかかるのは private のときだけである）。
-# macOS の起動時刻取得（sysctl kern.boottime）は実機が無いため注入テストで守っているが、
-# 公開後は実機で回せるようになる。
-#
-# 本ツールは Windows を第一級の対象とするが、プラットフォーム依存部分（boot time 取得・
-# PID の生存確認・プロセスツリーの終了）は platform_info.py と runner.py に隔離してあるため、
-# 純粋なロジック（掲示板・幽霊判定・命名・待機）は Linux 上でも検証できる。
-# 本ツールは資源を調べないので、実 GPU・実 COM を要求するテストは原理的に存在しない。
-#
-# 既知の穴: Windows 固有の ctypes 経路（GetTickCount64 / OpenProcess）は CI を通らない。
-# 公開して matrix へ移すまでは、**開発機（Windows）で uv run pytest を回すことが唯一の
-# 検証経路**である。手元で通してからコミットすること。
+# matrix に windows と macOS を入れるのは、プラットフォーム依存部分を実機で通すためである。
+# platform_info.py の ctypes 経路（GetTickCount64 / OpenProcess）と sysctl 経路
+# （kern.boottime）は、それぞれ Windows と macOS でしか実行されない。
 name: CI
 
 on:
@@ -33,29 +19,90 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    runs-on: [self-hosted, Linux, ARM64]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-
-      # uv が runner に無ければ導入する（管理された Python も uv sync が自動取得する）
-      - name: Set up uv
-        run: |
-          if ! command -v uv >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/uv" ]; then
-            curl -LsSf https://astral.sh/uv/install.sh | sh
-          fi
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Sync dependencies
-        run: uv sync
-
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync
       - name: Lint
         run: uv run ruff check .
-
       - name: Format check
         run: uv run ruff format --check .
-
       - name: Test
         run: uv run pytest
+
+  # 利用者と同じ手順で入れて、往復するところまで確かめる。
+  # **配布層は書いた本人の環境では検証できない。** 開発機には rb が PATH にあり、
+  # Git Bash があり、Python が新しい。その条件が偽になったときにだけ現れる欠陥が
+  # 実際に複数出た（cmd の終了コード、cp932 でのバッチ破損、Store スタブ）。
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install as a user would
+        run: uv tool install .
+      - name: Round trip
+        shell: bash
+        env:
+          RESOURCE_BROKER_HOME: ${{ runner.temp }}/rb-ci
+        run: |
+          set -eu
+          rb --help > /dev/null
+          rb claim CI-RESOURCE --job "CI round trip" \
+             --observed "temporary board on CI; no real resource is touched" \
+             --eta 5m --found free
+          rb status | grep -q CI-RESOURCE
+          # 使用中なら 2 度目の claim は 1 で戻る（排他が効いていること）
+          if rb claim CI-RESOURCE --job x --observed y --eta 1m; then
+            echo "a busy resource was claimed twice" >&2; exit 1
+          fi
+          rb release CI-RESOURCE
+
+  # プラグインとしての妥当性。Claude Code は npm で入るので CI で回せる。
+  plugin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Validate the plugin manifest
+        run: npx --yes @anthropic-ai/claude-code plugin validate .
+
+  # 版が 3 箇所に散っている。ずれると /plugin が古い版を表示し続け、更新が届かない。
+  manifests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version consistency
+        run: |
+          python - <<'PY'
+          import json, pathlib, re, sys
+          plugin = json.loads(pathlib.Path(".claude-plugin/plugin.json").read_text(encoding="utf-8"))["version"]
+          market = json.loads(pathlib.Path(".claude-plugin/marketplace.json").read_text(encoding="utf-8"))["plugins"][0]["version"]
+          pyproj = re.search(r'^version = "([^"]+)"', pathlib.Path("pyproject.toml").read_text(encoding="utf-8"), re.M).group(1)
+          if not plugin == market == pyproj:
+              sys.exit(f"version mismatch: plugin={plugin} marketplace={market} pyproject={pyproj}")
+          print(f"version ok: {plugin}")
+          PY
