@@ -42,8 +42,12 @@ jobs:
     # 「公開したら GitHub ホストへ移す」という手順に頼らない。手順は忘れられるし、
     # 忘れたことが分かるのは踏まれた後である。**公開の瞬間に危険になる設定を
     # 置いたままにしない。** この条件は移行後も無害なので、外す理由が無い。
+    #
+    # **許可する側を書く。** 「pull_request でなければ通す」と書くと、あとで
+    # `pull_request_target` や `issue_comment` トリガを足した瞬間に条件が真になり、
+    # fork のコードが self-hosted へ届く。足したときに気づけない形で開く穴になる。
     if: >-
-      github.event_name != 'pull_request' ||
+      github.event_name == 'push' ||
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, ARM64]
     timeout-minutes: 20
