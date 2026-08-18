@@ -313,7 +313,15 @@ def test_every_hook_named_in_hooks_json_exists_and_is_launchable() -> None:
     assert commands, spec
 
     for command in commands:
-        name = command.rsplit(" ", 1)[-1]
+        launcher, _, name = command.rpartition(" ")
+
+        # **ランチャの側も見る。** フック名だけを確かめても、`bin/rb-hook` を改名・移動
+        # したり hooks.json のパスを打ち間違えたりすれば、フックは 3 つとも黙る。
+        # 「三者がずれたことに気づく手段が他に無い」と言っている当のずれ方である。
+        assert "${CLAUDE_PLUGIN_ROOT}" in launcher, launcher
+        relative = launcher.split("}", 1)[-1].strip('"').lstrip("/")
+        assert (ROOT / relative).is_file(), f"{relative} が無い"
+
         assert re.fullmatch(r"[a-z0-9_]+", name), f"{name} はランチャの制約に合わない"
         assert (ROOT / "hooks" / f"{name}.py").is_file(), f"hooks/{name}.py が無い"
 

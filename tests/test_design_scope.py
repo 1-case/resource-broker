@@ -22,7 +22,16 @@ ROOT = Path(__file__).resolve().parent.parent
 DESIGN = ROOT / "docs" / "DESIGN.md"
 
 #: 行数の上限。増えたぶんはたいてい経緯である。
-MAX_LINES = 600
+#: DESIGN.md の行数上限。
+#:
+#: 1175 行あった文書を「最終到達状態だけ」に絞ったときの実測（599 行）に合わせて置いた。
+#: **上げるのは仕様が増えたときだけで、散文が増えたときではない。** 散文を止めるのは
+#: この数ではなく :data:`NARRATIVE` と「私的文書へリンクしない」の 2 つである。
+#:
+#: 620 へ上げたのは、公開 API（``RESOURCE_BROKER_DISABLE``）と保持期限、そして
+#: 受け入れた残余 3 件を書く場所が無くなったためである。**必要な仕様を番人が
+#: 塞ぐなら、番人のほうが間違っている。**
+MAX_LINES = 620
 
 #: 公開しない文書。**公開物からここへリンクすると参照切れになる。**
 PRIVATE_DOCS = ("EXPERIMENTS.md", "STATUS.md", "tools/speak.py", "tools/speak_dict.json")
@@ -144,10 +153,17 @@ def test_a_self_hosted_runner_never_accepts_a_fork_pull_request() -> None:
     「公開したら GitHub ホストへ移す」という手順に頼らない。手順は忘れられるし、
     忘れたことが分かるのは踏まれた後である。公開の瞬間に危険になる設定は、
     private のうちから置かない。
+
+    **限界を書いておく。** self-hosted runner をカスタムラベル（``runs-on: pi-cm5``）で
+    登録すると、この番人からは見えない。「番人があるから安全」とは読まないこと。
     """
     guard = "github.event.pull_request.head.repo.full_name == github.repository"
 
-    for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+    workflows = sorted(
+        list((ROOT / ".github" / "workflows").glob("*.yml"))
+        + list((ROOT / ".github" / "workflows").glob("*.yaml"))
+    )
+    for path in workflows:
         # コメントは落とす。**この workflow は自分の危険をコメントで説明している**ので、
         # 素朴に探すと説明文そのものに反応する。
         lines = [
@@ -196,3 +212,31 @@ def test_the_version_is_the_same_everywhere() -> None:
         data = json.loads((ROOT / ".claude-plugin" / name).read_text(encoding="utf-8"))
         found = data.get("version") or data["plugins"][0]["version"]
         assert found == expected, f"{name} の版 {found} が pyproject の {expected} と違う"
+
+
+# --- README が数えている件数と実装を一致させる ---------------------------------------
+
+
+def test_the_readmes_state_the_real_number_of_subprocess_calls() -> None:
+    """README の「``subprocess`` は N か所」が実装と一致している。
+
+    **これは 2 周連続で嘘になった。** 1 度目は ``taskkill`` を数え落とし、2 度目は
+    ログを開けなかったときの退避路を足した自分の修正で 4 が 5 になった。
+    README 自身が「審査や監査で最初に確かめられる性質」と前置きしている行であり、
+    ``grep`` 一発で嘘が見つかる。**散文が実装を追い越せないように機械で縛る。**
+    """
+    pattern = re.compile(r"subprocess\.(run|Popen)\(")
+    count = sum(
+        1
+        for folder in ("src", "hooks")
+        for path in (ROOT / folder).rglob("*.py")
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if pattern.search(line)
+    )
+
+    assert count > 0, "数え方が壊れている"
+    for name in ("README.md", "README.en.md"):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        assert f"subprocess` は {count} か所" in text or f"in exactly {count} places" in text, (
+            f"{name} が {count} 以外の件数を書いている"
+        )

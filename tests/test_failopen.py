@@ -10,14 +10,16 @@
 
 from __future__ import annotations
 
+import json
 import os
+import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from resource_broker import audit, clock, platform_info
+from resource_broker import audit, clock, platform_info, runner
 from resource_broker.board import Board, build_entry
 from resource_broker.cli import main
 
@@ -304,3 +306,69 @@ def test_lock_failure_does_not_look_like_contention(
     assert "宣言しました" in captured.out
     assert "排他を弱めて続行" in captured.err
     assert board.list_all()  # 宣言は残っている（ロック無しでも取得はできる）
+
+
+def test_a_caller_cannot_override_the_audit_timestamp(tmp_path: Path) -> None:
+    """監査ログの ``at`` は呼び出し側から上書きできない。
+
+    ``event`` は位置引数なので Python 自身が二重指定を拒む。時刻は ``**fields`` 経由で
+    入ってこられるため、**機械の値を後に置く**ことでしか守れない。
+    """
+    audit.append(tmp_path, "test_event", at="2000-01-01T00:00:00+09:00")
+
+    written = "".join(
+        path.read_text(encoding="utf-8") for path in audit.audit_dir(tmp_path).glob("*.jsonl")
+    )
+    record = json.loads(written.splitlines()[0])
+
+    assert record["at"] != "2000-01-01T00:00:00+09:00"
+    assert record["event"] == "test_event"
+
+
+def test_a_log_that_cannot_be_opened_does_not_stop_the_job(tmp_path: Path) -> None:
+    """ログを開けなくてもジョブは走る。**ログの故障は資源の競合ではない。**
+
+    ここで諦めると「ログ置き場が書けないからジョブが走らない」ことになる。
+    本ツールがユーザーの作業を止めてよい場面は無い。
+    """
+    blocked = tmp_path / "logs"
+    blocked.mkdir()  # ディレクトリなので "ab" では開けない
+
+    code = runner.default_spawn(
+        [sys.executable, "-c", "print('走った')"], blocked, dict(os.environ)
+    )
+
+    assert code == 0
+
+
+def test_a_broken_log_sink_does_not_stop_the_child(tmp_path: Path) -> None:
+    """ログが書けなくなっても**読むのはやめない**。
+
+    読むのをやめると ``finally`` が読み口を閉じ、子は次の書き込みで EPIPE を受けて
+    死ぬ。**ディスクが一杯なだけでジョブが落ちる。**
+    """
+
+    class Exploding:
+        def write(self, _data: bytes) -> int:
+            raise OSError("ディスクが一杯")
+
+        def flush(self) -> None:
+            raise OSError("ディスクが一杯")
+
+    chunks = [b"a" * 10, b"b" * 10, b"c" * 10]
+    drained: list[bytes] = []
+
+    class Source:
+        def read1(self, _size: int) -> bytes:
+            if not chunks:
+                return b""
+            chunk = chunks.pop(0)
+            drained.append(chunk)
+            return chunk
+
+        def close(self) -> None:
+            pass
+
+    runner._pump(Source(), Exploding(), 1000)
+
+    assert len(drained) == 3, "sink が壊れた時点で読むのをやめている"
