@@ -393,6 +393,12 @@ class Entry:
         書き戻したときに壊れた値が正規の位置へ戻らないようにするためである。
         """
         expected: dict[str, type | tuple[type, ...]] = {
+            # ``schema`` もここに入れる。**形式を識別する当のキーを例外にしない。**
+            # 将来 semver 文字列（``"2.1"``）や dict を採る版が現れたとき、旧版が読んで
+            # 書き戻すと版の印だけが現行版に化け、拡張フィールドは ``extra`` に残る
+            # ——つまり「schema 1 なのに未来の鍵がある」という、この仕組みが防ごうと
+            # している状態そのものになる。
+            "schema": int,
             "display": str,
             "holder": dict,
             "log": str,
@@ -405,7 +411,13 @@ class Entry:
         }
         extra: dict[str, object] = {k: v for k, v in data.items() if k not in _KNOWN_KEYS}
         for key, kind in expected.items():
-            if key in data and data[key] is not None and not isinstance(data[key], kind):
+            # ``bool`` は ``int`` の派生なので、``schema: true`` を通さないよう明示的に除く。
+            broken = isinstance(data.get(key), bool) and kind is int
+            if (
+                key in data
+                and data[key] is not None
+                and (broken or not isinstance(data[key], kind))
+            ):
                 # **既にある ``x-`` を潰さない。** ``x-`` は拡張フィールドの慣例接頭辞で、
                 # 別の版がその名前を使っている可能性がある。退避のために別の値を消せば、
                 # この関数が防ごうとしている取りこぼしを自分で起こす。
