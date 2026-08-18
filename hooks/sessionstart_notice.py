@@ -206,13 +206,19 @@ def read_entries_directly() -> list[dict[str, object]] | None:
     「誰が何を宣言しているか」をそのまま見せる場所である。
     """
     board = board_root() / "board"
+    # **「まだ無い」と「読めない」を分ける。** 読めないのに「掲示板は空です」と断定すると、
+    # 実際には使われている資源を全セッションへ「空き」として配る。空きは宣言を退ける
+    # 根拠にならない、という原則の裏返しであり、断定してよい側ではない。
+    unreadable = False
     rows: list[dict[str, object]] = []
     by_resource: dict[str, dict[str, object]] = {}
 
     def load(directory: Path) -> list[dict[str, object]]:
+        nonlocal unreadable
         try:
             paths = sorted(directory.glob("*.json"))
         except OSError:
+            unreadable = True
             return []
         found: list[dict[str, object]] = []
         for path in paths:
@@ -268,6 +274,9 @@ def read_entries_directly() -> list[dict[str, object]] | None:
         joins = row.get("joins")
         if isinstance(joins, list):
             joins.append(data)
+
+    if unreadable and not rows:
+        return None  # 読めなかった。**空だとは言えない**
     return rows
 
 
@@ -301,13 +310,23 @@ def clip(value: object, limit: int) -> str:
     # こちらを空白にしないのは、幅ゼロの文字であり、空白を入れるほうが原文を歪めるため
     # である（絵文字の ZWJ 連結や ZWNJ を使う言語では語形が変わるが、通知は読ませるための
     # ものであり、表示の忠実さより「見えている通りに読める」ことを取る）。
-    body = " ".join(
-        "".join(
-            " " if unicodedata.category(ch) == "Cc" else ch
-            for ch in text
-            if unicodedata.category(ch) != "Cf"
-        ).split()
-    )
+    # **切ってから走査する。** 出力の上限はどれも 200 バイト程度なのに、走査は
+    # 元の全文に掛かっていた。``--observed "$(nvidia-smi)"`` のような使い方で
+    # 200KB の申告が 1 件あると、**毎プロンプト**その全文を舐めることになる。
+    # 上限のバイト数より十分大きいところで頭打ちにすれば、結果は変わらない。
+    text = text[: limit * 4 + 64]
+    # ``category`` は 1 文字につき 1 回だけ呼ぶ。ASCII は表を引かずに決める
+    # （Cc は U+0000-1F と U+7F、Cf は非 ASCII にしか無い）。
+    kept: list[str] = []
+    for ch in text:
+        if ch < "\x80":
+            kept.append(" " if ch < " " or ch == "\x7f" else ch)
+            continue
+        category = unicodedata.category(ch)
+        if category == "Cf":
+            continue
+        kept.append(" " if category == "Cc" else ch)
+    body = " ".join("".join(kept).split())
     data = body.encode(ENCODING, errors="replace")
     if len(data) <= limit:
         return body
@@ -478,6 +497,12 @@ def build_notice(resources: list[dict[str, object]]) -> str:
 def main() -> int:
     """フックの本体。何が起きても 0 を返す。"""
     if disabled():
+        # **黙るときも読み捨てる。** 読まずに戻ると、親が書き込み中の場合に
+        # ``EPIPE`` を受ける。読む理由は出力するかどうかと無関係である。
+        try:
+            sys.stdin.read()
+        except Exception:  # noqa: BLE001 - fail-open
+            pass
         return 0
     try:
         sys.stdin.read()  # フックへの入力は使わないが、読み捨てて詰まらせない
@@ -492,13 +517,18 @@ def main() -> int:
             resources = read_entries_directly()
             degraded = True
         if resources is None:
-            return 0  # 掲示板そのものが読めない。これは本当に情報が無い
+            # 掲示板そのものが読めない。**空だと言わずに、読めなかったと言う。**
+            emit(
+                f"[resource-broker] 掲示板を読めませんでした"
+                f"（掲示板: {board_root()}）。**空とは限りません。**\n{USAGE}"
+            )
+            return 0
         notice = build_notice(resources)
         if degraded:
             notice += (
                 "\n注意: rb コマンドを起動できませんでした"
                 "（PATH に無い、または Python が 3.11 未満）。\n"
-                "掲示板は直接読んでいるので上の内容は正しいが、rb status / rb run は"
+                "掲示板は直接読んでいるが、rb status / rb run は"
                 "打てない状態である。"
             )
         emit(notice)

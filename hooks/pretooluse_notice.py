@@ -131,13 +131,23 @@ def clip(value: object, limit: int) -> str:
     # こちらを空白にしないのは、幅ゼロの文字であり、空白を入れるほうが原文を歪めるため
     # である（絵文字の ZWJ 連結や ZWNJ を使う言語では語形が変わるが、通知は読ませるための
     # ものであり、表示の忠実さより「見えている通りに読める」ことを取る）。
-    body = " ".join(
-        "".join(
-            " " if unicodedata.category(ch) == "Cc" else ch
-            for ch in text
-            if unicodedata.category(ch) != "Cf"
-        ).split()
-    )
+    # **切ってから走査する。** 出力の上限はどれも 200 バイト程度なのに、走査は
+    # 元の全文に掛かっていた。``--observed "$(nvidia-smi)"`` のような使い方で
+    # 200KB の申告が 1 件あると、**毎プロンプト**その全文を舐めることになる。
+    # 上限のバイト数より十分大きいところで頭打ちにすれば、結果は変わらない。
+    text = text[: limit * 4 + 64]
+    # ``category`` は 1 文字につき 1 回だけ呼ぶ。ASCII は表を引かずに決める
+    # （Cc は U+0000-1F と U+7F、Cf は非 ASCII にしか無い）。
+    kept: list[str] = []
+    for ch in text:
+        if ch < "\x80":
+            kept.append(" " if ch < " " or ch == "\x7f" else ch)
+            continue
+        category = unicodedata.category(ch)
+        if category == "Cf":
+            continue
+        kept.append(" " if category == "Cc" else ch)
+    body = " ".join("".join(kept).split())
     data = body.encode(ENCODING, errors="replace")
     if len(data) <= limit:
         return body
@@ -272,14 +282,38 @@ def declarations_for(root: Path, resource: str | None) -> list[dict[str, object]
     return found
 
 
+def session_id() -> str:
+    """このセッションの識別子。取れなければ空文字。
+
+    本体の :func:`platform_info.session_id` と**同じ規則**にする（import はしない。
+    フックは素の ``python`` で単体起動されるため）。
+    """
+    for name in ("RESOURCE_BROKER_SESSION_ID", "CLAUDE_CODE_SESSION_ID"):
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return ""
+
+
 def declared_by_me(entries: list[dict[str, object]], cwd: str) -> bool:
     """その資源を自分が既に宣言しているか。
 
     宣言済みの相手に「宣言してから使え」と毎回言うのはノイズであり、ノイズは無視を招く。
+
+    **照合の規則を本体（``Board.owns``）とそろえる。** cwd だけで見ると、同じ
+    リポジトリで動いている**別のセッション**の宣言を自分のものと読み、
+    「宣言せずに使おうとしている」という**いちばん出したい場面で通知が消える**。
+    両者が session_id を持つときは cwd を見ない。
     """
+    mine = session_id()
     for entry in entries:
         holder = entry.get("holder")
         holder = holder if isinstance(holder, dict) else {}
+        declared_session = str(holder.get("session_id") or "")
+        if declared_session and mine:
+            if declared_session == mine:
+                return True
+            continue
         if owned_by(str(holder.get("cwd", "")), cwd):
             return True
     return False
@@ -419,6 +453,12 @@ def notice_for(payload: dict[str, object]) -> str | None:
 def main() -> int:
     """フックの本体。何が起きても 0 を返す。"""
     if disabled():
+        # **黙るときも読み捨てる。** 読まずに戻ると、親が書き込み中の場合に
+        # ``EPIPE`` を受ける。読む理由は出力するかどうかと無関係である。
+        try:
+            sys.stdin.read()
+        except Exception:  # noqa: BLE001 - fail-open
+            pass
         return EXIT_ALLOW
     try:
         raw = sys.stdin.read()

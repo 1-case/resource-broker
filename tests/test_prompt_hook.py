@@ -307,3 +307,44 @@ def test_a_display_name_does_not_hide_which_resource_is_held(tmp_path: Path) -> 
 
     assert "GPU0" in text
     assert "malm E017 学習" in text
+
+
+def test_a_newline_becomes_a_space_not_nothing(tmp_path: Path) -> None:
+    """改行は**空白に潰す**。消すと語が連結する。
+
+    ``--observed "$(nvidia-smi)"`` は現実的な使い方であり、そこで語が繋がると
+    読ませるために注入した行が読めなくなる。
+    """
+    declare(tmp_path, "GPU0", job="実行中\n完了まで待て")
+
+    notice = run_hook(tmp_path).decode("utf-8")
+
+    assert "実行中 完了まで待て" in notice, notice
+
+
+def test_a_bidi_control_character_cannot_reorder_the_line(tmp_path: Path) -> None:
+    """双方向書式文字（U+202E 等）は落とす。
+
+    残ると、注入された行が読む側の画面で並べ替わる。行頭の印と前置きを保っていても、
+    読まれる文が書いた文と違うものになる。
+    """
+    declare(tmp_path, "GPU0", job="安全\u202e険危")
+
+    notice = run_hook(tmp_path).decode("utf-8")
+
+    assert "\u202e" not in notice, "双方向制御が残っている"
+    assert "\u200e" not in notice
+
+
+def test_dropping_entries_for_count_is_not_silent(tmp_path: Path) -> None:
+    """件数で落としたことを黙らない。
+
+    バイト数で溢れたときは 1 行残すのに、件数で溢れたときだけ何も言わずに消えていた。
+    落としたことが分からないと、読む側は「宣言はこれで全部だ」と読む。
+    """
+    for i in range(20):
+        declare(tmp_path, f"GPU{i}", job=f"ジョブ {i}")
+
+    notice = run_hook(tmp_path).decode("utf-8")
+
+    assert "省略" in notice, notice

@@ -27,9 +27,17 @@ ALLOW = 0
 RULE = {"pattern": r"run_e\d+\.py", "resource": "GPU0", "note": "実験スクリプト"}
 
 
+#: フックを走らせるときのセッション ID。
+#:
+#: **掲示板の宣言を作るのはテストプロセスである。** 何もしないとフックの session_id と
+#: 一致し、どの宣言も「自分のもの」に見えて通知が消える。別セッションとして走らせる。
+HOOK_SESSION = "hook-session"
+
+
 def run_hook(home: Path, payload: object) -> subprocess.CompletedProcess[bytes]:
     """フックを起動する。stdin には PreToolUse の入力を渡す。"""
     env = dict(os.environ)
+    env["RESOURCE_BROKER_SESSION_ID"] = HOOK_SESSION
     env["RESOURCE_BROKER_HOME"] = str(home)
     env.pop("PYTHONIOENCODING", None)
     env.pop("PYTHONUTF8", None)
@@ -224,7 +232,12 @@ def test_silent_when_i_declared_it_from_a_parent_directory(tmp_path: Path) -> No
     # 何も検証していない状態になる。
     place = str(tmp_path / "works" / "folnet")
     deeper = str(tmp_path / "works" / "folnet" / "runs" / "e059")
-    assert board.try_claim(build_entry(normalize("GPU0"), job="E059 eval", cwd=place))
+    # **session_id を持たない宣言で確かめる。** 両者が持っていれば cwd は見ない規則に
+    # したので、cwd の祖先フォールバックを検証するにはここを空にする必要がある
+    # （古い宣言や Claude Code 以外からの利用がこの経路に当たる）。
+    assert board.try_claim(
+        build_entry(normalize("GPU0"), job="E059 eval", cwd=place, session_id="")
+    )
 
     # 前提: 無関係な場所からなら注意は出る（出ないことの検証が空振りしていないこと）
     assert run_hook(tmp_path, bash("python scripts/run_e059.py")).stdout.strip() != b""
@@ -232,6 +245,25 @@ def test_silent_when_i_declared_it_from_a_parent_directory(tmp_path: Path) -> No
     result = run_hook(tmp_path, bash("python scripts/run_e059.py", cwd=deeper))
 
     assert result.stdout.strip() == b""
+
+
+def test_another_session_in_the_same_directory_still_gets_the_notice(tmp_path: Path) -> None:
+    """**同じ場所で動く別セッション**には、ちゃんと注意が出る。
+
+    同じリポジトリで 2 つのセッションを立てるのは日常である。cwd だけで所有を判定すると、
+    相手の宣言を自分のものと読み、**宣言せずに使おうとしている、いちばん出したい場面で
+    通知が消える**。照合の規則は本体（``Board.owns``）とそろえる。
+    """
+    write_guard(tmp_path, [RULE])
+    board = Board(tmp_path)
+    place = str(tmp_path / "works" / "folnet")
+    assert board.try_claim(
+        build_entry(normalize("GPU0"), job="E059 eval", cwd=place, session_id="別のセッション")
+    )
+
+    result = run_hook(tmp_path, bash("python scripts/run_e059.py", cwd=place))
+
+    assert result.stdout.strip() != b"", "同じ場所の別セッションに通知が出ていない"
 
 
 def test_other_tools_are_not_touched(tmp_path: Path) -> None:
