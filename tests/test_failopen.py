@@ -10,12 +10,14 @@
 
 from __future__ import annotations
 
+import os
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from resource_broker import clock, platform_info
+from resource_broker import audit, clock, platform_info
 from resource_broker.board import Board, build_entry
 from resource_broker.cli import main
 
@@ -56,6 +58,41 @@ def test_unreadable_entry_does_not_raise(board: Board, monkeypatch: pytest.Monke
 
     monkeypatch.setattr(Path, "read_text", explode)
     assert board.read("pc-a::GPU0") is None
+
+
+def test_old_audit_logs_are_pruned(tmp_path: Path) -> None:
+    """監査ログを単調増加させない。
+
+    ここには ``job`` の自由記述と宣言元の ``cwd`` が入る——利用者がいつ何の作業を
+    していたかの履歴である。``rb wait`` は 10 秒ごとに 1 行足す。放置すれば増え続ける。
+    """
+    old = audit.audit_dir(tmp_path)
+    old.mkdir(parents=True)
+    stale = old / "2020-01-01.jsonl"
+    stale.write_text("{}\n", encoding="utf-8")
+    ancient = time.time() - (audit.AUDIT_RETENTION_DAYS + 1) * 86400
+    os.utime(stale, (ancient, ancient))
+
+    audit.append(tmp_path, "test_event")
+
+    assert not stale.exists(), "保持期限を過ぎた監査ログが残っている"
+    assert list(old.glob("*.jsonl")), "今日のログまで消している"
+
+
+def test_pruning_does_not_touch_recent_audit_logs(tmp_path: Path) -> None:
+    """期限内のログは消さない。**掃除が証拠を消してはならない。**"""
+    directory = audit.audit_dir(tmp_path)
+    directory.mkdir(parents=True)
+    recent = directory / "2020-01-02.jsonl"
+    recent.write_text("{}\n", encoding="utf-8")
+
+    assert audit.prune(tmp_path) == 0
+    assert recent.exists()
+
+
+def test_pruning_a_missing_audit_directory_is_not_an_error(tmp_path: Path) -> None:
+    """監査ディレクトリが無くても例外を出さない（fail-open）。"""
+    assert audit.prune(tmp_path / "無い") == 0
 
 
 def test_audit_failure_does_not_propagate(board: Board, monkeypatch: pytest.MonkeyPatch) -> None:
