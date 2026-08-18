@@ -34,8 +34,17 @@ for py in py python3.13 python3.12 python3.11 python3 python; do
     # 決めると、Cygwin / MSYS2(msys) の POSIX python にも Windows パスを渡してしまう。
     # そちらはバックスラッシュを区切りとみなさないので sys.path が壊れる。
     # ここは版を聞くついでに sys.platform も受け取っているので、推測する必要が無い。
+    #
+    # **`case` で前方一致にする。** Windows の python は `print()` がテキスト層を通るので、
+    # パイプ相手でも `win32\r\n` を書く。コマンド置換が剥がすのは末尾の `\n` だけなので
+    # `$plat` は `win32<CR>` になり、`=` の比較は**恒偽**になる。この分岐が要る場面
+    # （Git Bash + ネイティブ python）でちょうど死ぬ。
     script=$posix_script
-    if [ "$plat" = win32 ] && command -v cygpath >/dev/null 2>&1; then
+    case "$plat" in
+        win32*) ;;
+        *) plat="" ;;
+    esac
+    if [ -n "$plat" ] && command -v cygpath >/dev/null 2>&1; then
         script=$(cygpath -w "$posix_script") || script=$posix_script
     fi
     exec "$py" "$script" ${1+"$@"}
