@@ -371,16 +371,38 @@ def test_a_fresh_install_still_delivers_the_usage(
     assert "rb run" in out, out
 
 
-def test_the_hook_can_be_silenced_without_uninstalling(tmp_path: Path) -> None:
+#: 3 つのフック本体。opt-out は README で「3 つとも」と約束している。
+ALL_HOOKS = [
+    "sessionstart_notice.py",
+    "prompt_board_reminder.py",
+    "pretooluse_notice.py",
+]
+
+
+@pytest.mark.parametrize("hook", ALL_HOOKS)
+def test_the_hook_can_be_silenced_without_uninstalling(tmp_path: Path, hook: str) -> None:
     """環境変数 1 つで黙る。**止める手段を持たないものを毎ターン割り込ませない。**
 
     注入が邪魔になった 1 セッションのために、マシン全体の掲示板を失う必要は無い。
+    README は「3 つとも」と約束しているので、3 つとも確かめる。
     """
     declare(tmp_path, "GPU0", job="E059 eval")
+    env = dict(os.environ)
+    env["RESOURCE_BROKER_HOME"] = str(tmp_path)
+    env["RESOURCE_BROKER_DISABLE"] = "1"
 
-    result = run_hook(home=tmp_path, extra_env={"RESOURCE_BROKER_DISABLE": "1"})
+    result = subprocess.run(
+        [sys.executable, str(HOOK.parent / hook)],
+        input='{"tool_name": "Bash", "tool_input": {"command": "python x.py"}}',
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        timeout=60,
+    )
 
-    assert result.returncode == 0
+    assert result.returncode == 0, result.stderr
     assert result.stdout == "", result.stdout
 
 

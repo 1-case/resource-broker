@@ -1075,7 +1075,7 @@ def test_a_join_from_before_the_reboot_is_discarded(
     )
 
     assert board.list_joins(RESOURCE) == []
-    assert board.join_path(RESOURCE, THEIRS).exists() is False  # 掃除まで行う
+    assert board.join_path(RESOURCE, THEIRS, "theirs").exists() is False  # 掃除まで行う
 
 
 def test_a_join_within_the_boot_margin_survives(
@@ -1100,6 +1100,42 @@ def test_a_join_within_the_boot_margin_survives(
     assert len(board.list_joins(RESOURCE)) == 1
 
 
+def test_two_sessions_in_one_directory_are_both_visible(tmp_path: Path) -> None:
+    """同じ場所から出た 2 セッションの相乗りが、**両方とも掲示板に載る**。
+
+    同じリポジトリで 2 つのセッションを立てるのは日常である（片方が実装、片方が
+    レビュー等）。鍵が ``(資源, cwd)`` だけだと 2 人目は申告を残せず、1 人目が先に
+    終わって取り下げた瞬間、**まだ資源を使っている 2 人目が掲示板から完全に消える**。
+    相乗りは「見えるようにする」ためだけの仕組みなのに、見えなくなる方向へ倒れる。
+    """
+    board = Board(tmp_path)
+    first = build_entry(RESOURCE, job="実装", cwd=THEIRS, session="a", session_id="a")
+    second = build_entry(RESOURCE, job="レビュー", cwd=THEIRS, session="b", session_id="b")
+
+    assert board.add_join(first, THEIRS)
+    assert board.add_join(second, THEIRS), "2 人目が申告を残せていない"
+
+    assert sorted(join.job for join in board.list_joins(RESOURCE)) == ["レビュー", "実装"]
+
+    # 1 人目が取り下げても 2 人目は残る
+    board.remove_own_join(RESOURCE, THEIRS, reason="テスト", expect_nonce=first.nonce)
+
+    assert [join.job for join in board.list_joins(RESOURCE)] == ["レビュー"]
+
+
+def test_the_same_session_cannot_join_twice_from_one_directory(tmp_path: Path) -> None:
+    """同じセッションが同じ場所から二重に申告することはできない（従来どおり）。
+
+    セッションを鍵に混ぜたのは**別のセッションを区別する**ためであって、
+    1 つのセッションの二重申告を許すためではない。
+    """
+    board = Board(tmp_path)
+    entry = build_entry(RESOURCE, job="実装", cwd=THEIRS, session="a", session_id="a")
+
+    assert board.add_join(entry, THEIRS)
+    assert board.add_join(entry, THEIRS) is False
+
+
 def test_a_stale_join_is_removed_only_when_it_still_matches(tmp_path: Path) -> None:
     """相乗りの削除も **nonce の CAS** に乗る（読み取りと削除の間の入れ替わり）。
 
@@ -1113,12 +1149,17 @@ def test_a_stale_join_is_removed_only_when_it_still_matches(tmp_path: Path) -> N
     )
     assert board.add_join(old, THEIRS)
 
-    # 読み終えた直後に、同じ場所の申告が取り下げられて出し直された状況を作る
-    board.join_path(RESOURCE, THEIRS).unlink()
-    assert board.add_join(build_entry(RESOURCE, job="新しい相乗り", cwd=THEIRS), THEIRS)
+    # 読み終えた直後に、同じセッションの申告が取り下げられて出し直された状況を作る
+    board.join_path(RESOURCE, THEIRS, "theirs").unlink()
+    assert board.add_join(
+        build_entry(
+            RESOURCE, job="新しい相乗り", cwd=THEIRS, session="theirs", session_id="theirs"
+        ),
+        THEIRS,
+    )
 
     result = board._capture_and_remove(
-        board.join_path(RESOURCE, THEIRS),
+        board.join_path(RESOURCE, THEIRS, "theirs"),
         expect_nonce=old.nonce,
         resource_id=RESOURCE,
         reason="テスト",
@@ -1563,3 +1604,17 @@ def test_my_own_session_id_is_recorded_on_the_board(tmp_path: Path) -> None:
     entry = Board(tmp_path).read(RESOURCE)
     assert entry is not None
     assert entry.holder["session_id"] == "mine"
+
+
+def test_a_known_nonce_never_falls_back_to_the_directory(tmp_path: Path) -> None:
+    """nonce を持っている呼び出し側は、相手に nonce が無ければ**自分のではない**と判定する。
+
+    「照合できないので次の規則へ」と読むと、自分の宣言が外部から強制解放された後に
+    同じ場所へ出た**別人の古い形式の宣言**を、後始末が自分のものとして消す。
+    """
+    board = Board(tmp_path)
+    entry = build_entry(RESOURCE, job="他人の古い宣言", cwd=MINE, session_id="")
+    entry.holder.pop("nonce", None)
+
+    assert board.owns(entry, nonce="", cwd=MINE) is True  # nonce を持たない操作は従来どおり
+    assert board.owns(entry, nonce="自分の nonce", cwd=MINE) is False

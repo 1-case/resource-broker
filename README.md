@@ -277,10 +277,11 @@ Claude Code のセッション同士が直接会話できるようになれば�
 
 審査や監査で最初に確かめられる性質を並べておく。**ネットワーク通信は一切しない**
 （`urllib` / `http` / HTTP ライブラリを持たず、`socket` の利用は `gethostname()` だけ）。
-**`shell=True` は使わない**（`subprocess` は 4 か所で、いずれも argv 固定——`rb run` の
-子プロセス起動・`rb run` が中断されたときに自分が記録した PID へ `taskkill /F /T`・
+**`shell=True` は使わない**（`subprocess` は 5 か所で、いずれも argv 固定——`rb run` の
+子プロセス起動・ログを開けなかったときの退避路での同じ起動（ログの故障でジョブを
+止めない）・`rb run` が中断されたときに自分が記録した PID へ `taskkill /F /T`・
 macOS の `kern.boottime` 読み取り・`SessionStart` フックが自身の `bin/rb.py` を呼ぶところ。
-`grep -rn subprocess src hooks` で 4 か所すべて出る）。
+`grep -rnE "subprocess\.(run|Popen)\(" src hooks` がちょうどその 5 行を出す）。
 **資源 ID で分岐する箇所は無い**（資源を調べるモジュールも持たない）。
 **バイナリを同梱しない**（`bin/` は依存ゼロの起動スクリプト 5 本で、残りは読める Python）。
 

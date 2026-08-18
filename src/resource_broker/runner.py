@@ -22,6 +22,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
+from typing import IO
 
 from . import clock, naming
 
@@ -167,23 +168,30 @@ def _pump(source: object, sink: object, limit: int) -> None:
                 break
             if truncated:
                 continue  # 読み捨てる。子をブロックさせない
-            if written + len(chunk) <= limit:
-                sink.write(chunk)  # type: ignore[attr-defined]
-                written += len(chunk)
-            else:
-                room = max(0, limit - written)
-                if room:
-                    sink.write(chunk[:room])  # type: ignore[attr-defined]
-                    written += room
-                notice = (
-                    f"\n=== {clock.now_iso()} ログが上限（{limit} バイト）に達したため、"
-                    "以降の出力を破棄した（ジョブは継続中）\n"
-                )
-                sink.write(notice.encode("utf-8", errors="replace"))  # type: ignore[attr-defined]
+            try:
+                if written + len(chunk) <= limit:
+                    sink.write(chunk)  # type: ignore[attr-defined]
+                    written += len(chunk)
+                else:
+                    room = max(0, limit - written)
+                    if room:
+                        sink.write(chunk[:room])  # type: ignore[attr-defined]
+                        written += room
+                    notice = (
+                        f"\n=== {clock.now_iso()} ログが上限（{limit} バイト）に達したため、"
+                        "以降の出力を破棄した（ジョブは継続中）\n"
+                    )
+                    sink.write(notice.encode("utf-8", errors="replace"))  # type: ignore[attr-defined]
+                    truncated = True
+                sink.flush()  # type: ignore[attr-defined]
+            except (OSError, ValueError):
+                # **書けなくなっても読むのはやめない。** ここで抜けると ``finally`` が
+                # 読み口を閉じ、子は次の書き込みで ``EPIPE``（POSIX では ``SIGPIPE``）を
+                # 受けて死ぬ。**ディスクが一杯なだけでジョブが落ちる。** 上限に達した
+                # ときと同じ「読み捨てモード」へ落として、EOF まで排出し続ける。
                 truncated = True
-            sink.flush()  # type: ignore[attr-defined]
     except (OSError, ValueError):
-        pass  # ログが書けなくなってもジョブは止めない
+        pass  # 読み口が壊れた。ここまで写した分で諦める
     finally:
         try:
             source.close()  # type: ignore[attr-defined]
@@ -210,12 +218,26 @@ def default_spawn(argv: list[str], log_path: Path, env: Mapping[str, str]) -> in
     # **ここで掃除をしない。** ``--log`` で場所を指定できるので、掃除を「書き込み先の
     # ディレクトリ」に対して行うと、利用者のプロジェクト配下にある**無関係な `*.log` を消す**。
     # 掃除の対象は本ツールが作った置き場に限る（呼び出し側が `prune_old_logs` を呼ぶ）。
-    log_path.parent.mkdir(parents=True, exist_ok=True)
     header = f"=== {clock.now_iso()} rb run: {subprocess.list2cmdline(argv)}\n"
 
-    with log_path.open("ab") as stream:
-        stream.write(header.encode("utf-8", errors="replace"))
-        stream.flush()
+    stream = _open_log(log_path)
+    if stream is None:
+        # **ログが開けないのはインフラの故障であって資源の競合ではない。**
+        # ここで諦めると「ログ置き場が書けないからジョブが走らない」ことになる。
+        # 本ツールがユーザーの作業を止めてよい場面は無い（CLAUDE.md「Fail-Open」）。
+        # 子の出力は捕まえずに親へ素通しする。**黙って捨てるほうが悪い。**
+        print(
+            f"警告: ログを開けませんでした（{log_path}）。出力は捕まえずにそのまま流します",
+            file=sys.stderr,
+        )
+        return _spawn_without_log(argv, env)
+
+    with stream:
+        try:
+            stream.write(header.encode("utf-8", errors="replace"))
+            stream.flush()
+        except (OSError, ValueError):
+            pass
         # POSIX では新しいプロセスグループにして、中断時に子孫までシグナルを届かせる。
         # Windows は taskkill /T で木ごと落とすのでここでは何もしない。
         extra: dict[str, object] = {} if sys.platform == "win32" else {"start_new_session": True}
@@ -231,13 +253,74 @@ def default_spawn(argv: list[str], log_path: Path, env: Mapping[str, str]) -> in
         )
         pump.start()
         try:
-            return process.wait()
+            code = process.wait()
+            _warn_if_descendants_survive(process, stream)
+            return code
         except BaseException:
-            _stop(process)
+            if not _stop(process):
+                _warn_if_descendants_survive(process, stream)
             raise
         finally:
             # 子が終わってもパイプに残りがある。書き切ってから戻る。
             pump.join(timeout=TERMINATE_TIMEOUT_S)
+
+
+def _open_log(log_path: Path) -> IO[bytes] | None:
+    """ログを開く。開けなければ None（**例外を呼び出し側へ出さない**）。"""
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        return log_path.open("ab")
+    except OSError:
+        return None
+
+
+def _spawn_without_log(argv: list[str], env: Mapping[str, str]) -> int:
+    """ログを取らずに子を起動する。**ログの故障でジョブを落とさないための退避路。**
+
+    出力は捕まえない（親の stdout/stderr をそのまま継ぐ）。捕まえてどこにも書けないと、
+    そのぶんが黙って消える。
+    """
+    extra: dict[str, object] = {} if sys.platform == "win32" else {"start_new_session": True}
+    process = subprocess.Popen(argv, env=dict(env), **extra)  # type: ignore[arg-type]
+    try:
+        code = process.wait()
+        _warn_if_descendants_survive(process, None)
+        return code
+    except BaseException:
+        if not _stop(process):
+            _warn_if_descendants_survive(process, None)
+        raise
+
+
+def _warn_if_descendants_survive(process: subprocess.Popen[bytes], sink: IO[bytes] | None) -> None:
+    """子孫が残ったまま戻ろうとしていることを**言う**。
+
+    直接の子が 0 で終わっても、孫が資源を掴んだまま生きていることがある
+    （推奨形の ``rb run ... -- uv run python train.py`` では資源を掴むのは孫である）。
+    呼び出し側の ``finally`` は宣言を消すので、**掲示板は空・資源は掴まれたまま**という
+    最も検出しにくい不整合ができる。
+
+    **待たない。** 常駐する子孫を待てば ``rb run`` が返らなくなり、それはこのツールが
+    ユーザーの作業を止めることになる。できるのは黙らないことである
+    （CLAUDE.md「Silence Is Not Success」）。
+    """
+    if _group_alive(process.pid) is not True:
+        return
+    text = (
+        f"=== {clock.now_iso()} 警告: 子プロセスの子孫が残ったまま rb run が終了する。"
+        "宣言は解放されるので、掲示板は空・資源は掴まれたままになりうる\n"
+    )
+    try:
+        print(text.strip(), file=sys.stderr)
+    except Exception:  # noqa: BLE001 - 通知の失敗でジョブの結果を変えない
+        pass
+    if sink is None:
+        return
+    try:
+        sink.write(text.encode("utf-8", errors="replace"))
+        sink.flush()
+    except (OSError, ValueError):
+        pass
 
 
 def _stop(
@@ -246,7 +329,7 @@ def _stop(
     kill_tree: KillTree | None = None,
     group_alive: GroupAlive | None = None,
     timeout_s: float = TERMINATE_TIMEOUT_S,
-) -> None:
+) -> bool:
     """子プロセスを**その子孫ごと**止める。応じなければ強制終了へ昇格する。
 
     直接の子だけを殺しても足りない。推奨している形が
@@ -274,19 +357,22 @@ def _stop(
 
     if killer(process.pid, False):
         if _wait_for_group(process, watcher, timeout_s):
-            return
+            return True
         # 直接の子か孫が SIGTERM を無視して残っている。強制終了へ昇格する。
         if killer(process.pid, True):
-            _wait_for_group(process, watcher, timeout_s)
-            return
+            # **昇格した後の待ちの結果を捨てない。** 捨てると、``SIGKILL`` でも死なない
+            # 子孫（ドライバ待ちで uninterruptible な状態など）が残ったまま
+            # 「止め終わった」として戻り、呼び出し側が宣言を消す。
+            return _wait_for_group(process, watcher, timeout_s)
 
     try:
         process.terminate()
-        if not _wait_quietly(process, timeout_s):
-            process.kill()
-            _wait_quietly(process, timeout_s)
+        if _wait_quietly(process, timeout_s):
+            return True
+        process.kill()
+        return _wait_quietly(process, timeout_s)
     except OSError:
-        pass
+        return False
 
 
 def _wait_quietly(process: subprocess.Popen[bytes], timeout_s: float) -> bool:

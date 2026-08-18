@@ -285,12 +285,13 @@ Four properties you can check quickly, because they are what a reviewer will wan
 - **No network access anywhere.** There is no `urllib`, `http`, `socket` client or third-party
   HTTP library in the tree; the single `socket` call is `gethostname()`. Nothing is uploaded,
   reported or phoned home.
-- **No `shell=True`, ever.** `subprocess` appears in exactly four places, each with a fixed
-  argv: spawning your job in `rb run` (your argv straight through, no shell re-parsing);
-  `taskkill /F /T /PID <pid>` on Windows to end that job's process tree when `rb run` is
-  interrupted, with a PID this tool recorded itself; reading `kern.boottime` on macOS; and the
-  `SessionStart` hook invoking this repository's own `bin/rb.py`. `grep -rn subprocess src hooks`
-  shows all four.
+- **No `shell=True`, ever.** `subprocess` appears in exactly 5 places, each with a fixed argv:
+  spawning your job in `rb run` (your argv straight through, no shell re-parsing); the same
+  spawn again for the fallback used when the log file cannot be opened — a logging failure must
+  never stop your job; `taskkill /F /T /PID <pid>` on Windows to end that job's process tree
+  when `rb run` is interrupted, with a PID this tool recorded itself; reading `kern.boottime` on
+  macOS; and the `SessionStart` hook invoking this repository's own `bin/rb.py`.
+  `grep -rnE "subprocess\.(run|Popen)\(" src hooks` prints exactly those 5 lines.
 - **No resource-specific code path.** Nothing branches on a resource ID and there is no probe
   module; the tool never inspects a GPU, a port or anything else. It records what *you* say you
   observed, with a machine-generated timestamp beside it.

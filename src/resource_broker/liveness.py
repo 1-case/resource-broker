@@ -83,6 +83,14 @@ class Verdict(StrEnum):
 FREE_VERDICTS = frozenset({Verdict.FREE, Verdict.STALE_PROBE, Verdict.STALE_REBOOT})
 
 
+#: ``since < boot`` の境界に持たせる余裕。
+#:
+#: ``since`` は秒精度、``boot`` は起動からの経過時間からの逆算（マイクロ秒つき、
+#: NTP の前方補正でも動く）。裸で比べると、起動直後に出た**生きた宣言**が
+#: 「再起動前」に見える。掲示板側の相乗りと同じ値を使う。
+BOOT_MARGIN = timedelta(seconds=60.0)
+
+
 def judge(
     *,
     has_entry: bool,
@@ -133,7 +141,11 @@ def judge(
         return Verdict.HELD
 
     # 2. 再起動をまたいだ宣言は確定的な幽霊。全 PID が無効になっている。
-    if boot is not None and since is not None and since < boot:
+    # **秒に切り捨てた ``since`` と、マイクロ秒を持つ ``boot`` を裸で比べない。**
+    # 起動 0.5 秒後に出した宣言は ``since`` が切り捨てで起動と同じ秒になり、
+    # ``since < boot`` が真になる。**生きた宣言を「再起動前」として退去させる**
+    # 唯一の経路であり、退去は取り返しがつかない。相乗り側と同じ余裕を引く。
+    if boot is not None and since is not None and since < boot - BOOT_MARGIN:
         return Verdict.STALE_REBOOT
 
     # 3. 宣言時刻が壊れていると猶予を計算できない。裏が取れないとして扱う。

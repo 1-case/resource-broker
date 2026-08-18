@@ -1364,7 +1364,7 @@ def _release_own(board: Board, resource_id: str, *, prefer: str | None = None) -
         entry, cwd=cwd, session_id=platform_info.session_id()
     )
     # 「この場所から出された相乗り」だけを曖昧さの材料にする（上の docstring 参照）。
-    has_exact_join = board.join_path(resource_id, cwd).exists()
+    has_exact_join = board.join_path(resource_id, cwd, platform_info.session_id()).exists()
 
     if prefer is None and mine_primary and has_exact_join:
         return _report_ambiguous_release(resource_id, entry)

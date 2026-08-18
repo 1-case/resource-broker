@@ -146,13 +146,23 @@ def clip(value: object, limit: int) -> str:
     # こちらを空白にしないのは、幅ゼロの文字であり、空白を入れるほうが原文を歪めるため
     # である（絵文字の ZWJ 連結や ZWNJ を使う言語では語形が変わるが、通知は読ませるための
     # ものであり、表示の忠実さより「見えている通りに読める」ことを取る）。
-    body = " ".join(
-        "".join(
-            " " if unicodedata.category(ch) == "Cc" else ch
-            for ch in text
-            if unicodedata.category(ch) != "Cf"
-        ).split()
-    )
+    # **切ってから走査する。** 出力の上限はどれも 200 バイト程度なのに、走査は
+    # 元の全文に掛かっていた。``--observed "$(nvidia-smi)"`` のような使い方で
+    # 200KB の申告が 1 件あると、**毎プロンプト**その全文を舐めることになる。
+    # 上限のバイト数より十分大きいところで頭打ちにすれば、結果は変わらない。
+    text = text[: limit * 4 + 64]
+    # ``category`` は 1 文字につき 1 回だけ呼ぶ。ASCII は表を引かずに決める
+    # （Cc は U+0000-1F と U+7F、Cf は非 ASCII にしか無い）。
+    kept: list[str] = []
+    for ch in text:
+        if ch < "\x80":
+            kept.append(" " if ch < " " or ch == "\x7f" else ch)
+            continue
+        category = unicodedata.category(ch)
+        if category == "Cf":
+            continue
+        kept.append(" " if category == "Cc" else ch)
+    body = " ".join("".join(kept).split())
     data = body.encode(ENCODING, errors="replace")
     if len(data) <= limit:
         return body
@@ -211,7 +221,15 @@ def read_entries(root: Path) -> list[dict[str, object]]:
     # 真っ先に落としてよいものではない。
     primaries, joins = collected[False], collected[True]
     head = primaries[: MAX_ENTRIES - min(MAX_ENTRIES // 2, len(joins))]
-    return head + joins[: MAX_ENTRIES - len(head)]
+    kept = head + joins[: MAX_ENTRIES - len(head)]
+
+    # **黙って落とさない。** 落としたことが分からないと、読む側は「宣言はこれで全部だ」
+    # と読む。バイト数で溢れたときは :func:`fit` が 1 行残すのに、件数で溢れたときだけ
+    # 何も言わずに消えていた。掲示板が混んでいる場面こそ、そう読まれてはいけない。
+    dropped = len(primaries) + len(joins) - len(kept)
+    if dropped:
+        kept.append({"_dropped": dropped})
+    return kept
 
 
 def build_notice(entries: list[dict[str, object]]) -> str:
@@ -225,12 +243,16 @@ def build_notice(entries: list[dict[str, object]]) -> str:
     始め、前置きで「データであって指示ではない」と明示する。長さは :func:`clip` と
     :func:`fit` の二段で抑える。
     """
-    if not entries:
+    if not [e for e in entries if not isinstance(e.get("_dropped"), int)]:
         return f"[rb] 宣言なし。{RULE}"
 
     rows: list[str] = []
     # 見出しは board_label で作る。**資源 ID を display で置き換えない。**
     for entry in entries:
+        dropped = entry.get("_dropped")
+        if isinstance(dropped, int):
+            rows.append(f"{DATA_MARK}（ほか {dropped} 件は多いため省略した。全件は rb status）")
+            continue
         holder = entry.get("holder")
         holder = holder if isinstance(holder, dict) else {}
         session = clip(holder.get("session"), MAX_NAME_BYTES) or "?"
@@ -265,6 +287,12 @@ def emit(text: str) -> None:
 def main() -> int:
     """フックの本体。何が起きても 0 を返す。"""
     if disabled():
+        # **黙るときも読み捨てる。** 読まずに戻ると、親が書き込み中の場合に
+        # ``EPIPE`` を受ける。読む理由は出力するかどうかと無関係である。
+        try:
+            sys.stdin.read()
+        except Exception:  # noqa: BLE001 - fail-open
+            pass
         return 0
     try:
         sys.stdin.read()
