@@ -150,3 +150,16 @@ def test_is_free_matches_the_declared_set(verdict: Verdict) -> None:
 def test_uncertain_is_not_treated_as_free() -> None:
     """裏が取れないときは fail-safe に倒す（掲示板は正常に読めているため）。"""
     assert Verdict.UNCERTAIN not in liveness.FREE_VERDICTS
+
+
+def test_a_declaration_made_just_after_boot_is_not_called_stale() -> None:
+    """起動直後に出した**生きた宣言**を「再起動前」と判定しない。
+
+    ``since`` は秒精度、``boot`` は起動からの経過時間からの逆算（マイクロ秒つき、
+    NTP の前方補正でも動く）。裸で比べると、起動 0.5 秒後の宣言が切り捨てで起動と
+    同じ秒になり、``since < boot`` が真になる。**生きた宣言を退去させる**唯一の
+    経路であり、退去は取り返しがつかない。
+    """
+    assert judge(since=BOOT - timedelta(seconds=1)) is not Verdict.STALE_REBOOT
+    # 十分に古ければ従来どおり退去できる（余裕が判定そのものを殺していないこと）
+    assert judge(since=BEFORE_BOOT) is Verdict.STALE_REBOOT

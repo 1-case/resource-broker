@@ -54,7 +54,8 @@ def append(root: Path, event: str, **fields: object) -> None:
     **fields
         イベントに付随する情報。JSON にできない値は文字列化する。
     """
-    record = {"at": clock.now_iso(), "event": event, **fields}
+    # **機械の値を後に置く。** 先に置くと呼び出し側の ``at`` / ``event`` が上書きする。
+    record = {**fields, "at": clock.now_iso(), "event": event}
     try:
         directory = audit_dir(root)
         directory.mkdir(parents=True, exist_ok=True)
@@ -118,7 +119,9 @@ def prune(root: Path, *, max_age_days: float = AUDIT_RETENTION_DAYS) -> int:
         except OSError:
             continue
 
-    if removed:
+    # ``max_age_days`` が 1 未満だと今日のファイル自身が対象になり、記録 → 掃除 →
+    # 記録 … が止まらない。現状そう呼ぶ経路は無いが、防具は 1 行で済む。
+    if removed and max_age_days >= 1:
         append(root, "audit_pruned", removed=removed, retention_days=max_age_days)
     return removed
 

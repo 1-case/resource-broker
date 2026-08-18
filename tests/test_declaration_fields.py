@@ -590,3 +590,20 @@ def test_joining_does_not_add_up_the_estimates(
     assert "足し算しない" in out
     assert "自分で確かめる" in out
     assert "rb release --join" in out  # 降りる道を示す
+
+
+def test_a_declared_timestamp_cannot_override_the_machine_one() -> None:
+    """申告に ``at`` を書いても、掲示板に載るのは**機械が刻んだ時刻**である。
+
+    「時刻はすべて機械生成」（DESIGN.md「Time Handling」）は、dict を組み立てる
+    引数の順序 1 つで破れる。LLM が書いた時刻がそのまま載る経路を塞ぐ。
+    """
+    entry = build_entry(
+        normalize("GPU0"),
+        job="E059 eval",
+        observed={"note": "nvidia-smi", "at": "2000-01-01T00:00:00+09:00"},
+    )
+
+    assert entry.observed is not None
+    assert entry.observed["at"] != "2000-01-01T00:00:00+09:00"
+    assert entry.observed["note"] == "nvidia-smi"
