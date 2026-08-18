@@ -427,3 +427,31 @@ def test_an_internal_error_does_not_look_like_a_release(
     monkeypatch.setattr(waiting, "wait_for_room", explode)
 
     assert main(["--home", str(tmp_path), "wait", "GPU0"]) != 0
+
+
+def test_a_broken_wait_is_distinguishable_from_a_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """内部エラーと上限到達を同じ終了コードにしない。
+
+    どちらも 1 にすると、呼び出し側が「上限まで待った」と「1 度も待っていない」を
+    区別できない。**前者は待ち直す価値があり、後者は原因を調べる必要がある。**
+    対処が違うものを畳まない。
+    """
+    from resource_broker import cli
+
+    hold_gpu(tmp_path)
+
+    def explode(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("待機の内部が壊れた")
+
+    monkeypatch.setattr(waiting, "wait_for_room", explode)
+    broken = main(["--home", str(tmp_path), "wait", "GPU0"])
+
+    monkeypatch.undo()
+    hold_gpu(tmp_path) if not Board(tmp_path).read(RESOURCE) else None
+    timed_out = main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0"])
+
+    assert broken == cli.EXIT_WAIT_BROKEN
+    assert timed_out == cli.EXIT_BUSY
+    assert broken != timed_out

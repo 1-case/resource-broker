@@ -46,6 +46,12 @@ EXIT_USAGE = 2
 #: Ctrl+C で中断されたときの終了コード（シェルの慣習に合わせる）。
 EXIT_INTERRUPTED = 130
 
+#: ``wait`` が内部エラーで待てなかったときの終了コード。
+#:
+#: **上限到達（``EXIT_BUSY``）と分ける。** どちらも 1 にすると、呼び出し側が
+#: 「上限まで待った」と「1 度も待っていない」を区別できない。対処が違う。
+EXIT_WAIT_BROKEN = 3
+
 #: ``--found`` の受け付ける値と、それが表す実測の結論。
 FOUND_CHOICES: dict[str, bool | None] = {"busy": True, "free": False, "unknown": None}
 
@@ -1720,7 +1726,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             # **wait の 0 は「宣言が減った」という積極的な意味を持つ。** 内部エラーで
             # 0 を返すと、1 度も待っていないのに「空いた」と読まれ、使用中の資源を
             # 掴みにいく。fail-open は「情報が無いなら通す」であって「嘘をつく」ではない。
-            return EXIT_BUSY
+            #
+            # **上限到達（EXIT_BUSY）とも分ける。** どちらも 1 にすると、呼び出し側が
+            # 「上限まで待った」と「1 度も待っていない」を区別できない。前者は待ち直す
+            # 価値があり、後者は原因を調べる必要がある。対処が違うものを畳まない。
+            return EXIT_WAIT_BROKEN
         return EXIT_OK
 
 

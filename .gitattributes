@@ -1,6 +1,6 @@
 # 既定を LF にする。**名指しの列挙は必ず陳腐化する**（bin/ にスクリプトを 1 本足した
 # 瞬間に罠が戻る）。Windows で clone すると autocrlf が CRLF へ直し、そのまま
-# Linux / macOS へ渡ると シェバンが '#!/bin/sh' になって bad interpreter で起動しない。
+# Linux / macOS へ渡ると シェバンが '#!/bin/sh\r' になって bad interpreter で起動しない。
 # プラグインとして配る以上、取り出す側の OS を選べない。
 * text=auto eol=lf
 

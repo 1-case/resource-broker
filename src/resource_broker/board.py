@@ -224,6 +224,11 @@ def _read_entry_at(path: Path) -> Entry | None:
 
 
 #: 読み取り時に既知として扱うキー。これ以外は extra に退避して書き戻す（前方互換）。
+#:
+#: **既知のキーが想定外の型で来た場合も落とさない。** ``from_dict`` は型が合わなければ
+#: 既定値へ倒すが、そのとき元の値を ``extra`` へ退避する。退避しないと、スキーマを
+#: 拡張した新しい版が書いた値を、古い版が読んで書き戻した瞬間に**黙って消す**。
+#: 前方互換は「未知のキー」だけでなく「既知のキーの未知の形」も守る必要がある。
 _KNOWN_KEYS = frozenset(
     {
         "schema",
@@ -356,8 +361,36 @@ class Entry:
             eta=eta if isinstance(eta, dict) else None,
             usage=usage if isinstance(usage, dict) else None,
             sharing=data["sharing"] if isinstance(data.get("sharing"), str) else "",
-            extra={k: v for k, v in data.items() if k not in _KNOWN_KEYS},
+            extra=cls._salvage(data),
         )
+
+    @staticmethod
+    def _salvage(data: dict[str, object]) -> dict[str, object]:
+        """書き戻しても失われない形で、拾えなかった値を退避する。
+
+        **前方互換は「未知のキー」だけでは足りない。** 既知のキーが想定外の型で来ると
+        上の分岐が既定値へ倒し、``extra`` にも入らないため、**読んで書き戻した瞬間に
+        黙って消える**。スキーマを拡張した新しい版が書いた値を、古い版が消す形になる。
+
+        型が合わなかった既知のキーは ``x-<キー名>`` として退避する。名前を変えるのは、
+        書き戻したときに壊れた値が正規の位置へ戻らないようにするためである。
+        """
+        expected: dict[str, type | tuple[type, ...]] = {
+            "display": str,
+            "holder": dict,
+            "log": str,
+            "since": str,
+            "boot": str,
+            "observed": dict,
+            "eta": dict,
+            "usage": dict,
+            "sharing": str,
+        }
+        extra: dict[str, object] = {k: v for k, v in data.items() if k not in _KNOWN_KEYS}
+        for key, kind in expected.items():
+            if key in data and data[key] is not None and not isinstance(data[key], kind):
+                extra[f"x-{key}"] = data[key]
+        return extra
 
 
 class Board:

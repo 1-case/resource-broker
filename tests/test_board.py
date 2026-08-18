@@ -201,3 +201,32 @@ def test_only_one_of_many_simultaneous_claims_wins(tmp_path: Path) -> None:
     assert codes.count(0) == 1, f"取得できたのが 1 人ではない: {codes}"
     assert codes.count(1) == racers - 1, f"残りが使用中で断られていない: {codes}"
     assert len(list((tmp_path / "board").glob("*.json"))) == 1
+
+
+# --- 前方互換: 既知のキーの「未知の形」も落とさない -------------------------------
+
+
+def test_a_known_key_with_an_unexpected_type_is_not_silently_dropped() -> None:
+    """既知のキーが想定外の型で来ても、読んで書き戻したときに消えない。
+
+    前方互換は「未知のキー」だけでは足りない。既知のキーが想定外の型で来ると
+    既定値へ倒れ、``extra`` にも入らないため、**スキーマを拡張した新しい版が書いた値を
+    古い版が読んで書き戻した瞬間に黙って消す**。
+    """
+    entry = Entry.from_dict(
+        {
+            "resource": "pc-a::GPU0",
+            "sharing": {"allowed": True, "limit": "5GB"},  # 将来 dict 化した想定
+            "display": ["GPU0", "RTX"],
+            "未知のキー": 1,
+        }
+    )
+
+    assert entry is not None
+    assert entry.sharing == ""  # 型が合わないので既定値へ倒れる
+    assert entry.extra["x-sharing"] == {"allowed": True, "limit": "5GB"}, "退避されていない"
+    assert entry.extra["x-display"] == ["GPU0", "RTX"]
+    assert entry.extra["未知のキー"] == 1  # 従来の前方互換も効いている
+
+    # 書き戻しても失われない
+    assert entry.to_dict()["x-sharing"] == {"allowed": True, "limit": "5GB"}

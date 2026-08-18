@@ -24,7 +24,14 @@ for py in py python3.13 python3.12 python3.11 python3 python; do
     "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null || continue
     # ${1+"$@"} を使う。macOS の /bin/sh は bash 3.2 で、set -u 下の "$@" が
     # 引数 0 個のとき unbound variable になる（`rb` だけ打つと落ちる）。
-    exec "$py" "$here/bin/rb.py" ${1+"$@"}
+    # Git Bash から Windows の python を呼ぶとき、POSIX パスは開けない。通常は MSYS の
+    # argv 変換が効くが、MSYS2_ARG_CONV_EXCL を設定している環境では効かない。
+    # rb-hook と同じ扱いにそろえる（片方だけ直すと、次に触った人が理由を探す）。
+    script="$here/bin/rb.py"
+    if command -v cygpath >/dev/null 2>&1; then
+        script=$(cygpath -w "$script") || script="$here/bin/rb.py"
+    fi
+    exec "$py" "$script" ${1+"$@"}
 done
 
 echo "rb: python が見つかりません（resource-broker は Python 3.11 以上を必要とします）" >&2
