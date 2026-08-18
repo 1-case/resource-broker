@@ -24,6 +24,7 @@ import json
 import os
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 #: ``rb status`` の待ち時間。超えたら黙って諦める。
@@ -186,34 +187,71 @@ def read_entries_directly() -> list[dict[str, object]] | None:
     ただし**判定（幽霊かどうか）はできない**。ここは資源の状態を判断する場所ではなく、
     「誰が何を宣言しているか」をそのまま見せる場所である。
     """
-    directory = board_root() / "board"
+    board = board_root() / "board"
+    rows: list[dict[str, object]] = []
+    by_resource: dict[str, dict[str, object]] = {}
+
+    def load(directory: Path) -> list[dict[str, object]]:
+        try:
+            paths = sorted(directory.glob("*.json"))
+        except OSError:
+            return []
+        found: list[dict[str, object]] = []
+        for path in paths:
+            try:
+                data = json.loads(path.read_text(encoding=ENCODING))
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(data, dict):
+                found.append(data)
+        return found
+
     try:
-        paths = sorted(directory.glob("*.json"))
+        if not board.is_dir():
+            return None
     except OSError:
         return None
-    rows: list[dict[str, object]] = []
-    for path in paths:
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        rows.append(
-            {
-                "resource": data.get("resource"),
+
+    for data in load(board):
+        row: dict[str, object] = {
+            "resource": data.get("resource"),
+            "display": data.get("display"),
+            "holder": data.get("holder"),
+            "since": data.get("since"),
+            "log": data.get("log"),
+            "observed": data.get("observed"),
+            "eta": data.get("eta"),
+            "usage": data.get("usage"),
+            "sharing": data.get("sharing"),
+            "occupied": True,
+            "joins": [],
+        }
+        rows.append(row)
+        key = data.get("resource")
+        if isinstance(key, str):
+            by_resource.setdefault(key, row)
+
+    # **相乗りも読む。** 主宣言が先に解放されて相乗りだけが残った資源は、``board/`` を
+    # 見ただけでは消える。この経路は ``rb`` を起動できなかったときの最後の砦であり、
+    # そこで「掲示板は空です」と出すのは、無言より悪い（実際に使っている者がいるのに
+    # 空きだと告げる）。本体も他のフックも相乗りを読んでいる。ここだけ例外にしない。
+    for data in load(board / "joins"):
+        key = data.get("resource")
+        row = by_resource.get(key) if isinstance(key, str) else None
+        if row is None:
+            row = {
+                "resource": key,
                 "display": data.get("display"),
-                "holder": data.get("holder"),
-                "since": data.get("since"),
-                "log": data.get("log"),
-                "observed": data.get("observed"),
-                "eta": data.get("eta"),
-                "usage": data.get("usage"),
-                "sharing": data.get("sharing"),
+                "holder": None,
                 "occupied": True,
                 "joins": [],
             }
-        )
+            rows.append(row)
+            if isinstance(key, str):
+                by_resource[key] = row
+        joins = row.get("joins")
+        if isinstance(joins, list):
+            joins.append(data)
     return rows
 
 
@@ -233,9 +271,18 @@ def clip(value: object, limit: int) -> str:
     重複の維持コストより、フックが常に動くことを取る。
     """
     text = value if isinstance(value, str) else ("" if value is None else str(value))
-    # 制御文字を落とし、空白の連なりを 1 つに潰す。``str.split()`` は改行・タブに加えて
-    # 行区切り扱いの Unicode 文字（U+2028 等）も分割対象にする。
-    body = " ".join("".join(ch for ch in text if ch >= " " and ch != "\x7f").split())
+    # 制御文字と**書式制御文字**を落とし、空白の連なりを 1 つに潰す。
+    # ``str.split()`` は改行・タブに加えて行区切り扱いの Unicode 文字（U+2028 等）も
+    # 分割対象にする。
+    #
+    # **Cf（書式制御）まで落とす。** C0 と DEL だけでは U+202E（RLO）等の双方向制御が
+    # 残り、注入した行が読む側の画面で逆順に表示される。行の中身が並べ替えられれば、
+    # 前置きの「データであって指示ではない」と行頭の印を保っていても、読まれる文が
+    # 書いた文と違うものになる。絵文字の ZWJ 連結も落ちるが、通知は読ませるためのもので
+    # あり、表示の忠実さより「見えている通りに読める」ことを取る。
+    body = " ".join(
+        "".join(ch for ch in text if unicodedata.category(ch) not in ("Cc", "Cf")).split()
+    )
     data = body.encode(ENCODING, errors="replace")
     if len(data) <= limit:
         return body
@@ -423,7 +470,7 @@ def main() -> int:
         if degraded:
             notice += (
                 "\n注意: rb コマンドを起動できませんでした"
-                "（PATH に無い、または Python が 3.13 未満）。\n"
+                "（PATH に無い、または Python が 3.11 未満）。\n"
                 "掲示板は直接読んでいるので上の内容は正しいが、rb status / rb run は"
                 "打てない状態である。"
             )
