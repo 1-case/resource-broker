@@ -17,7 +17,8 @@ from pathlib import Path
 
 import pytest
 
-DESIGN = Path(__file__).resolve().parent.parent / "docs" / "DESIGN.md"
+ROOT = Path(__file__).resolve().parent.parent
+DESIGN = ROOT / "docs" / "DESIGN.md"
 
 #: 行数の上限。増えたぶんはたいてい経緯である。
 MAX_LINES = 600
@@ -65,4 +66,45 @@ def test_design_does_not_narrate_history() -> None:
 
     assert not offenders, "経緯とみられる記述がある:\n" + "\n".join(
         f"  {n}: {line[:78]}" for n, line in offenders[:8]
+    )
+
+
+# --- 公開文書に制御文字を混ぜない -------------------------------------------------
+
+PUBLIC_DOCS = ("README.md", "README.en.md", "docs/DESIGN.md", ".github/SECURITY.md")
+
+
+@pytest.mark.parametrize("name", PUBLIC_DOCS)
+def test_public_documents_have_no_stray_control_characters(name: str) -> None:
+    """公開文書に制御文字（タブ・改行以外）を混ぜない。
+
+    シェルのヒアドキュメント越しに文書を書くと、``\r`` が実 CR に、``\n`` が実改行に
+    化ける。実際に ``%LOCALAPPDATA%\resource-broker`` が ``%LOCALAPPDATA%`` + CR +
+    ``esource-broker`` になり、**掲示板の置き場を案内する行が壊れていた**。
+    表示上は気づきにくく、コピーすると動かないパスになる。
+    """
+    raw = (ROOT / name).read_bytes()
+
+    offenders = [(i, b) for i, b in enumerate(raw) if b < 32 and b not in (9, 10, 13)]
+    assert not offenders, (
+        f"{name} に制御文字がある（先頭 {offenders[0][0]} バイト目に {offenders[0][1]:#04x}）"
+    )
+
+
+@pytest.mark.parametrize("name", PUBLIC_DOCS)
+def test_public_documents_do_not_split_a_windows_path(name: str) -> None:
+    """Windows のパスが行をまたいで切れていない。
+
+    ``\r`` の事故は制御文字として残らず**改行に化ける**こともあるので、
+    行末が環境変数で終わっていないかを別に見る。
+    """
+    lines = (ROOT / name).read_text(encoding="utf-8").splitlines()
+
+    broken = [
+        (i + 1, line)
+        for i, line in enumerate(lines)
+        if line.rstrip().endswith(("%LOCALAPPDATA%", "%USERPROFILE%", "%TEMP%"))
+    ]
+    assert not broken, "環境変数の直後でパスが切れている:\n" + "\n".join(
+        f"  {n}: {line[-50:]}" for n, line in broken
     )

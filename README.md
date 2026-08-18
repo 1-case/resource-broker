@@ -63,6 +63,25 @@ Claude Code 以外のプロセスも、本ツールからは見えないし止�
 逆に、競合しても大した問題にならないもの（読むだけの処理、すぐやり直せる短い操作）は
 宣言しなくてよい。掲示板を宣言で埋めても、読む側の判断が鈍るだけである。
 
+## 対象外: 実行環境をまたいだ共有
+
+**掲示板は 1 つのファイルシステムの上で成立する。** したがって次の組み合わせは**対象外**である。
+
+- WSL のセッション ↔ Windows ホストのセッション
+- コンテナの中 ↔ ホスト
+- 別のコンテナ同士
+
+**同じ物理 GPU を使えても、互いの宣言は見えない。** 既定の置き場が違うためである
+（Windows は `%LOCALAPPDATA%\resource-broker`、それ以外は `~/.resource-broker`）。
+`SessionStart` の通知が毎回**掲示板の場所を名乗る**ので、違うパスが出たら分断していると分かる。
+
+`RESOURCE_BROKER_HOME` を共有マウントへ揃えれば繋がるように見えるが、**そうしないこと。**
+このツールの正しさは `O_EXCL` と `os.rename` の原子性だけに乗っており、9p / drvfs /
+バインドマウント越しにそれが保たれる保証が無い。**「共有できているつもりで排他が効いていない」
+状態は、分断しているより悪い。**
+
+**この境界をまたぐなら、掲示板に頼らないこと。** 2 つの環境は別のマシンだと考えるのが正しい。
+
 ## 導入
 
 **プラグインとして入れるのが最短である。** Claude Code の中で 2 行打つだけでよい。
@@ -162,10 +181,9 @@ $ rb history GPU0
 入れただけでは 3 つ目のフックは沈黙する。出したい対象は自分で決めて置く。
 
 ```jsonc
-// %LOCALAPPDATA%
-esource-broker\guard.json （Windows 以外は ~/.resource-broker/guard.json）
+// %LOCALAPPDATA%\resource-broker\guard.json （Windows 以外は ~/.resource-broker/guard.json）
 { "schema": 1, "patterns": [
-    { "pattern": "run_e\d+\.py", "resource": "GPU0", "note": "学習スクリプト" } ] }
+    { "pattern": "run_e\\d+\\.py", "resource": "GPU0", "note": "学習スクリプト" } ] }
 ```
 
 表が陳腐化しても害は無い（一致しなくなる＝注意が出なくなるだけで、何も止まらない）。
@@ -232,8 +250,7 @@ Claude Code のセッション同士が直接会話できるようになれば�
 
 ## 信頼境界とセキュリティ
 
-掲示板と監査ログは **`%LOCALAPPDATA%
-esource-broker\`**（Windows 以外は `~/.resource-broker/`）
+掲示板と監査ログは **`%LOCALAPPDATA%\resource-broker\`**（Windows 以外は `~/.resource-broker/`）
 に置かれる。`RESOURCE_BROKER_HOME` で移せる。中身は `board/`（宣言）・`audit/`（監査ログ）・
 `logs/`（`rb run` の出力）で、**リポジトリの中には作られない**。`logs/` は既定 7 日で
 自動削除するが、**`audit/` は消さない**（`rb wait` が 10 秒ごとに 1 行足すので単調に増える）。

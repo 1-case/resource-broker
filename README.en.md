@@ -69,6 +69,26 @@ and render the rest invisible** — the same failure mode as hard-coding how to 
 Conversely, do not declare things whose collision is cheap (read-only work, short operations
 you can simply redo). A board full of noise dulls the reader's judgement.
 
+## Out of scope: sharing across execution environments
+
+**The board only works within one filesystem.** These combinations are therefore **not supported**:
+
+- a WSL session ↔ a Windows host session
+- inside a container ↔ the host
+- one container ↔ another
+
+**They cannot see each other's declarations even when they share the same physical GPU**,
+because the default location differs (`%LOCALAPPDATA%\resource-broker` on Windows,
+`~/.resource-broker` elsewhere). The `SessionStart` notice always names the board's location,
+so two different paths mean you are split.
+
+Pointing `RESOURCE_BROKER_HOME` at a shared mount appears to join them. **Do not.**
+Correctness here rests entirely on the atomicity of `O_EXCL` and `os.rename`, and nothing
+guarantees that over 9p / drvfs / bind mounts. **Believing you are coordinated while exclusion
+silently does not hold is worse than being split.**
+
+**Do not rely on the board across that boundary.** Treat the two environments as two machines.
+
 ## Install
 
 **Installing it as a plugin is the shortest path** — two lines inside Claude Code:
@@ -186,10 +206,9 @@ holder set to shrink, you identify the holder from the board and ask them direct
 shipped — so out of the box the third hook stays silent. You decide what deserves a notice:
 
 ```jsonc
-// %LOCALAPPDATA%
-esource-broker\guard.json  (elsewhere: ~/.resource-broker/guard.json)
+// %LOCALAPPDATA%\resource-broker\guard.json  (elsewhere: ~/.resource-broker/guard.json)
 { "schema": 1, "patterns": [
-    { "pattern": "run_e\d+\.py", "resource": "GPU0", "note": "training scripts" } ] }
+    { "pattern": "run_e\\d+\\.py", "resource": "GPU0", "note": "training scripts" } ] }
 ```
 
 A stale table is harmless: it stops matching, so notices stop — nothing is ever blocked.
@@ -215,8 +234,7 @@ that led there is deliberately not in it.
 
 ## Trust boundary and security
 
-The board and the audit log live in **`%LOCALAPPDATA%
-esource-broker\`** (`~/.resource-broker/`
+The board and the audit log live in **`%LOCALAPPDATA%\resource-broker\`** (`~/.resource-broker/`
 elsewhere); `RESOURCE_BROKER_HOME` moves them. They hold `board/` (declarations), `audit/`
 (the audit log) and `logs/` (`rb run` output), and are **never created inside the repository**.
 `logs/` is pruned after 7 days; **`audit/` is never pruned** (`rb wait` appends a line every
