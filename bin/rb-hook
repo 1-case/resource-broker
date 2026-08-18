@@ -34,6 +34,7 @@ for py in py python3 python; do
     # 見分けは在り処でつく。POSIX ネイティブの実行体はエミュレーション根（/usr, /bin）に
     # あり、ドライブ経由（/c/...）や /mingw64 から見えるものは Windows ネイティブである。
     # sys.platform を聞けば確実だが、python の起動が 1 回増える。フックは毎ターン走る。
+    # （bin/rb は版を聞くために既に 1 回起動しているので、あちらは確実な方を採っている。）
     case "$path" in
         /usr/* | /bin/* | /sbin/*) ;;
         *)

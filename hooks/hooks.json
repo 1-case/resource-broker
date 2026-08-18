@@ -5,7 +5,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/rb-hook sessionstart_notice"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/rb-hook sessionstart_notice",
+            "timeout": 15
           }
         ]
       }
@@ -15,7 +16,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/rb-hook prompt_board_reminder"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/rb-hook prompt_board_reminder",
+            "timeout": 10
           }
         ]
       }
@@ -26,7 +28,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/rb-hook pretooluse_notice"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/rb-hook pretooluse_notice",
+            "timeout": 10
           }
         ]
       }
