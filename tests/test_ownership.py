@@ -807,20 +807,31 @@ def corrupt(board: Board) -> None:
     (board.entries_dir / "壊れている.json").write_text("{ これは JSON ではない", encoding="utf-8")
 
 
-def test_a_corrupt_declaration_can_be_cleaned_with_force(tmp_path: Path) -> None:
-    """壊れた主宣言を ``rb release --force`` で掃除できる。
+def test_a_corrupt_file_blocks_nothing_and_is_cleaned_by_clean(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """壊れたファイルは**何も塞がない**。掃除は ``rb release --clean`` である。
 
-    以前は ``read`` が None なら消さずに「見つかりませんでした」と答えていた。
-    壊れたファイルは status に出ず、wait は即座に解放と答え、claim は ``O_EXCL`` で
-    永久に失敗する。**その資源について掲示板が恒久的に機能停止し、人間がファイルを
-    手で消すしか回復手段が無かった。**
+    宣言のファイル名は nonce なので、読めないファイルがあっても新しい宣言は作れる。
+    一方、**中身が読めないファイルはどの資源のものか分からない**ので、資源を指した
+    ``--force`` では消せない。掃除の道は資源を指定しない ``--clean`` だけである。
+
+    ここを取り違えると、次に読む人が「force で消えないのはバグだ」と考えて、
+    **資源名からパスを組み立てる削除**を復活させる（それは平坦化が捨てた構造である）。
     """
     board = Board(tmp_path)
     corrupt(board)
+    stray = board.unreadable_paths()
+    assert len(stray) == 1, stray
+
+    assert claim(tmp_path) == 0, "壊れたファイルが取得を塞いでいる"
 
     assert run(tmp_path, "release", "GPU0", "--force") == 0
-    assert board.list_for(RESOURCE) == []
-    assert claim(tmp_path) == 0  # 掃除したあとは普通に取れる
+    assert board.unreadable_paths() == stray, "--force が壊れたファイルを消している"
+
+    capsys.readouterr()
+    assert run(tmp_path, "release", "--clean") == 0
+    assert board.unreadable_paths() == [], "--clean で掃除できていない"
 
 
 def test_claim_names_the_corrupt_entry_instead_of_failing_silently(
@@ -924,67 +935,7 @@ def test_joins_only_resource_is_listed_without_arguments(
 # --- join の CLI 経路 -----------------------------------------------------------
 
 
-def test_join_requires_a_primary_declaration(tmp_path: Path) -> None:
-    """主宣言が無ければ相乗りではなく claim を使わせる。"""
-    code = run(
-        tmp_path,
-        "claim",
-        "--res",
-        "GPU0",
-        "--job",
-        "相乗り",
-        "--observed",
-        "調べた",
-        "--eta",
-        "10m",
-    )
-
-    assert code == 2
-
-
 # --- 相乗りが消せること ---------------------------------------------------------
-
-
-def test_a_stale_join_that_cannot_be_removed_is_still_reported(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """掃除に失敗した相乗りを「無い」と答えない。
-
-    消せていないものを消えたことにすると、資源が空きに見えて他セッションが取りにくる。
-    掲示板が出しうる誤りのうち最も危ないのがこれである。
-    """
-    board = Board(tmp_path)
-    assert board.declare(build_entry(RESOURCE, job="消せない相乗り", cwd=THEIRS))
-    monkeypatch.setattr(
-        "resource_broker.platform_info.boot_time", lambda: clock.now() + timedelta(minutes=10)
-    )
-
-    def refuse(*_args: object, **_kwargs: object) -> None:
-        raise PermissionError("共有違反")
-
-    monkeypatch.setattr(os, "rename", refuse)
-    monkeypatch.setattr("resource_broker.board.UNLINK_DELAY_S", 0.0)
-
-    assert [join.job for join in board.list_for(RESOURCE)] == ["消せない相乗り"]
-
-
-def test_a_live_join_is_not_discarded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """起動後に出された相乗りは、猶予も PID も見ずにそのまま残す。
-
-    「実測が空きに見える」「PID が死んでいる」で相乗りを消してはならない
-    （CLAUDE.md「Liveness Judgment」の非対称性）。
-    """
-    board = Board(tmp_path)
-    joiner = build_entry(
-        RESOURCE, job="生きている相乗り", cwd=THEIRS, session="theirs", session_id="theirs"
-    )
-    assert board.declare(joiner)
-
-    monkeypatch.setattr(
-        "resource_broker.platform_info.boot_time", lambda: clock.now() - timedelta(days=1)
-    )
-
-    assert len(board.list_for(RESOURCE)) == 1
 
 
 def test_force_release_clears_joins_without_a_primary(tmp_path: Path) -> None:

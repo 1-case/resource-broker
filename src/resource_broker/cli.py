@@ -347,9 +347,17 @@ def acquire(
             reason = "強制取得" if force else "幽霊と判定した"
             removal = board.remove_if_nonce(resource_id, expect_nonce=ghost.nonce, reason=reason)
             if removal not in (RemovalResult.REMOVED, RemovalResult.ABSENT):
-                # 消せていないものを消えたことにしない。**残っている事実のほうを残す。**
+                # **消せなかったことを「使用中」に化けさせない。** 掲示板のファイルを
+                # 消せなかっただけで、資源の保持者を確認したわけではない。平坦化で
+                # 幽霊のファイルは何も塞がなくなった（名前が nonce なので新しい宣言は
+                # 作れる）ので、退去に失敗しても取得を通してよい。fail-open は
+                # 「本ツール側の故障で作業を止めない」ことである。
                 notices.append(_explain_failed_displacement(removal))
-                living.append(ghost)
+
+        # **退去のあとに読み直す。** 幽霊を消している間に他セッションが入っていることが
+        # ある（実際、同じ幽霊を見た 2 人のうち一方が先に取り直す）。古い読み取りで
+        # 判断すると、**生きた宣言があるのに気づかずに通す**。
+        living = live_declarations(board, resource_id, observation)
 
         if force:
             for entry in list(living):
@@ -569,24 +577,23 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # 掃除すると、利用者のプロジェクト配下にある無関係な *.log を消す。
     runner.prune_own_logs(board.root)
 
-    if True:
-        # ラッパーはジョブと同じ寿命を持つ。ここでだけ PID を記録する。
-        result = acquire(
-            board,
-            resource_id,
-            observation,
-            job=args.job,
-            found=args.found,
-            eta=args.eta,
-            peak=args.peak or "",
-            avg=args.avg or "",
-            sharing=args.sharing or "",
-            display=args.display or "",
-            log=str(log_path),
-            force=args.force,
-            share=args.share,
-            pid=os.getpid(),
-        )
+    # ラッパーはジョブと同じ寿命を持つ。ここでだけ PID を記録する。
+    result = acquire(
+        board,
+        resource_id,
+        observation,
+        job=args.job,
+        found=args.found,
+        eta=args.eta,
+        peak=args.peak or "",
+        avg=args.avg or "",
+        sharing=args.sharing or "",
+        display=args.display or "",
+        log=str(log_path),
+        force=args.force,
+        share=args.share,
+        pid=os.getpid(),
+    )
     entry = result.entry
     if entry is None:
         print("資源を取得できなかったため、コマンドを実行していません", file=sys.stderr)
@@ -978,10 +985,8 @@ def _cmd_history(args: argparse.Namespace) -> int:
         elapsed, stated = _elapsed_and_stated(record, release)
 
         # 主宣言と相乗りは別物なので、見分けが付く形で出す。
-        kind = "相乗り " if record.get("event") == "joined" else ""
         print(
-            f"{record.get('at', '?')}  "
-            f"{kind}{naming.display_default(str(record.get('resource', '?')))}"
+            f"{record.get('at', '?')}  {naming.display_default(str(record.get('resource', '?')))}"
         )
         print(f"    job   {record.get('job', '')}")
 
@@ -1024,20 +1029,43 @@ def _cmd_update(args: argparse.Namespace) -> int:
 
 
 def _update_locked(board: Board, resource_id: str, args: argparse.Namespace) -> int:
-    """``update`` の本体。呼び出し側がロックを保持している前提である。"""
-    entry = first_declaration(board, resource_id)
+    """``update`` の本体。呼び出し側がロックを保持している前提である。
 
-    if entry is None:
+    **「いちばん古い宣言」を掴んではならない。** 平坦化で 1 資源に宣言が N 件並ぶように
+    なったので、最古を選ぶと「先に宣言した人のもの」という**役割を暗に復活させる**。
+    後から `--share` で並んだ側は自分の宣言を一生更新できず、`--force` を付けると
+    **他人の宣言に自分の申告を書き込む**ことになる（掲示板は各自の申告の集まりであり、
+    人の申告を勝手に直せると誰の言葉なのか分からなくなる）。
+    """
+    cwd = os.getcwd()
+    session_id = platform_info.session_id()
+    declarations = board.list_for(resource_id)
+    mine = [e for e in declarations if board.owns(e, cwd=cwd, session_id=session_id)]
+
+    if not declarations:
         print("宣言が見つかりませんでした", file=sys.stderr)
         return EXIT_USAGE
 
-    if not args.force and not board.owns(
-        entry, cwd=os.getcwd(), session_id=platform_info.session_id()
-    ):
+    if mine:
+        entry = mine[0]
+        if len(mine) > 1:
+            # **どれを書き換えたかを言う。** 黙って 1 件選ぶと、更新したつもりの宣言と
+            # 実際に変わった宣言が食い違ったまま気づけない。
+            _say(
+                f"自分の宣言が {len(mine)} 件あります。最も古いものを書き換えます: {entry.job}",
+                err=True,
+            )
+    elif args.force:
+        entry = declarations[0]
+        # **他人のものを書き換えたことを必ず言う。** 誰の言葉かが変わる操作である。
+        _say(f"警告: 他セッションの宣言を書き換えます: {entry.session} / {entry.job}", err=True)
+    else:
         print(
-            "他セッションの宣言は書き換えられません（--force で上書きできます）", file=sys.stderr
+            "自分の宣言はありません（--force で他セッションのものを書き換えられます）",
+            file=sys.stderr,
         )
-        print(f"  宣言者: {entry.session} / {entry.job}", file=sys.stderr)
+        for other in declarations:
+            print(f"  {other.session} / {other.job}（since {other.since}）", file=sys.stderr)
         return EXIT_BUSY
 
     # 読んでから書くまでの間に保持者が入れ替わっていたら、古い内容で潰さない。
@@ -1109,6 +1137,20 @@ def _cmd_release(args: argparse.Namespace) -> int:
         else:
             _say("読めないファイルはありませんでした")
         return EXIT_OK
+
+    if not args.resource:
+        # **引数の不備を「内部エラー」にしない。** `normalize(None)` は例外になり、
+        # 総括の catch-all が exit 0 と `cli_internal_error` を残す——利用者の打ち間違いが
+        # 本ツールの故障として監査ログに積まれる。
+        print("資源 ID を指定するか、--clean を付けてください", file=sys.stderr)
+        return EXIT_USAGE
+
+    if not args.resource:
+        # **引数の不備を「内部エラー」にしない。** `normalize(None)` は例外になり、
+        # 総括の catch-all が exit 0 と `cli_internal_error` を残す——利用者の打ち間違いが
+        # 本ツールの故障として監査ログに積まれる。
+        print("資源 ID を指定するか、--clean を付けてください", file=sys.stderr)
+        return EXIT_USAGE
 
     resource_id = naming.normalize(args.resource)
     if args.force:

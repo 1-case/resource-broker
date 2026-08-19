@@ -252,11 +252,14 @@ holder set to shrink, you identify the holder from the board and ask them direct
 - **Removal rests on a nonce compare-and-swap, not on a lock.** The lock is a performance
   optimization; correctness is identical whether or not it is acquired. What the CAS guarantees is
   that you never delete a declaration other than the one you read.
-- **There is no first-come-wins.** Declarations are equal and a declaration always succeeds, so two
-  sessions declaring in the same instant both land on the board. The tool cannot prevent that — the
-  filesystem offers no conditional write — so it does the next thing: **each of them is told, right
-  then, that someone else arrived at the same moment.** Verified by racing 12 real processes with the
-  read-then-write window forced open: all 12 declared, all 12 were told.
+- **Admission is serialized by a per-resource lock, not by `O_EXCL`.** A declaration's filename is its
+  nonce, so creation never collides and cannot decide a winner. Scan-decide-write happens inside the
+  lock, and the board is re-read after evicting ghosts, so a declaration that lands before your write
+  is caught. **The guarantee holds only while the lock is obtainable**: the tool will not stop your
+  work because it failed to take a lock, so when that happens it declares anyway and says so.
+- **A declaration that lands after your write cannot be stopped**, only reported — and the report
+  reaches whichever side re-reads last, not necessarily both. There is no conditional write on a
+  filesystem. This is a stated residual, not a solved problem.
 - **One file per declaration, named by its nonce.** Damage stays local, and the filename carries no
   identity — deriving identity from a filename is what broke this code once already.
 

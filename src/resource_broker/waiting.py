@@ -29,7 +29,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
-from . import audit, clock
+from . import audit, clock, liveness, platform_info
 from .board import Board, Entry, first_declaration
 
 #: ポーリングの既定間隔（秒）。
@@ -99,8 +99,18 @@ def holder_keys(board: Board, resource_id: str) -> set[str]:
     いないのに ``rb wait`` が戻り、待っている側は入れないまま起こされる。
     nonce を持たない古い宣言だけ従来のキーで代替する。
     """
+    boot = platform_info.boot_time()
     keys: set[str] = set()
     for entry in board.list_for(resource_id):
+        # **再起動をまたいだ宣言は数えない。** 確定的な幽霊であり、`rb claim` なら
+        # 即座に退けて取れる。ここで数えると `rb wait` だけが上限まで待ち切って
+        # 「まだ使用中です」と答える——同じ掲示板を見て 2 つのコマンドが逆のことを言う。
+        #
+        # **`STALE_PROBE` は数える。** あちらは実測（`--found free`）が要るので、
+        # 待っている側が単独で判定してよい根拠ではない。
+        since = entry.since_dt
+        if boot is not None and since is not None and since < boot - liveness.BOOT_MARGIN:
+            continue
         keys.add(entry.nonce or f"{entry.since}:{entry.session}")
     return keys
 

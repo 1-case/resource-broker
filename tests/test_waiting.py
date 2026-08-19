@@ -483,3 +483,28 @@ def test_a_broken_wait_is_distinguishable_from_a_timeout(
     assert broken == cli.EXIT_WAIT_BROKEN
     assert timed_out == cli.EXIT_BUSY
     assert broken != timed_out
+
+
+def test_a_reboot_ghost_does_not_keep_wait_running(tmp_path: Path) -> None:
+    """再起動をまたいだ宣言だけの資源では、``rb wait`` はすぐ戻る。
+
+    確定的な幽霊なので `rb claim` は即座に退けて取れる。ここで数えてしまうと、
+    **同じ掲示板を見て 2 つのコマンドが逆のことを言う**——`claim` は「取れる」、
+    `wait` は上限まで待って「まだ使用中です」。
+    """
+    board = Board(tmp_path)
+    entry = build_entry(RESOURCE, job="落ちたセッション", session="theirs")
+    entry.since = clock.to_iso(clock.now() - timedelta(hours=3))
+    assert board.declare(entry)
+
+    assert waiting.holder_keys(board, RESOURCE) != set(), "起動時刻が読めない環境では数える"
+
+    # 起動がこの宣言より後 = 再起動をまたいでいる
+    import resource_broker.platform_info as platform_info
+
+    original = platform_info.boot_time
+    platform_info.boot_time = lambda: clock.now() - timedelta(hours=1)
+    try:
+        assert waiting.holder_keys(board, RESOURCE) == set(), "確定的な幽霊を数えている"
+    finally:
+        platform_info.boot_time = original

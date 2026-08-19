@@ -64,7 +64,7 @@ src/resource_broker/
   board.py / liveness.py      掲示板の読み書き（O_EXCL・nonce の CAS・ロック） / 幽霊判定（純粋関数）
   audit.py / platform_info.py 監査ログの追記 / boot time・PID 生存・ホスト名（OS 依存の隔離）
   runner.py / waiting.py      子プロセスの起動とログの強制 / 宣言が減るまで待つ
-  cli.py                      status / claim / release / run / join / update / wait / history
+  cli.py                      status / claim / release / run / update / wait / history
 hooks/  stdlib のみ・常に exit 0・何も止めない
         sessionstart_notice.py / prompt_board_reminder.py / pretooluse_notice.py / hooks.json
 bin/    rb / rb.cmd / rb-hook / rb-hook.cmd / rb.py（インストール不要の起動口）
@@ -99,7 +99,7 @@ uv run rb run --res GPU0 --job "E009 学習" --observed "..." --eta 40m -- uv ru
 ### Architecture
 
 ```
-  ┌─ CLI ────── status / claim / release / run / join / update / wait / history（能動的に使う）
+  ┌─ CLI ────── status / claim / release / run / update / wait / history（能動的に使う）
   ├─ 掲示板（資源ごとに 1 ファイル、JSON） ← 真実の単一情報源
   └─ フック（user スコープ / プラグイン） ── 気づき（**何も止めない**。詳細は「Hook Spec」）
 ```
@@ -107,7 +107,7 @@ uv run rb run --res GPU0 --job "E009 学習" --observed "..." --eta 40m -- uv ru
 | 項目 | 値 |
 |---|---|
 | 掲示板の場所 | `%LOCALAPPDATA%\resource-broker\board\`（無ければ `~/.resource-broker/board/`）。**マシン全体で 1 箇所**に置く（全アセットから参照するため、プロジェクト配下には置かない） |
-| エントリ | 資源 1 つにつき 1 ファイル。単一ファイルに集約しない（破損を局所化する） |
+| 宣言 | 宣言 1 件につき 1 ファイル（名前は nonce）。単一ファイルに集約しない（破損を局所化する） |
 | 旧い置き場 | `board/<safe-name>.json` と `board/joins/*.json`。**ただの宣言として読む**（形式を変えた瞬間に稼働中の宣言を見失わないため）。新しく作ることはない |
 | 宣言 | `O_CREAT｜O_EXCL` 相当だが、名前が nonce なので**必ず成功する**。**先着を決める仕組みは無い**——条件付き書き込みのプリミティブが OS に無い。書いた直後に読み直し、同時に入った相手を双方へ知らせる |
 | 排他区間のロック | `board/<safe-name>.lock`。資源ごとに 1 つ |
@@ -122,7 +122,7 @@ uv run rb run --res GPU0 --job "E009 学習" --observed "..." --eta 40m -- uv ru
 
 | 操作 | 形 | 原子性の根拠 |
 |---|---|---|
-| 取得 | `try_claim` | `os.link`（中身のある一時ファイルへ名前を付ける）。先着 1 名 |
+| 宣言 | `declare` | `os.link`（中身のある一時ファイルへ名前を付ける）。名前が nonce なので**必ず成功する**——先着は決まらない |
 | 削除 | `remove_if_nonce` | `os.rename` で一時名へ**捕まえる**。捕まえられるのは 1 人だけ |
 | 置換 | `replace(expect_nonce=...)` | 読んで確かめてから一時ファイルを `os.replace` |
 
@@ -156,7 +156,7 @@ uv run rb run --res GPU0 --job "E009 学習" --observed "..." --eta 40m -- uv ru
 
 **どの結果でも止めない。** ロックが取れないのは「他セッションが掲示板を**操作中**」でしかなく、資源が使用中である証拠ではない。止めると、
 資源が今まさに空こうとしている瞬間に「使用中」を返し、ロックを持ったままプロセスが死ねば 30 秒間すべてのセッションが取得できなくなる。
-本当に競っていれば `try_claim` が負けて**真の busy** が返る。また**排他区間の中で I/O をしない**（保持が `LOCK_STALE_S` を超えて奪取される）。
+取得の直列化はこのロックだけが担う（`O_EXCL` は名前が衝突しないので競合を解決しない）。また**排他区間の中で I/O をしない**（保持が `LOCK_STALE_S` を超えて奪取される）。
 文言は溜めて区間の外で、**例外が飛んでも**出す。
 
 #### Known Residuals
@@ -209,7 +209,7 @@ uv run rb run --res GPU0 --job "E009 学習" --observed "..." --eta 40m -- uv ru
 
 #### Declaration Fields
 
-`claim` / `run` / `join` は `--job` と `--observed` と `--eta` を**必須**とする。ここが本ツールの強制である。
+`claim` / `run` は `--job` と `--observed` と `--eta` を**必須**とする。ここが本ツールの強制である。
 
 - `--observed` は**自由記述**で、本ツールは中身を解釈しない。掲示板が持つのは観測点であり、意味づけは読む側の仕事
 - `--found` は `busy` / `free` / `unknown` の 3 値（既定 `unknown`）。幽霊判定に渡す唯一の機械可読な入力である
@@ -320,9 +320,17 @@ cwd の照合は一方向に限る。配下からの解放は許すが**逆方�
 
 #### Corrupt Entries
 
-JSON が壊れたエントリは、読み取りでは「無い」と同じ扱いになる（fail-open）。しかし**ファイルは存在する**ため、`read` / `status` には出てこず、
-`wait` は即座に「解放済み」と答え、`try_claim` は `O_EXCL` で**永久に失敗する**。したがって **`rb release --force` は `read` を介さずに削除し**
-（「読めたら消す」にすると壊れたものだけが消せない）、**`claim` は「書けなかった」と「壊れたものが居座っている」を区別して伝える**。
+**壊れたファイルは何も塞がない。** 宣言のファイル名は nonce なので、読めないファイルが
+あっても新しい宣言は作れる。以前のように「その資源について掲示板が恒久的に機能停止する」
+状態は起こらない。
+
+代わりに**持ち主が分からなくなる**。中身が読めなければどの資源のものか判別できないので、
+資源を指した `rb release --force` では消せない。掃除の道は資源を指定しない
+`rb release --clean` だけであり、`rb status` と `rb claim` が場所を教える。
+
+**「読めない」と「壊れている」を畳まない。** 一時的な共有違反や、他セッションが捕獲の
+途中で名前を外した瞬間は、**生きた宣言**でも起こる。畳むと `--clean` がそれを消し、
+掲示板は空・資源は掴まれたままになる。`--clean` の対象は JSON として壊れているものだけ。
 
 ### Ghost Detection
 

@@ -1,15 +1,21 @@
 """掲示板の読み書き。
 
-掲示板は**資源ごとに 1 ファイル**の JSON である。単一ファイルに集約しないのは、
-破損の被害を 1 資源に閉じ込めるためと、``O_EXCL`` による取得競合の解決を
-単純にするためである（DESIGN.md「Architecture」）。
+掲示板は**宣言ごとに 1 ファイル**の JSON で、名前は nonce である。単一ファイルに
+集約しないのは、破損の被害を 1 件に閉じ込めるためである（DESIGN.md「Architecture」）。
+**ファイル名は身元を持たない**——名前から身元を導くと、鍵の構成を変えた瞬間に判定が
+黙って恒偽になる。
 
-**正しさはロックではなく nonce の compare-and-swap（CAS）が担保する。**
-掲示板を書き換える操作は「期待する nonce と一致するときだけ消す／置く」の形にしてある。
-ロックは競り合いを減らすための性能最適化であり、取れても取れなくても正しさは変わらない
-（DESIGN.md「Per-Resource Lock」）。ロックを主防御に据えると、ロックが外れた瞬間だけ
-排他が消えるという最悪の相関を持つことになる。Windows では、競合が激しいときほど
-``O_EXCL`` が ``PermissionError`` になりやすく、この相関は現実に起こる。
+**削除の正しさは nonce の compare-and-swap（CAS）が担保する。** 「期待する nonce と
+一致するときだけ消す／置く」の形にしてあり、ロックが取れても取れなくても
+「**読んだ宣言以外を消さない**」は変わらない。
+
+**取得の直列化はロックだけが担う。** 名前が nonce なので ``O_EXCL`` は取得競合を
+解決しない（衝突しないので必ず作れる）。つまり取得については、このモジュールが他の
+全箇所で避けてきた「ロックが外れた瞬間だけ排他が消える」という相関を**受け入れて
+いる**。Windows では競合が激しいときほど ``PermissionError`` が起きやすく、この相関は
+現実に起こる。**取れなかったことは呼び出し側が必ず告げる**（DESIGN.md「Per-Resource
+Lock」）。条件付き書き込みのプリミティブがファイルシステムに無いため、平坦な宣言の
+集まりに対してこれ以上の保証は置けない。
 
 本モジュールの全ての公開関数は**例外を投げない**。読めない・書けない・壊れているは
 すべて「情報が無い」に畳み込み、呼び出し側が fail-open で通せるようにする。
@@ -55,7 +61,6 @@ LOCK_STALE_S = 30.0
 UNLINK_ATTEMPTS = 4
 UNLINK_DELAY_S = 0.05
 
-#: 相乗りを「再起動をまたいだ幽霊」とみなすときの余裕（秒）。
 #:
 #: 判定は ``since < boot - この余裕`` で行う。``boot`` は起動からの経過時間から
 #: 逆算した値なので、NTP が時計を**前方**へ飛ばすと、直前に出したばかりの相乗りが
@@ -115,20 +120,6 @@ class UpdateResult(StrEnum):
 
     REPLACED = "replaced"
     CONFLICT = "conflict"
-    FAILED = "failed"
-
-
-class JoinResult(StrEnum):
-    """相乗りの申告の結果。
-
-    **「既にある」と「掲示板に残せなかった」を畳まない。** 畳むと、mkdir・書き込み・
-    ハードリンクのいずれが失敗しても「既に申告しています」と答えることになり、
-    **掲示板に 1 件も残っていないのに利用者を安心させる**。他セッションから見えない
-    利用が始まるのは、掲示板が防ごうとしているもの（衝突）そのものである。
-    """
-
-    ADDED = "added"
-    EXISTS = "exists"
     FAILED = "failed"
 
 
@@ -515,9 +506,6 @@ class Board:
 
     def __init__(self, root: Path | str | None = None) -> None:
         self.root = Path(root) if root is not None else Path(platform_info.board_root())
-        #: 直近の相乗り走査で**読めなかったものがあったか**。
-        #: `_load_joins` が更新する（読む側は `list_all_joins_detailed` を使う）。
-        self._joins_unreadable = False
 
     @property
     def entries_dir(self) -> Path:
@@ -535,14 +523,20 @@ class Board:
 
     @contextmanager
     def locked(self, resource_id: str, *, wait_s: float = LOCK_WAIT_S) -> Iterator[LockState]:
-        """書き換えの区間を囲う。**これは性能最適化であって、安全性の主防御ではない。**
+        """書き換えの区間を囲う。**取得の排他はここに乗っている。**
 
-        「読んで、幽霊なら退けて、作る」の途中は ``O_EXCL`` では守れない。囲えば
-        同じ幽霊を 2 人が見る場面自体が減るので、無駄な往復が減る。しかし
-        **囲えなくても正しさは変わらない**。掲示板の書き換えは nonce の CAS
-        （:meth:`remove_if_nonce` / :meth:`replace`）で守ってあり、ロックが外れた瞬間だけ
-        排他が消えるということは無い。ロックを主防御に据えると、Windows で
-        「競合が激しいときほど ``O_EXCL`` が ``PermissionError`` になる」という
+        宣言のファイル名は nonce なので、``O_EXCL`` は**取得の競合を解決しない**
+        （名前が衝突しないので必ず作れる）。「読んで、幽霊なら退けて、作る」を
+        直列化するのはこの区間だけである。実測: この区間を外して読み書きの窓を
+        開くと、12 プロセスが同一資源へ**全件**宣言できる。
+
+        **削除の正しさは別に立っている。** 「読んだ宣言以外を消さない」は nonce の
+        CAS（:meth:`remove_if_nonce`）が守っており、ロックの有無に依存しない。
+
+        **取れなければ排他は無い。** その場合でも通す——ロックが取れないのは本ツール側の
+        事情であって「資源が使用中だと確認できた」ではなく、そこで止めるのは fail-open に
+        反する。**保証の範囲はロックが取れる間だけ**であり、取れなかったことは呼び出し側が
+        必ず告げる。ロックを主防御に据える代償として、Windows で
         最悪の相関を抱えることになる。
 
         結果は 3 値で渡す（:class:`LockState`）。**インフラの故障と資源の競合を
@@ -728,8 +722,16 @@ class Board:
             paths, _ = _json_files(directory)
             for path in paths:
                 try:
-                    data = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError, ValueError):
+                    text = path.read_text(encoding="utf-8")
+                except OSError:
+                    # **「読めない」を「壊れている」と混ぜない。** 他セッションが捕獲の
+                    # 途中で名前を外した瞬間（`FileNotFoundError`）や、一時的な共有違反
+                    # （`PermissionError`）は、**生きた宣言**でも起こる。ここへ入れると
+                    # `--clean` がそれを消し、掲示板は空・資源は掴まれたままになる。
+                    continue
+                try:
+                    data = json.loads(text)
+                except (json.JSONDecodeError, ValueError):
                     found.append(path)
                     continue
                 if Entry.from_dict(data) is None:
@@ -745,6 +747,10 @@ class Board:
         """
         removed: list[Path] = []
         for path in self.unreadable_paths():
+            # **消す直前にもう一度確かめる。** 一覧を作ってから消すまでの間に、正常な
+            # 宣言がそこへ現れうる（旧い置き場は資源ごとの固定パスである）。
+            if path not in set(self.unreadable_paths()):
+                continue
             result, error = _unlink_with_retry(path)
             if result is RemovalResult.REMOVED:
                 removed.append(path)
@@ -854,6 +860,13 @@ class Board:
         """
         # 1. 先読み。**中身で探す。** ファイル名から場所を組み立てない——名前の付け方を
         #    変えた瞬間に「見つからない」へ黙って倒れる（実際に一度そうなった）。
+        if not expect_nonce:
+            # **空文字を鍵にしてはならない。** nonce を持たない古い宣言は複数ありうるので、
+            # 「nonce が空のもの」に一致させると**別の生きた宣言**を捕まえて消す。
+            # 古い宣言の削除は :meth:`remove_matching` が中身の照合で行う。
+            self.audit("remove_refused", resource=resource_id, reason="nonce が空である")
+            return RemovalResult.NOT_OWNED
+
         pairs = self.pairs_for(resource_id)
         found = [(path, e) for path, e in pairs if e.nonce == expect_nonce]
         if not found:
@@ -871,6 +884,41 @@ class Board:
             resource_id=resource_id,
             reason=reason,
         )
+
+    def remove_matching(self, path: Path, expected: Entry, *, reason: str) -> RemovalResult:
+        """**中身が一致するときだけ**消す。nonce を持たない古い宣言のための経路。
+
+        捕まえてから、読み直した中身が期待どおりかを確かめる。nonce が無いので
+        照合は「資源・宣言時刻・宣言者」の三つ組で行う。一致しなければ元へ戻す。
+
+        **無条件の unlink にしてはならない。** 古い置き場は資源ごとの固定パスなので、
+        読んでから消すまでに別セッションが同じ名前を作り直しうる。
+        """
+        tombstone = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.taken")
+        moved, error = _rename_with_retry(path, tombstone)
+        if moved is MoveResult.ABSENT:
+            return RemovalResult.ABSENT
+        if moved is not MoveResult.MOVED:
+            self.audit("remove_failed", resource=expected.resource, error=error)
+            return RemovalResult.FAILED
+
+        captured = _read_entry_at(tombstone)
+        if captured is None or (
+            captured.resource,
+            captured.since,
+            captured.session,
+        ) != (expected.resource, expected.since, expected.session):
+            self._restore(tombstone, path, expected.resource)
+            self.audit(
+                "remove_refused", resource=expected.resource, reason="捕まえた宣言が別物だった"
+            )
+            return RemovalResult.NOT_OWNED
+
+        result, error = _unlink_with_retry(tombstone)
+        if result is RemovalResult.FAILED:
+            self.audit("tombstone_left", resource=expected.resource, error=error)
+        self.audit("removed", resource=expected.resource, job=captured.job, reason=reason)
+        return RemovalResult.REMOVED
 
     def _capture_and_remove(
         self,
@@ -1018,12 +1066,9 @@ class Board:
                         resource_id, expect_nonce=entry.nonce, reason=reason
                     )
                 else:
-                    # nonce を持たない古い宣言。照合できる値が無いので素直に消す。
-                    result, error = _unlink_with_retry(path)
-                    if result is RemovalResult.REMOVED:
-                        self.audit("removed", resource=resource_id, reason=reason)
-                    elif result is RemovalResult.FAILED:
-                        self.audit("remove_failed", resource=resource_id, error=error)
+                    # nonce を持たない古い宣言。**無条件に消さない**——固定パスなので、
+                    # 読んでから消すまでに別セッションが同じ名前を作り直しうる。
+                    result = self.remove_matching(path, entry, reason=reason)
                 if result is RemovalResult.REMOVED:
                     removed.append(entry)
                 elif result is RemovalResult.ABSENT:
@@ -1035,13 +1080,6 @@ class Board:
                 else:
                     failed.append(entry)
         return OwnRemoval(removed=removed, failed=failed, swapped=swapped, foreign=foreign)
-
-    def owns_any(self, resource_id: str, *, cwd: str | None = None) -> bool:
-        """その資源に**自分の宣言があるか**。"""
-        return any(
-            self.owns(entry, cwd=cwd, session_id=platform_info.session_id())
-            for entry in self.list_for(resource_id)
-        )
 
     def list_all(self) -> list[Entry]:
         """全ての宣言を読む。読めなかったものは飛ばす。"""

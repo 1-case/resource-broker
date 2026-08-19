@@ -45,8 +45,8 @@ NOTABLE_EVENTS = frozenset({"claim_refused"})
 
 #: 取得と解放の組。``rb history`` と同じ対応付けを使う（主宣言は資源ごと、
 #: 相乗りは資源と作業ディレクトリごと）。
-OPEN_EVENTS = {"claimed": "primary", "joined": "join"}
-CLOSE_EVENTS = {"removed": "primary", "join_removed": "join"}
+OPEN_EVENTS = {"claimed": "declaration"}
+CLOSE_EVENTS = {"removed": "declaration"}
 
 
 def board_root(override: str | None) -> Path:

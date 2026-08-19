@@ -268,3 +268,20 @@ def test_the_board_is_never_read_with_glob() -> None:
                     offenders.append(f"{path.relative_to(ROOT)}:{number}")
 
     assert not offenders, "掲示板を glob で読んでいる: " + ", ".join(offenders)
+
+
+# --- 消した仕組みの名前が文書に残らない -------------------------------------------
+
+
+def test_public_documents_do_not_mention_removed_machinery() -> None:
+    """削除した仕組みの名前が公開文書に残っていない。
+
+    仕様書が正本だと言っている以上、**存在しないコマンドや関数を説明したまま**にする
+    のは看板の問題である。実装の関数名と突き合わせるより、消した名前の禁止のほうが
+    保守が楽で、実際に起きた取り残しは全部これで拾える。
+    """
+    gone = ("try_claim", "rb join", "--primary", "add_join", "find_own_join", "JoinResult")
+    for name in ("docs/DESIGN.md", "README.md", "README.en.md"):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        for word in gone:
+            assert word not in text, f"{name} に消した仕組みの名前が残っている: {word}"

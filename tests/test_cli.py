@@ -378,15 +378,13 @@ def test_share_is_wired_into_run(tmp_path: Path) -> None:
     assert code == 0
 
 
-def test_a_simultaneous_declaration_is_reported_to_both(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+def test_a_declaration_that_lands_before_our_write_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """同じ瞬間に入った宣言は、**入れた側にその場で知らされる**。
+    """**書く前**に入った宣言は、読み直しで捕まえて断る。
 
-    平坦化の代償として `O_EXCL` による「先着 1 名」が無くなった。読んでから書くまでの
-    窓で 2 セッションが同時に通り抜けられる（窓を意図的に開くと 12 プロセス全員が通る）。
-    条件付き書き込みのプリミティブが OS に無いので**窓は塞げない**。できるのは
-    見えるようにすることで、それはこのツールの本来の仕事でもある。
+    幽霊を退けている間に他セッションが入ることがある。最初の読み取りだけで判断すると
+    **生きた宣言があるのに気づかずに通す**。退去のあとに読み直せば捕まえられる。
     """
     import resource_broker.cli as cli_module
 
@@ -400,10 +398,33 @@ def test_a_simultaneous_declaration_is_reported_to_both(
         return result
 
     monkeypatch.setattr(cli_module, "assess", racing)
+
+    assert claim(tmp_path, "GPU0", "私のジョブ") == 1, "読み直していない"
+
+
+def test_a_declaration_that_lands_after_our_write_is_reported(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**書いた後**に入った宣言は止められない。**その場で知らせる。**
+
+    条件付き書き込みのプリミティブが OS に無いので、書いてから次に読むまでの窓は
+    塞げない。**この通知は片側にしか届かない**——先に読み直したほうは、まだ書いて
+    いない相手を見ない。それでも黙るよりはよい（DESIGN.md「Known Residuals」）。
+    """
+    other = build_entry(normalize("GPU0"), job="後から来た相手", session="other")
+    real_declare = Board.declare
+
+    def declare_then_race(self, entry):  # type: ignore[no-untyped-def]
+        ok = real_declare(self, entry)
+        if entry.job == "私のジョブ":
+            real_declare(self, other)  # 自分が書いた直後に相手が入る
+        return ok
+
+    monkeypatch.setattr(Board, "declare", declare_then_race)
     capsys.readouterr()
 
     assert claim(tmp_path, "GPU0", "私のジョブ") == 0
 
     err = capsys.readouterr().err
     assert "ほぼ同時" in err, err
-    assert "ほぼ同時の相手" in err, err
+    assert "後から来た相手" in err, err
