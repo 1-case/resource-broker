@@ -210,7 +210,10 @@ def _terminating_signals_raise() -> "Iterator[None]":
         for num, old in previous:
             try:
                 signal.signal(num, old)  # type: ignore[arg-type]
-            except (ValueError, OSError):
+            except (TypeError, ValueError, OSError):
+                # ``TypeError`` は「Python 以外が設定したハンドラ」を戻そうとした場合
+                # （``signal.signal`` は None を返す）。**ここは fail-open の退避路の
+                # 内側**なので、戻せないことでジョブの結果を変えてはならない。
                 continue
 
 
