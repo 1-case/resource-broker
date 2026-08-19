@@ -87,18 +87,29 @@ def assess(
 
 
 def _known_resources(board: Board) -> list[str]:
-    """掲示板に載っている資源を列挙する。
+    """掲示板に載っている資源を列挙する。"""
+    return _known_resources_detailed(board)[0]
+
+
+def _known_resources_detailed(board: Board) -> tuple[list[str], bool]:
+    """掲示板に載っている資源と、**読めなかったものがあったか**を返す。
 
     主宣言だけでなく**相乗りだけが残っている資源**も拾う。主宣言が先に解放されて
     相乗りが残る場合があり、そこを取りこぼすと「誰も使っていない」に見えてしまう。
+
+    読めなかったことを畳まない。畳むと「掲示板は空です」と断定してしまい、
+    **実際には使われている資源を空きとして配る**（DESIGN.md「Liveness Judgment」の
+    非対称性の裏返しであり、断定してよい側ではない）。
     """
-    resources = [entry.resource for entry in board.list_all()]
+    entries, unreadable = board.list_all_detailed()
+    resources = [entry.resource for entry in entries]
     seen = set(resources)
-    for join in board.list_all_joins():
+    joins, joins_unreadable = board.list_all_joins_detailed()
+    for join in joins:
         if join.resource not in seen:
             seen.add(join.resource)
             resources.append(join.resource)
-    return resources
+    return resources, unreadable or joins_unreadable
 
 
 @dataclass(frozen=True)
@@ -137,9 +148,10 @@ def _describe(entry: Entry) -> dict[str, object]:
 
 def _cmd_status(args: argparse.Namespace) -> int:
     board = Board(args.home)
-    targets = (
-        [naming.normalize(r) for r in args.resource] if args.resource else _known_resources(board)
-    )
+    if args.resource:
+        targets, unreadable = [naming.normalize(r) for r in args.resource], False
+    else:
+        targets, unreadable = _known_resources_detailed(board)
 
     rows = []
     for resource_id in targets:
@@ -187,13 +199,22 @@ def _cmd_status(args: argparse.Namespace) -> int:
         )
 
     if args.json:
-        print(json.dumps({"resources": rows}, ensure_ascii=False, indent=2))
+        # ``partial`` は「読めなかった宣言がある」。**空と読ませない**ための旗である。
+        print(json.dumps({"resources": rows, "partial": unreadable}, ensure_ascii=False, indent=2))
         return EXIT_OK
 
     if not rows:
+        if unreadable:
+            print("掲示板を読めませんでした。**空とは限りません**")
+            print(f"  掲示板の場所: {board.root}")
+            print("  権限・パス・ネットワークドライブの接続を確かめること")
+            return EXIT_OK
         print("掲示板は空です（誰も資源を宣言していません）")
         print("使う前に自分で資源の状態を調べ、rb claim で宣言すること")
         return EXIT_OK
+
+    if unreadable:
+        print("注意: 掲示板の一部を読めませんでした。**これで全部とは限りません**")
 
     for row in rows:
         # 表示は occupied（誰か 1 人でも宣言しているか）で決める。
@@ -618,9 +639,11 @@ def _warn_not_declared() -> None:
     掲示板の唯一の役目は「他セッションから見えること」なので、そこが果たせて
     いないなら成功と言ってはならない。
     """
-    print("警告: 宣言を掲示板に残せていません。他セッションからは見えません", file=sys.stderr)
-    print("  他セッションはこの利用を知らないまま同じ資源を取りにきます", file=sys.stderr)
-    print("  作業は止めませんが、衝突を避けたいなら掲示板の状態を確かめること", file=sys.stderr)
+    # **_say で出す。** ここは掲示板へ書いた後であり、出力が例外を出すと
+    # 「宣言だけ残ってジョブが 1 度も走らない」になる（`_say` の docstring 参照）。
+    _say("警告: 宣言を掲示板に残せていません。他セッションからは見えません", err=True)
+    _say("  他セッションはこの利用を知らないまま同じ資源を取りにきます", err=True)
+    _say("  作業は止めませんが、衝突を避けたいなら掲示板の状態を確かめること", err=True)
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -698,10 +721,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
             # **掲示板に載っているのに載っていないと言う**ことになる。
             pass
         elif result.declared:
-            print(f"宣言しました: {entry.display} / {entry.job}")
+            _say(f"宣言しました: {entry.display} / {entry.job}")
         else:
             _warn_not_declared()
-        print(f"ログ: {log_path}")
+        _say(f"ログ: {log_path}")
         exit_code = runner.execute(list(args.trailing), log_path, spawn=SPAWN)
         return exit_code
     except (KeyboardInterrupt, runner.Terminated):
@@ -1383,7 +1406,10 @@ def _release_own(board: Board, resource_id: str, *, prefer: str | None = None) -
         entry, cwd=cwd, session_id=platform_info.session_id()
     )
     # 「この場所から出された相乗り」だけを曖昧さの材料にする（上の docstring 参照）。
-    has_exact_join = board.join_path(resource_id, cwd, platform_info.session_id()).exists()
+    # **ファイル名で判定しない。** 鍵にラッパーの nonce が入った時点で恒偽になり、
+    # 主宣言と相乗りが両方あるのに「相乗りは無い」と読んで**走行中の主宣言を黙って
+    # 解放する**経路になっていた。
+    has_exact_join = board.declared_here(resource_id, cwd)
 
     if prefer is None and mine_primary and has_exact_join:
         return _report_ambiguous_release(resource_id, entry)

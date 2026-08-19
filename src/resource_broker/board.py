@@ -246,6 +246,46 @@ _KNOWN_KEYS = frozenset(
 )
 
 
+def _json_files(directory: Path) -> tuple[list[Path], bool]:
+    """ディレクトリ内の ``*.json`` を並べる。**「読めない」を「空」と混ぜない。**
+
+    ``Path.glob`` を使ってはならない。``glob`` は ``OSError`` を内部で握り潰して
+    空を返すため、次のいずれも**空の掲示板と同じ形**で返ってくる。
+
+    - 掲示板のディレクトリが通常ファイルになっている
+    - 権限で拒否されている（ACL、別ユーザーの所有）
+    - 切断されたネットワークパスを ``RESOURCE_BROKER_HOME`` に指している
+
+    「空きだ」と断定して全セッションへ配るのは、このツールが最もやってはならない
+    ことである（DESIGN.md「Liveness Judgment」の非対称性の裏返し）。``os.scandir``
+    は ``NotADirectoryError`` / ``PermissionError`` をそのまま投げるので区別できる。
+
+    Returns
+    -------
+    tuple of (list of Path, bool)
+        読めたファイルと、**読めなかったものがあったか**。
+    """
+    found: list[Path] = []
+    unreadable = False
+    try:
+        for entry in os.scandir(directory):
+            if not entry.name.endswith(".json"):
+                continue
+            if entry.is_file():
+                found.append(Path(entry.path))
+                continue
+            # **壊れたリンクを黙って落とさない。** ``is_file()`` は
+            # ``FileNotFoundError`` を内部で False に畳むので、リンク先を失った
+            # 宣言が「そもそも無かった」と同じ形になる。
+            if entry.is_symlink():
+                unreadable = True
+    except FileNotFoundError:
+        return [], False  # まだ誰も宣言していない。これは「空」であって「読めない」ではない
+    except OSError:
+        return [], True
+    return sorted(found), unreadable
+
+
 def _is_within(child: str, parent: str) -> bool:
     """``child`` が ``parent`` と同じ場所か、その**配下**か。
 
@@ -444,6 +484,9 @@ class Board:
 
     def __init__(self, root: Path | str | None = None) -> None:
         self.root = Path(root) if root is not None else Path(platform_info.board_root())
+        #: 直近の相乗り走査で**読めなかったものがあったか**。
+        #: `_load_joins` が更新する（読む側は `list_all_joins_detailed` を使う）。
+        self._joins_unreadable = False
 
     @property
     def entries_dir(self) -> Path:
@@ -865,22 +908,33 @@ class Board:
 
     def list_all(self) -> list[Entry]:
         """全エントリを読む。読めなかったものは黙って飛ばす。"""
-        try:
-            paths = sorted(self.entries_dir.glob("*.json"))
-        except OSError:
-            return []
+        return self.list_all_detailed()[0]
+
+    def list_all_detailed(self) -> tuple[list[Entry], bool]:
+        """全エントリと、**読めなかったものがあったか**を返す。
+
+        読めなかったことを呼び出し側へ伝える。伝えないと ``rb status`` が
+        「掲示板は空です」と断定し、実際には使われている資源を空きとして配る。
+        """
+        paths, unreadable = _json_files(self.entries_dir)
 
         entries: list[Entry] = []
         for path in paths:
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError, ValueError) as exc:
+            except OSError as exc:
+                # **1 件読めないのも「読めない」である。** 壊れている（JSON として
+                # 不正）とは別の事実であり、こちらは「空」と言ってはいけない側。
                 self.audit("entry_unreadable", path=str(path), error=str(exc))
+                unreadable = True
+                continue
+            except (json.JSONDecodeError, ValueError) as exc:
+                self.audit("entry_corrupt", path=str(path), error=str(exc))
                 continue
             entry = Entry.from_dict(data)
             if entry is not None:
                 entries.append(entry)
-        return entries
+        return entries, unreadable
 
     def try_claim(self, entry: Entry) -> bool:
         """エントリを作成して資源を宣言する。既にあれば False。
@@ -1081,10 +1135,7 @@ class Board:
         はその**新しい生きた申告**を消す。主宣言で塞いだ read-delete race と同じものなので、
         同じ捕獲型 CAS（:meth:`_capture_and_remove`）に載せる。
         """
-        try:
-            paths = sorted(self.joins_dir.glob("*.json"))
-        except OSError:
-            return []
+        paths, self._joins_unreadable = _json_files(self.joins_dir)
 
         boot = platform_info.boot_time()
         # **境界に余裕を持たせる。** boot は起動からの経過時間から逆算した値なので、
@@ -1099,8 +1150,13 @@ class Board:
         loaded: list[tuple[Path, Entry]] = []
         for path in paths:
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError, ValueError):
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                self._joins_unreadable = True
+                continue
+            try:
+                data = json.loads(text)
+            except (json.JSONDecodeError, ValueError):
                 continue
             entry = Entry.from_dict(data)
             if entry is None:
@@ -1135,8 +1191,39 @@ class Board:
         """全ての相乗り申告を読む。資源の一覧を作るときに使う。"""
         return [entry for _, entry in self._load_joins()]
 
+    def list_all_joins_detailed(self) -> tuple[list[Entry], bool]:
+        """全ての相乗り申告と、**読めなかったものがあったか**を返す。"""
+        joins = [entry for _, entry in self._load_joins()]
+        return joins, self._joins_unreadable
+
+    def declared_here(self, resource_id: str, cwd: str) -> bool:
+        """**この場所から自分が出した相乗り**があるか。
+
+        **ファイル名で判定しない。** 鍵の構成（資源 + cwd + session_id +（ラッパーなら）
+        nonce）は運用の都合で変わる。実際、ラッパー経由の申告に nonce を足したときに
+        「パスが一致するか」で見ていた 3 箇所が**すべて恒偽**になり、そのうち 1 つは
+        ``rb release`` の曖昧判定だった——主宣言と相乗りが両方あるのに「相乗りは無い」と
+        読み、**走行中の主宣言を黙って解放する**経路になっていた。
+
+        中身（宣言された cwd）で見れば、鍵をどう変えても壊れない。
+        """
+        here = os.path.normcase(os.path.normpath(cwd))
+        for _, entry in self._load_joins():
+            if entry.resource != resource_id:
+                continue
+            if not self.owns(entry, cwd=cwd, session_id=platform_info.session_id()):
+                continue
+            declared = str(entry.holder.get("cwd") or "")
+            if declared and os.path.normcase(os.path.normpath(declared)) == here:
+                return True
+        return False
+
     def remove_join(self, resource_id: str, cwd: str, *, reason: str) -> bool:
-        """指定した作業ディレクトリの相乗り申告を取り下げる（パスの完全一致）。"""
+        """指定した作業ディレクトリの相乗り申告を取り下げる（パスの完全一致）。
+
+        **テスト専用に近い。** 実運用の経路は :meth:`remove_own_join`（中身で選ぶ）で
+        あり、こちらはファイル名で指すので鍵の構成に依存する。
+        """
         result, error = _unlink_with_retry(
             self.join_path(resource_id, cwd, platform_info.session_id())
         )
@@ -1183,14 +1270,17 @@ class Board:
             # **他人の生きた申告を選ぶ**。
             return next(((p, e) for p, e in loaded if e.nonce == expect_nonce), None)
 
-        exact = self.join_path(resource_id, cwd, platform_info.session_id())
+        # **ファイル名ではなく宣言された cwd で見る。** 鍵にラッパーの nonce が入って
+        # からは、パスの一致は成立しない（それに気づかず 1 周、この分岐は恒偽だった）。
+        here = os.path.normcase(os.path.normpath(cwd))
         candidates = [
             (path, entry)
             for path, entry in loaded
             if self.owns(entry, cwd=cwd, session_id=platform_info.session_id())
         ]
         for path, entry in candidates:
-            if path == exact:
+            declared = str(entry.holder.get("cwd") or "")
+            if declared and os.path.normcase(os.path.normpath(declared)) == here:
                 return (path, entry)
         if candidates:
             # 最も近い祖先を選ぶ。declared_cwd が長いほど自分に近い。
