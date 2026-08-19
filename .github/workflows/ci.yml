@@ -76,10 +76,14 @@ jobs:
             echo "a declared resource was claimed again without --share" >&2; exit 1
           fi
           # --share を付ければ並べる（意思表示であって、掲示板には役割として残らない）
-          rb claim CI-RESOURCE --job "alongside" --observed y --eta 1m --found busy --share
-          test "$(rb status --json | python -c 'import json,sys; print(len(json.load(sys.stdin)["resources"][0]["declarations"]))')" = 2
+          rb claim CI-RESOURCE --job alongside --observed y --eta 1m --found busy --share
+          # **日本語で grep しない。** Windows のコンソールは cp932 で、照合の前に
+          # 出力が化ける。機械可読な --json を数える。
+          rb status --json > board.json
+          test "$(grep -c '"nonce"' board.json)" = 2
           rb release CI-RESOURCE
-          rb status | grep -q "掲示板は空です" 
+          rb status --json > empty.json
+          grep -q '"resources": \[\]' empty.json
 
   # プラグインとしての妥当性。Claude Code は npm で入るので CI で回せる。
   plugin:

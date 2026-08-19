@@ -358,6 +358,22 @@ def test_unreadable_board_is_treated_as_released(tmp_path: Path) -> None:
 # --- 待っている側に逃げ道を示す ---------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _boot_is_long_ago(monkeypatch: pytest.MonkeyPatch) -> None:
+    """起動時刻を十分に過去へ固定する。
+
+    **テストが開発機の稼働時間に依存していた。** `hold_gpu(minutes_ago=200)` は
+    3h20m 前の宣言を作るが、起動から間もないマシン（CI のランナーはまさにそれ）では
+    それが**本物の再起動またぎ**になり、`holder_keys` が確定的な幽霊として数えなく
+    なる。開発機では稼働時間が長いので通り、CI で初めて落ちた。
+
+    再起動またぎを試したいテストは、この固定を自分で上書きする。
+    """
+    monkeypatch.setattr(
+        "resource_broker.platform_info.boot_time", lambda: clock.now() - timedelta(days=30)
+    )
+
+
 def hold_gpu(tmp_path: Path, *, minutes_ago: int = 0) -> None:
     """他セッションの宣言を 1 件置く。``minutes_ago`` で古さを作る。"""
     board = Board(tmp_path)
@@ -485,7 +501,9 @@ def test_a_broken_wait_is_distinguishable_from_a_timeout(
     assert broken != timed_out
 
 
-def test_a_reboot_ghost_does_not_keep_wait_running(tmp_path: Path) -> None:
+def test_a_reboot_ghost_does_not_keep_wait_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """再起動をまたいだ宣言だけの資源では、``rb wait`` はすぐ戻る。
 
     確定的な幽霊なので `rb claim` は即座に退けて取れる。ここで数えてしまうと、
@@ -497,14 +515,12 @@ def test_a_reboot_ghost_does_not_keep_wait_running(tmp_path: Path) -> None:
     entry.since = clock.to_iso(clock.now() - timedelta(hours=3))
     assert board.declare(entry)
 
-    assert waiting.holder_keys(board, RESOURCE) != set(), "起動時刻が読めない環境では数える"
+    # 既定の固定（起動は 30 日前）では、この宣言は起動より後なので数える
+    assert waiting.holder_keys(board, RESOURCE) != set()
 
     # 起動がこの宣言より後 = 再起動をまたいでいる
-    import resource_broker.platform_info as platform_info
+    monkeypatch.setattr(
+        "resource_broker.platform_info.boot_time", lambda: clock.now() - timedelta(hours=1)
+    )
 
-    original = platform_info.boot_time
-    platform_info.boot_time = lambda: clock.now() - timedelta(hours=1)
-    try:
-        assert waiting.holder_keys(board, RESOURCE) == set(), "確定的な幽霊を数えている"
-    finally:
-        platform_info.boot_time = original
+    assert waiting.holder_keys(board, RESOURCE) == set(), "確定的な幽霊を数えている"
