@@ -44,7 +44,7 @@ def run_hook(home: Path, *, path: str | None = None) -> bytes:
 def declare(home: Path, resource: str, *, job: str, session: str = "folnet") -> None:
     """一時掲示板に宣言を 1 件置く。"""
     board = Board(home)
-    assert board.try_claim(build_entry(normalize(resource), job=job, session=session))
+    assert board.declare(build_entry(normalize(resource), job=job, session=session))
 
 
 def test_rule_is_injected_even_when_board_is_empty(tmp_path: Path) -> None:
@@ -91,7 +91,7 @@ def test_usage_details_are_left_to_session_start(tmp_path: Path) -> None:
 def test_log_paths_are_not_repeated_every_prompt(tmp_path: Path) -> None:
     """ログのパスは毎プロンプトには載せない。長いうえ、判断が要る場面でしか使わない。"""
     board = Board(tmp_path)
-    assert board.try_claim(
+    assert board.declare(
         build_entry(normalize("GPU0"), job="E059 eval", log="C:\\とても\\長い\\ログ\\path.log")
     )
 
@@ -145,23 +145,6 @@ def test_is_fast_enough_for_every_prompt(tmp_path: Path) -> None:
     elapsed = time.monotonic() - started
 
     assert elapsed < BUDGET_S, f"{elapsed:.3f}s かかった"
-
-
-def test_joins_are_not_crowded_out_by_primaries(tmp_path: Path) -> None:
-    """主宣言が上限まで並んでも、相乗りが 1 件も出ない状態にしない。
-
-    連結してから上限で切ると、主宣言が埋め尽くした時点で相乗りが消える。
-    相乗りは「主宣言だけでは見えない使用者」であり、真っ先に落としてよいものではない。
-    """
-    board = Board(tmp_path)
-    for index in range(10):
-        assert board.try_claim(build_entry(normalize(f"COM{index}"), job=f"主宣言{index}"))
-    place = str(tmp_path / "works" / "malm")
-    assert board.add_join(build_entry(normalize("GPU0"), job="相乗りのジョブ", cwd=place), place)
-
-    text = run_hook(tmp_path).decode("utf-8")
-
-    assert "相乗りのジョブ" in text
 
 
 # --- 自由記述は「データ」であって「指示」ではない -------------------------------
@@ -294,7 +277,7 @@ def test_a_display_name_does_not_hide_which_resource_is_held(tmp_path: Path) -> 
     する側は見覚えのないジョブ名しか見えず、空きだと誤読しうる状態だった。
     """
     board = Board(tmp_path)
-    assert board.try_claim(
+    assert board.declare(
         build_entry(
             normalize("GPU0"),
             job="E017 A/B 学習 10 本",

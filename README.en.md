@@ -20,7 +20,7 @@ GPU0                     使用中    実測で使用を確認、または宣言
                          since  2026-08-13T19:05:58+09:00 (2h17m elapsed)
                          ETA    9h (around 2026-08-14T04:05:58+09:00)  ※ a claim, not a promise
                          見積   peak VRAM 1.4GB / avg VRAM 1.3GB
-                         相乗り allowed (up to 5GB VRAM remaining)
+                         共有 up to 5GB VRAM remaining
 ```
 
 > **Note on language.** The CLI, the hook messages and all design documents are in Japanese.
@@ -145,7 +145,7 @@ $ rb claim GPU0 --job "..." --observed "..." --eta 40m
 $ rb release GPU0
 
 # Share a resource someone else holds (read their --sharing first)
-$ rb run --res GPU0 --join --job "..." --observed "..." --eta 10m -- python small.py
+$ rb run --res GPU0 --share --job "..." --observed "..." --eta 10m -- python small.py
 
 # Wait until the set of holders shrinks (not only until it is fully free)
 $ rb wait GPU0
@@ -249,10 +249,19 @@ holder set to shrink, you identify the holder from the board and ask them direct
   (`since < boot`), or (grace elapsed **and** measured free **and** the declaring process is
   dead) all three together, or an explicit `release` / `--force`.
 - **Every timestamp is machine-generated.** An LLM is never asked to write or estimate a time.
-- **Exclusion rests on a nonce compare-and-swap, not on a lock.** The lock is a performance
-  optimization; correctness is identical whether or not it is acquired. Verified end-to-end by racing
-  5 real processes against one board: exactly one wins.
-- **One file per resource.** Damage stays local and `O_EXCL` settles acquisition races.
+- **Removal rests on a nonce compare-and-swap, not on a lock.** The lock is a performance
+  optimization; correctness is identical whether or not it is acquired. What the CAS guarantees is
+  that you never delete a declaration other than the one you read.
+- **Admission is serialized by a per-resource lock, not by `O_EXCL`.** A declaration's filename is its
+  nonce, so creation never collides and cannot decide a winner. Scan-decide-write happens inside the
+  lock, and the board is re-read after evicting ghosts, so a declaration that lands before your write
+  is caught. **The guarantee holds only while the lock is obtainable**: the tool will not stop your
+  work because it failed to take a lock, so when that happens it declares anyway and says so.
+- **A declaration that lands after your write cannot be stopped**, only reported — and the report
+  reaches whichever side re-reads last, not necessarily both. There is no conditional write on a
+  filesystem. This is a stated residual, not a solved problem.
+- **One file per declaration, named by its nonce.** Damage stays local, and the filename carries no
+  identity — deriving identity from a filename is what broke this code once already.
 
 The method, spec and constraints as they currently stand live in
 [docs/DESIGN.md](docs/DESIGN.md) (Japanese). It documents **the end state only** — the road

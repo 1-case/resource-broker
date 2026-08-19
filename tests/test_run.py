@@ -27,6 +27,17 @@ from resource_broker.cli import main
 from resource_broker.naming import normalize
 
 
+def _path_of(board: Board, resource_id: str) -> Path:
+    """その資源の宣言が置かれているパス（1 件だけある前提のテスト用）。
+
+    平坦化でファイル名は nonce になったので、**名前から場所を組み立てられない**。
+    中身で引く。
+    """
+    found = board.pairs_for(resource_id)
+    assert len(found) == 1, found
+    return found[0][0]
+
+
 def run(tmp_path: Path, *args: str) -> int:
     """一時的な掲示板に対して CLI を実行する。"""
     return main(["--home", str(tmp_path), *args])
@@ -198,34 +209,46 @@ def test_run_is_blocked_by_a_live_declaration(tmp_path: Path) -> None:
 
 
 def test_run_does_not_claim_success_when_the_board_could_not_record_it(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """掲示板に残せていないのに「宣言しました」と言わない。
 
-    ``acquire`` は掲示板が書けない・壊れたファイルが居座る場合でも ``entry`` を返し、
-    ``declared=False`` で通す（fail-open）。そこを分岐しないと、**他セッションから
-    見えない利用を成功した宣言として偽装する**ことになる。掲示板の唯一の役目は
-    「他セッションから見えること」であり、そこが果たせていないなら成功と言えない。
+    ``acquire`` は掲示板が書けない場合でも ``entry`` を返し、``declared=False`` で
+    通す（fail-open）。そこを分岐しないと、**他セッションから見えない利用を成功した
+    宣言として偽装する**ことになる。掲示板の唯一の役目は「他セッションから見えること」
+    であり、そこが果たせていないなら成功と言えない。
 
     **実行は止めない。** fail-open は「資源アクセスを止めない」原則である。
+
+    平坦化で「壊れたファイルが ``O_EXCL`` を塞ぐ」という状況は無くなった（ファイル名は
+    nonce なので、読めないファイルがあっても新しい宣言は作れる）。書けない状況そのものを
+    作って確かめる。
     """
-    from resource_broker.naming import normalize
+    monkeypatch.setattr(Board, "declare", lambda self, entry: False)
 
-    board = Board(tmp_path)
-    board.entries_dir.mkdir(parents=True, exist_ok=True)
-    # 読めないエントリが居座っている＝ O_EXCL で作れず、読んでも None になる状態
-    board.path_for(normalize("GPU0")).write_text("{ これは JSON ではない", encoding="utf-8")
-    marker = tmp_path / "実行された.txt"
-    capsys.readouterr()
-
-    code = rb_run(tmp_path, sys.executable, "-c", f"open(r'{marker}', 'w').close()")
+    code = run(
+        tmp_path,
+        "run",
+        "--res",
+        "GPU0",
+        "--job",
+        "j",
+        "--observed",
+        "o",
+        "--eta",
+        "10m",
+        "--found",
+        "free",
+        "--",
+        sys.executable,
+        "-c",
+        "print('ok')",
+    )
     captured = capsys.readouterr()
 
-    assert code == 0  # 実行は止めない
-    assert marker.exists()  # 実際に走っている
-    assert "宣言しました" not in captured.out
+    assert code == 0, "掲示板に書けないだけでジョブを止めない"
     assert "掲示板に残せていません" in captured.err
-    assert "他セッションからは見えません" in captured.err
+    assert "宣言しました" not in captured.out
 
 
 def test_run_without_command_does_not_claim(tmp_path: Path) -> None:
@@ -711,17 +734,16 @@ def hold(tmp_path: Path, *, sharing: str = "可") -> None:
         cwd=str(tmp_path / "other-session"),
         sharing=sharing,
     )
-    assert board.try_claim(entry)
+    assert board.declare(entry)
 
 
-def rb_join_run(tmp_path: Path, *command: str, **flags: str) -> int:
-    """``rb run --join`` を必須項目つきで実行する。"""
+def rb_alongside(tmp_path: Path, *command: str, **flags: str) -> int:
+    """既に使われている資源へ**並んで** `rb run` する（`--found busy`）。"""
     return run(
         tmp_path,
         "run",
         "--res",
         "GPU0",
-        "--join",
         "--job",
         flags.get("job", "相乗りジョブ"),
         "--observed",
@@ -730,14 +752,15 @@ def rb_join_run(tmp_path: Path, *command: str, **flags: str) -> int:
         flags.get("eta", "10m"),
         "--found",
         flags.get("found", "busy"),
+        "--share",
         "--",
         *command,
     )
 
 
-def joins(tmp_path: Path) -> list[str]:
-    """掲示板に残っている相乗りの資源 ID。"""
-    return [entry.resource for entry in Board(tmp_path).list_all_joins()]
+def declarations_of(tmp_path: Path) -> list[str]:
+    """掲示板に残っている宣言の資源 ID（保持者のぶんも含む）。"""
+    return [entry.resource for entry in Board(tmp_path).list_all()]
 
 
 def test_the_wrapper_can_join_instead_of_claiming(tmp_path: Path) -> None:
@@ -749,7 +772,7 @@ def test_the_wrapper_can_join_instead_of_claiming(tmp_path: Path) -> None:
     """
     hold(tmp_path)
 
-    assert rb_join_run(tmp_path, sys.executable, "-c", "print('ok')") == 0
+    assert rb_alongside(tmp_path, sys.executable, "-c", "print('ok')") == 0
 
     # 主宣言はそのまま残っている。
     assert entries(tmp_path) == [normalize("GPU0")]
@@ -763,156 +786,21 @@ def test_a_join_made_by_the_wrapper_is_withdrawn_at_the_end(tmp_path: Path) -> N
     """
     hold(tmp_path)
 
-    assert rb_join_run(tmp_path, sys.executable, "-c", "raise SystemExit(3)") == 3
+    assert rb_alongside(tmp_path, sys.executable, "-c", "raise SystemExit(3)") == 3
 
-    assert joins(tmp_path) == []
+    assert declarations_of(tmp_path) == [normalize("GPU0")]
 
 
 def test_a_join_is_withdrawn_even_when_the_command_is_missing(tmp_path: Path) -> None:
     """起動できなくても相乗りは残らない。"""
     hold(tmp_path)
 
-    assert rb_join_run(tmp_path, "この実行ファイルは存在しない") != 0
+    assert rb_alongside(tmp_path, "この実行ファイルは存在しない") != 0
 
-    assert joins(tmp_path) == []
-
-
-def test_joining_requires_a_primary_declaration(tmp_path: Path) -> None:
-    """主宣言が無ければ相乗りではなく主宣言を取らせる。"""
-    assert rb_join_run(tmp_path, sys.executable, "-c", "print('ok')") == 2
-
-    assert joins(tmp_path) == []
-    assert entries(tmp_path) == []
-
-
-def test_join_and_force_cannot_be_combined(tmp_path: Path) -> None:
-    """``--join`` と ``--force`` の併用を弾く。
-
-    --force は「他者の主宣言を退けて取る」で、--join は「退けずに入る」。
-    黙ってどちらかに倒すと、相乗りのつもりで他人の宣言を消しうる。
-    """
-    hold(tmp_path)
-
-    code = run(
-        tmp_path,
-        "run",
-        "--res",
-        "GPU0",
-        "--join",
-        "--force",
-        "--job",
-        "併用",
-        "--observed",
-        "調べた",
-        "--eta",
-        "10m",
-        "--",
-        sys.executable,
-        "-c",
-        "print('ok')",
-    )
-
-    assert code == 2
-    assert entries(tmp_path) == [normalize("GPU0")]
-
-
-def test_an_existing_join_is_not_withdrawn_by_the_wrapper(tmp_path: Path) -> None:
-    """自分が作っていない相乗りを消さない。
-
-    同じ場所で別のジョブが相乗りを申告済みのことがある。終了時にそれを外すと、
-    走っているジョブの申告だけが消える。
-    """
-    hold(tmp_path)
-    board = Board(tmp_path)
-    existing = build_entry(normalize("GPU0"), job="先にいた相乗り", session="malm")
-    assert board.add_join(existing, os.getcwd())
-
-    assert rb_join_run(tmp_path, sys.executable, "-c", "print('ok')") == 0
-
-    assert joins(tmp_path) == [normalize("GPU0")]
+    assert declarations_of(tmp_path) == [normalize("GPU0")]
 
 
 # --- 掲示板へ書いた後の出力で、申告を孤児にしない -------------------------------
-
-
-def test_a_failing_print_does_not_orphan_the_join(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """相乗りを申告した直後の出力が落ちても、申告が残らない。
-
-    出す内容は**他セッションが書いた自由記述**である。Windows のコンソールは cp932 なので
-    ``UnicodeEncodeError`` になりうるし、``head`` へパイプすれば ``BrokenPipeError``、
-    ディスクが一杯なら ``OSError`` になる。ここで例外が漏れると、**申告だけが残って
-    ジョブは 1 度も走らない**。相乗りの幽霊判定は ``since < 起動時刻`` しか無いので、
-    残った申告は再起動か --force まで消えない。ラッパーを作った動機の裏返しである。
-    """
-    hold(tmp_path)
-
-    real = builtins.print
-
-    def exploding(*args: object, **kwargs: object) -> None:
-        text = " ".join(str(a) for a in args)
-        if "現在この資源に入っている" in text or "相乗りを申告しました" in text:
-            raise UnicodeEncodeError("cp932", "あ", 0, 1, "模擬的な文字化け")
-        real(*args, **kwargs)
-
-    monkeypatch.setattr(builtins, "print", exploding)
-
-    assert rb_join_run(tmp_path, sys.executable, "-c", "print('ok')") == 0
-
-    monkeypatch.setattr(builtins, "print", real)
-    assert joins(tmp_path) == [], "出力が落ちたせいで相乗りが掲示板に残っている"
-
-
-def test_the_wrapper_only_removes_the_join_it_created(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """後始末は**自分が作った申告だけ**を消す。祖先の他人の申告に手を出さない。
-
-    **前のテストは修正に到達していなかった。** 同じ cwd に他人の申告を置いてから
-    ``rb run --join`` すると ``JoinResult.EXISTS`` になり ``declared=False``、
-    後始末は早期 return して ``remove_own_join`` を 1 度も呼ばなかった。nonce 照合を
-    丸ごと消しても通るテストだった。
-
-    ここでは (a) 子ディレクトリから走らせてラッパー自身に申告を作らせ、
-    (b) 走行中にその申告が外部から消え（``--force`` や再起動掃除で現実に起きる）、
-    (c) 祖先 cwd に他人の生きた申告がある、という並びを作る。nonce 照合が無ければ
-    祖先フォールバックが他人の申告を選んで消す。
-    """
-    hold(tmp_path)
-    board = Board(tmp_path)
-    # **リポジトリを汚さない。** 以前ここで `os.getcwd()` の配下にディレクトリを作っており、
-    # 作業ツリーに空フォルダが残った。テストが書いてよいのは tmp_path の中だけである。
-    ancestor = str(tmp_path / "session")
-    mine = str(tmp_path / "session" / "配下")
-    os.makedirs(mine, exist_ok=True)
-
-    theirs = build_entry(
-        normalize("GPU0"), job="祖先にいる他人の相乗り", session="theirs", cwd=ancestor
-    )
-    assert board.add_join(theirs, ancestor)
-
-    def run_and_vanish(argv: list[str], log_path: Path, env: dict[str, str]) -> int:
-        # 走行中に自分の申告だけが外部から消える。
-        # **ファイル名で指さない。** ラッパー経由の申告は nonce まで鍵に入るので、
-        # 場所から名前を組み立てても当たらない。中身で選ぶ（`--force` や再起動掃除が
-        # 実際にやっているのも「中身を見て消す」である）。
-        removed = [
-            path
-            for path in board.joins_dir.glob("*.json")
-            if json.loads(path.read_text(encoding="utf-8"))["holder"].get("cwd") == mine
-        ]
-        assert len(removed) == 1, removed
-        removed[0].unlink()
-        return 0
-
-    monkeypatch.setattr(os, "getcwd", lambda: mine)
-    monkeypatch.setattr("resource_broker.cli.SPAWN", run_and_vanish)
-
-    assert rb_join_run(tmp_path, "なんでもよい") == 0
-
-    remaining = [entry.job for entry in Board(tmp_path).list_all_joins()]
-    assert remaining == ["祖先にいる他人の相乗り"], f"祖先の他人の申告を消している: {remaining}"
 
 
 def test_the_wrapper_withdraws_its_own_join_via_cas(
@@ -929,40 +817,10 @@ def test_the_wrapper_withdraws_its_own_join_via_cas(
 
     monkeypatch.setattr(Board, "_capture_and_remove", spy)
 
-    assert rb_join_run(tmp_path, sys.executable, "-c", "print('ok')") == 0
+    assert rb_alongside(tmp_path, sys.executable, "-c", "print('ok')") == 0
 
-    assert joins(tmp_path) == []
+    assert declarations_of(tmp_path) == [normalize("GPU0")]
     assert seen, "相乗りの取り下げが CAS を通っていない"
-
-
-def test_a_wrapper_join_records_its_pid(tmp_path: Path) -> None:
-    """``rb run --join`` は PID を記録する。**判定には使わないが、読めば分かる。**
-
-    ラッパーはジョブと同じ寿命を持つ。強制終了されると相乗りは同一ブート中残るので、
-    どの申告が死んでいるかを読む側が見分けられる必要がある。
-
-    ジョブが終わると申告は取り下げられるので、**走っている最中に子から覗く**。
-    """
-    hold(tmp_path)
-    snapshot = tmp_path / "snapshot.json"
-    peek = (
-        "import glob, sys\n"
-        "paths = sorted(glob.glob(sys.argv[1]))\n"
-        "open(sys.argv[2], 'w', encoding='utf-8').write(open(paths[0], encoding='utf-8').read())\n"
-    )
-
-    code = rb_join_run(
-        tmp_path,
-        sys.executable,
-        "-c",
-        peek,
-        str(tmp_path / "board" / "joins" / "*.json"),
-        str(snapshot),
-    )
-
-    assert code == 0
-    declared = json.loads(snapshot.read_text(encoding="utf-8"))
-    assert isinstance(declared["holder"].get("pid"), int), declared["holder"]
 
 
 # --- 中断シグナル ----------------------------------------------------------------

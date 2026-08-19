@@ -270,20 +270,18 @@ def test_the_board_is_never_read_with_glob() -> None:
     assert not offenders, "掲示板を glob で読んでいる: " + ", ".join(offenders)
 
 
-def test_design_describes_the_join_key_as_implemented() -> None:
-    """DESIGN の「相乗りの鍵」の記述が実装の要素をすべて挙げている。
+# --- 消した仕組みの名前が文書に残らない -------------------------------------------
 
-    鍵の構成は 2 周続けて変え、2 回とも DESIGN を直し忘れた。仕様書が正本だと
-    言っている以上、**中心的な仕様が実装に追い越されたまま**になるのは看板に関わる。
+
+def test_public_documents_do_not_mention_removed_machinery() -> None:
+    """削除した仕組みの名前が公開文書に残っていない。
+
+    仕様書が正本だと言っている以上、**存在しないコマンドや関数を説明したまま**にする
+    のは看板の問題である。実装の関数名と突き合わせるより、消した名前の禁止のほうが
+    保守が楽で、実際に起きた取り残しは全部これで拾える。
     """
-    source = (ROOT / "src" / "resource_broker" / "board.py").read_text(encoding="utf-8")
-    start = source.index("def join_path(")
-    body = source[start : source.index("def add_join(", start)]
-
-    design = (ROOT / "docs" / "DESIGN.md").read_text(encoding="utf-8")
-    sentence = next((line for line in design.splitlines() if "相乗りのファイル名は" in line), "")
-    assert sentence, "DESIGN に相乗りの鍵の記述が無い"
-
-    for part in ("cwd", "session_id", "nonce"):
-        assert part in body, f"実装が {part} を使っていない（テストの前提が古い）"
-        assert part in sentence, f"DESIGN が鍵の要素 {part} を書いていない"
+    gone = ("try_claim", "rb join", "--primary", "add_join", "find_own_join", "JoinResult")
+    for name in ("docs/DESIGN.md", "README.md", "README.en.md"):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        for word in gone:
+            assert word not in text, f"{name} に消した仕組みの名前が残っている: {word}"

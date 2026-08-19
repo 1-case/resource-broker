@@ -9,38 +9,60 @@ import sys
 import threading
 from pathlib import Path
 
-from resource_broker.board import SCHEMA, Board, Entry, build_entry
+import pytest
+
+from resource_broker.board import (
+    SCHEMA,
+    Board,
+    Entry,
+    RemovalResult,
+    build_entry,
+)
+from resource_broker.naming import normalize
 
 
-def test_claim_is_exclusive(board: Board) -> None:
-    """同じ資源を 2 回宣言できない（O_EXCL による先着 1 名）。"""
+def _first(board: Board, resource_id: str) -> Entry | None:
+    """その資源の**最初の宣言**（無ければ None）。順序は ``since``。"""
+    found = board.list_for(resource_id)
+    return found[0] if found else None
+
+
+def test_declaring_never_refuses(board: Board) -> None:
+    """掲示板は宣言を断らない。**断るのは CLI の判断である。**
+
+    ファイル名が nonce なので ``O_EXCL`` は衝突せず、同じ資源へ何件でも並ぶ。
+    「使われているなら断る」は掲示板の仕事ではなく、読んで判断する側の仕事である。
+    """
     first = build_entry("pc-a::GPU0", job="1 本目")
     second = build_entry("pc-a::GPU0", job="2 本目")
 
-    assert board.try_claim(first) is True
-    assert board.try_claim(second) is False
+    assert board.declare(first) is True
+    # 宣言は**必ず残せる**（ファイル名は nonce）。断るのは CLI の判断であって
+    # 掲示板の仕事ではない。
+    assert board.declare(second) is True
+    assert len(board.list_for("pc-a::GPU0")) == 2
 
 
 def test_claim_after_release_succeeds(board: Board) -> None:
     """解放した後は再び宣言できる。"""
-    board.try_claim(build_entry("pc-a::GPU0", job="1 本目"))
-    board.remove("pc-a::GPU0", reason="テスト")
+    board.declare(build_entry("pc-a::GPU0", job="1 本目"))
+    board.remove_all("pc-a::GPU0", reason="テスト")
 
-    assert board.try_claim(build_entry("pc-a::GPU0", job="2 本目")) is True
+    assert board.declare(build_entry("pc-a::GPU0", job="2 本目")) is True
 
 
 def test_different_resources_do_not_interfere(board: Board) -> None:
     """資源ごとに 1 ファイルなので、別資源の宣言は互いに影響しない。"""
-    assert board.try_claim(build_entry("pc-a::GPU0", job="学習")) is True
-    assert board.try_claim(build_entry("pc-a::COM3", job="実機")) is True
+    assert board.declare(build_entry("pc-a::GPU0", job="学習")) is True
+    assert board.declare(build_entry("pc-a::COM3", job="実機")) is True
 
 
 def test_round_trip_preserves_declared_fields(board: Board) -> None:
     """宣言した内容がそのまま読み戻せる。"""
     entry = build_entry("pc-a::GPU0", job="E008 sweep", log="runs/e008.log")
-    board.try_claim(entry)
+    board.declare(entry)
 
-    loaded = board.read("pc-a::GPU0")
+    loaded = _first(board, "pc-a::GPU0")
     assert loaded is not None
     assert loaded.job == "E008 sweep"
     assert loaded.log == "runs/e008.log"
@@ -63,9 +85,9 @@ def test_unknown_fields_survive_a_read_write_cycle(board: Board) -> None:
     """
     entry = build_entry("pc-a::GPU0", job="学習")
     entry.extra["future_field"] = {"kind": "まだ知らない情報"}
-    board.try_claim(entry)
+    board.declare(entry)
 
-    loaded = board.read("pc-a::GPU0")
+    loaded = _first(board, "pc-a::GPU0")
     assert loaded is not None
     assert loaded.extra["future_field"] == {"kind": "まだ知らない情報"}
     assert loaded.to_dict()["future_field"] == {"kind": "まだ知らない情報"}
@@ -73,7 +95,7 @@ def test_unknown_fields_survive_a_read_write_cycle(board: Board) -> None:
 
 def test_list_all_skips_unreadable_entries(board: Board) -> None:
     """壊れたエントリがあっても、読める分は返す。"""
-    board.try_claim(build_entry("pc-a::GPU0", job="正常"))
+    board.declare(build_entry("pc-a::GPU0", job="正常"))
     board.entries_dir.mkdir(parents=True, exist_ok=True)
     (board.entries_dir / "broken.json").write_text("{ これは JSON ではない", encoding="utf-8")
 
@@ -83,13 +105,13 @@ def test_list_all_skips_unreadable_entries(board: Board) -> None:
 
 def test_remove_reports_absence(board: Board) -> None:
     """存在しない宣言の削除は False を返す（例外にしない）。"""
-    assert board.remove("pc-a::GPU0", reason="テスト") is False
+    assert board.remove_all("pc-a::GPU0", reason="テスト") == 0
 
 
 def test_audit_records_claim_and_removal(board: Board) -> None:
     """宣言と削除が監査ログに残る（沈黙は成功ではない）。"""
-    board.try_claim(build_entry("pc-a::GPU0", job="学習"))
-    board.remove("pc-a::GPU0", reason="テストのため")
+    board.declare(build_entry("pc-a::GPU0", job="学習"))
+    board.remove_all("pc-a::GPU0", reason="テストのため")
 
     lines = [
         json.loads(line)
@@ -176,15 +198,14 @@ def _race_claim(index: int, home: Path, barrier: threading.Barrier, codes: list[
 
 
 def test_only_one_of_many_simultaneous_claims_wins(tmp_path: Path) -> None:
-    """同時に「空き」を見て一斉に宣言しても、取れるのは 1 人だけである。
+    """同時に「空き」を見て一斉に宣言しても、通るのは 1 人だけである。
 
-    **これは確率で薄める設計ではない。** 掲示板の作成は ``O_EXCL`` が、幽霊の退去は
-    ``os.rename`` による捕獲が決める。どちらも OS が原子性を保証する操作であり、
-    ロックは競り合いを減らす最適化にすぎない（取れても取れなくても結論は変わらない）。
+    **これは保証ではなく、ロックが取れる間の振る舞いである。** 宣言のファイル名は
+    nonce なので ``O_EXCL`` は取得競合を解決しない。直列化しているのは資源ごとの
+    ロックだけで、**取れなければ全員通る**（別のテストがその劣化を固定している）。
 
-    単体では ``try_claim`` の戻り値を、フェイクではロックの 3 値を検証しているが、
-    **実プロセスを競らせる検証がここまで無かった**。CLAUDE.md が「取得競合の排他性」を
-    性質として名指ししているのに、端から端までは一度も確かめていなかった。
+    ここで確かめるのは「既定の経路では 1 人だけが通る」ことである。端から端まで、
+    実プロセスを競らせて見る。
     """
     racers = 5
     codes: list[int] = [-1] * racers
@@ -300,3 +321,131 @@ def test_salvage_does_not_overwrite_an_existing_extension_field() -> None:
 
     assert entry is not None
     assert entry.extra["x-sharing"] == "別の版が書いた値", "既存の拡張を潰している"
+
+
+def test_without_the_lock_two_claims_both_get_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**ロックが取れなければ排他は無い。** その劣化をここで固定する。
+
+    宣言のファイル名は nonce なので ``O_EXCL`` は取得競合を解決しない。直列化して
+    いるのは資源ごとのロックだけで、取れなければ「読む → 読み直す → 書く」が交錯し、
+    2 人とも通る。**保証の範囲を誤解させないために、劣化のほうも書いておく。**
+
+    この性質は隣の `test_only_one_of_many_simultaneous_claims_wins` と対になっている
+    ——あちらは「ロックが取れる既定の経路では 1 人だけ」、こちらは「取れなければ全員」。
+    """
+    from contextlib import contextmanager
+
+    from resource_broker.board import LockState
+    from resource_broker.cli import main
+
+    @contextmanager
+    def unavailable(*_args: object, **_kwargs: object):  # type: ignore[no-untyped-def]
+        yield LockState.UNAVAILABLE
+
+    monkeypatch.setattr(Board, "locked", unavailable)
+
+    board = Board(tmp_path)
+    ready = threading.Barrier(2)
+    real_declare = Board.declare
+
+    def declare_together(self, entry):  # type: ignore[no-untyped-def]
+        ready.wait(timeout=5)  # 2 人とも「空きだ」と読み終えてから書く
+        return real_declare(self, entry)
+
+    monkeypatch.setattr(Board, "declare", declare_together)
+
+    codes: list[int] = [-1, -1]
+
+    def claim(index: int) -> None:
+        codes[index] = main(
+            [
+                "--home",
+                str(tmp_path),
+                "claim",
+                "GPU0",
+                "--job",
+                f"J{index}",
+                "--observed",
+                "空だった",
+                "--eta",
+                "1h",
+                "--found",
+                "free",
+            ]
+        )
+
+    threads = [threading.Thread(target=claim, args=(i,)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+
+    assert codes == [0, 0], "ロック無しでも排他が効いてしまっている（前提が変わった）"
+    assert len(board.list_for(normalize("GPU0"))) == 2
+
+
+def test_a_declaration_in_the_legacy_layout_is_read(tmp_path: Path) -> None:
+    """旧い置き場（``board/<資源>.json`` と ``board/joins/*.json``）を宣言として読む。
+
+    形式を変えた瞬間に、稼働中のセッションの宣言を見失わないための経路である。
+    **ここが消えても本番の掲示板からしか気づけない**ので、テストで固定する。
+    """
+    board = Board(tmp_path)
+    (tmp_path / "board" / "joins").mkdir(parents=True)
+    old_primary = build_entry("pc-a::GPU0", job="旧い主宣言", session="old")
+    old_join = build_entry("pc-a::GPU0", job="旧い相乗り", session="old2")
+    (tmp_path / "board" / "pc-a__GPU0.json").write_text(
+        json.dumps(old_primary.to_dict(), ensure_ascii=False), encoding="utf-8"
+    )
+    (tmp_path / "board" / "joins" / "何か.json").write_text(
+        json.dumps(old_join.to_dict(), ensure_ascii=False), encoding="utf-8"
+    )
+
+    assert sorted(e.job for e in board.list_for("pc-a::GPU0")) == ["旧い主宣言", "旧い相乗り"]
+
+
+def test_a_declaration_in_the_legacy_layout_can_be_removed(tmp_path: Path) -> None:
+    """旧い置き場の宣言を**消せる**（nonce があれば CAS、無ければ中身の照合）。"""
+    board = Board(tmp_path)
+    (tmp_path / "board" / "joins").mkdir(parents=True)
+    with_nonce = build_entry("pc-a::GPU0", job="nonce あり", session="old")
+    without = build_entry("pc-a::GPU0", job="nonce なし", session="old2")
+    without.holder.pop("nonce", None)
+    (tmp_path / "board" / "pc-a__GPU0.json").write_text(
+        json.dumps(with_nonce.to_dict(), ensure_ascii=False), encoding="utf-8"
+    )
+    (tmp_path / "board" / "joins" / "何か.json").write_text(
+        json.dumps(without.to_dict(), ensure_ascii=False), encoding="utf-8"
+    )
+
+    assert (
+        board.remove_if_nonce("pc-a::GPU0", expect_nonce=with_nonce.nonce, reason="テスト")
+        is RemovalResult.REMOVED
+    )
+
+    path, entry = board.pairs_for("pc-a::GPU0")[0]
+    assert board.remove_matching(path, entry, reason="テスト") is RemovalResult.REMOVED
+    assert board.list_for("pc-a::GPU0") == []
+
+
+def test_an_empty_nonce_is_never_a_cas_key(tmp_path: Path) -> None:
+    """空の nonce を照合鍵にしない。
+
+    「nonce が空のもの」に一致させると、nonce を持たない古い宣言が 2 件あるとき
+    **別の生きた宣言**を捕まえて消す（古い順の先頭が当たる）。
+    """
+    board = Board(tmp_path)
+    board.entries_dir.mkdir(parents=True)
+    for index in range(2):
+        entry = build_entry("pc-a::GPU0", job=f"古い宣言{index}", session=f"s{index}")
+        entry.holder.pop("nonce", None)
+        (board.entries_dir / f"old{index}.json").write_text(
+            json.dumps(entry.to_dict(), ensure_ascii=False), encoding="utf-8"
+        )
+
+    assert board.remove_if_nonce("pc-a::GPU0", expect_nonce="", reason="テスト") is (
+        RemovalResult.NOT_OWNED
+    )
+    assert len(board.list_for("pc-a::GPU0")) == 2, "空の nonce で宣言が消えた"

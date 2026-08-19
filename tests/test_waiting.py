@@ -26,6 +26,19 @@ from resource_broker.board import Board, build_entry
 from resource_broker.cli import main
 from resource_broker.naming import normalize
 
+
+def _joined_nonce(board: Board, cwd: str) -> str:
+    """その場所から出された宣言の nonce。
+
+    平坦化で宣言は対等になったので、``cwd`` だけで消すと**祖先関係で他の宣言まで
+    巻き込む**。テストが狙った 1 件だけを外すために nonce で指す。
+    """
+    for entry in board.list_for(RESOURCE):
+        if str(entry.holder.get("cwd") or "") == cwd:
+            return entry.nonce
+    raise AssertionError(f"{cwd} から出された宣言が無い")
+
+
 RESOURCE = normalize("GPU0")
 
 #: 相乗り者の作業ディレクトリ。**ネイティブの区切りで組み立てる。**
@@ -50,13 +63,13 @@ class FakeClock:
 
 def declare(board: Board, *, eta: str = "40m") -> None:
     """主宣言を置く。"""
-    assert board.try_claim(build_entry(RESOURCE, job="E059 eval", session="folnet", eta=eta))
+    assert board.declare(build_entry(RESOURCE, job="E059 eval", session="folnet", eta=eta))
 
 
 def join(board: Board, cwd: str) -> None:
     """相乗りを置く。"""
     entry = build_entry(RESOURCE, job="相乗りのジョブ", cwd=cwd, session="malm")
-    assert board.add_join(entry, cwd)
+    assert board.declare(entry)
 
 
 def audit_events(root: Path) -> list[dict[str, object]]:
@@ -102,7 +115,7 @@ def test_returns_when_the_primary_is_released(tmp_path: Path) -> None:
         calls["n"] += 1
         fake.sleep(seconds)
         if calls["n"] == 3:
-            board.remove(RESOURCE, reason="テストで解放")
+            board.remove_all(RESOURCE, reason="テストで解放")
 
     result = waiting.wait_for_room(
         board, RESOURCE, interval_s=5, timeout_s=1000, sleep=sleep, now=fake.now
@@ -127,7 +140,12 @@ def test_returns_when_a_joiner_leaves(tmp_path: Path) -> None:
         calls["n"] += 1
         fake.sleep(seconds)
         if calls["n"] == 2:
-            board.remove_join(RESOURCE, JOINER_CWD, reason="テストで離脱")
+            board.remove_own(
+                RESOURCE,
+                cwd=JOINER_CWD,
+                reason="テストで離脱",
+                nonce=_joined_nonce(board, JOINER_CWD),
+            )
 
     result = waiting.wait_for_room(
         board, RESOURCE, interval_s=5, timeout_s=1000, sleep=sleep, now=fake.now
@@ -181,8 +199,8 @@ def test_holder_replacement_is_not_a_shrink(tmp_path: Path) -> None:
         calls["n"] += 1
         fake.sleep(seconds)
         if calls["n"] == 2:
-            board.remove(RESOURCE, reason="テストで交代")
-            assert board.try_claim(build_entry(RESOURCE, job="別のジョブ", session="malm"))
+            board.remove_all(RESOURCE, reason="テストで交代")
+            assert board.declare(build_entry(RESOURCE, job="別のジョブ", session="malm"))
 
     result = waiting.wait_for_room(
         board, RESOURCE, interval_s=5, timeout_s=40, sleep=sleep, now=fake.now
@@ -208,10 +226,15 @@ def test_shrink_after_a_replacement_still_wakes(tmp_path: Path) -> None:
         calls["n"] += 1
         fake.sleep(seconds)
         if calls["n"] == 1:
-            board.remove(RESOURCE, reason="テストで交代")
-            assert board.try_claim(build_entry(RESOURCE, job="別のジョブ", session="malm"))
+            board.remove_all(RESOURCE, reason="テストで交代")
+            assert board.declare(build_entry(RESOURCE, job="別のジョブ", session="malm"))
         if calls["n"] == 3:
-            board.remove_join(RESOURCE, JOINER_CWD, reason="テストで離脱")
+            board.remove_own(
+                RESOURCE,
+                cwd=JOINER_CWD,
+                reason="テストで離脱",
+                nonce=_joined_nonce(board, JOINER_CWD),
+            )
 
     result = waiting.wait_for_room(
         board, RESOURCE, interval_s=5, timeout_s=1000, sleep=sleep, now=fake.now
@@ -237,7 +260,12 @@ def test_growth_then_shrink_still_wakes(tmp_path: Path) -> None:
         if calls["n"] == 1:
             join(board, JOINER_CWD)
         if calls["n"] == 3:
-            board.remove_join(RESOURCE, JOINER_CWD, reason="テストで離脱")
+            board.remove_own(
+                RESOURCE,
+                cwd=JOINER_CWD,
+                reason="テストで離脱",
+                nonce=_joined_nonce(board, JOINER_CWD),
+            )
 
     result = waiting.wait_for_room(
         board, RESOURCE, interval_s=5, timeout_s=1000, sleep=sleep, now=fake.now
@@ -344,7 +372,7 @@ def hold_gpu(tmp_path: Path, *, minutes_ago: int = 0) -> None:
         entry.since = (
             datetime.fromisoformat(entry.since) - timedelta(minutes=minutes_ago)
         ).isoformat()
-    assert board.try_claim(entry)
+    assert board.declare(entry)
 
 
 def test_wait_tells_the_waiter_how_to_escape(
@@ -449,9 +477,34 @@ def test_a_broken_wait_is_distinguishable_from_a_timeout(
     broken = main(["--home", str(tmp_path), "wait", "GPU0"])
 
     monkeypatch.undo()
-    hold_gpu(tmp_path) if not Board(tmp_path).read(RESOURCE) else None
+    hold_gpu(tmp_path) if not Board(tmp_path).list_for(RESOURCE) else None
     timed_out = main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0"])
 
     assert broken == cli.EXIT_WAIT_BROKEN
     assert timed_out == cli.EXIT_BUSY
     assert broken != timed_out
+
+
+def test_a_reboot_ghost_does_not_keep_wait_running(tmp_path: Path) -> None:
+    """再起動をまたいだ宣言だけの資源では、``rb wait`` はすぐ戻る。
+
+    確定的な幽霊なので `rb claim` は即座に退けて取れる。ここで数えてしまうと、
+    **同じ掲示板を見て 2 つのコマンドが逆のことを言う**——`claim` は「取れる」、
+    `wait` は上限まで待って「まだ使用中です」。
+    """
+    board = Board(tmp_path)
+    entry = build_entry(RESOURCE, job="落ちたセッション", session="theirs")
+    entry.since = clock.to_iso(clock.now() - timedelta(hours=3))
+    assert board.declare(entry)
+
+    assert waiting.holder_keys(board, RESOURCE) != set(), "起動時刻が読めない環境では数える"
+
+    # 起動がこの宣言より後 = 再起動をまたいでいる
+    import resource_broker.platform_info as platform_info
+
+    original = platform_info.boot_time
+    platform_info.boot_time = lambda: clock.now() - timedelta(hours=1)
+    try:
+        assert waiting.holder_keys(board, RESOURCE) == set(), "確定的な幽霊を数えている"
+    finally:
+        platform_info.boot_time = original

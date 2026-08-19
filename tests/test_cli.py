@@ -10,11 +10,14 @@ GPU も COM ポートも、テストから見れば単なる文字列の ID で�
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
+from resource_broker.board import Board, build_entry
 from resource_broker.cli import main
+from resource_broker.naming import normalize
 
 
 def run(tmp_path: Path, *args: str) -> int:
@@ -137,11 +140,11 @@ def test_status_json_exposes_verdict_and_holder(
     payload = json.loads(capsys.readouterr().out)
     row = payload["resources"][0]
 
-    assert row["free"] is False
-    assert row["verdict"] == "held"
-    assert row["holder"]["job"] == "実機の教示"
-    assert row["log"] == "runs/probe.log"
-    assert row["since"]
+    assert row["occupied"] is True
+    assert row["occupied"] is True
+    assert row["declarations"][0]["holder"]["job"] == "実機の教示"
+    assert row["declarations"][0]["log"] == "runs/probe.log"
+    assert row["declarations"][0]["since"]
 
 
 def test_status_reports_free_for_unclaimed_resource(
@@ -151,8 +154,8 @@ def test_status_reports_free_for_unclaimed_resource(
     assert run(tmp_path, "status", "COM7", "--json") == 0
     row = json.loads(capsys.readouterr().out)["resources"][0]
 
-    assert row["free"] is True
-    assert row["verdict"] == "free"
+    assert row["occupied"] is False
+    assert row["occupied"] is False
 
 
 def test_claim_records_the_log_path(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -165,7 +168,7 @@ def test_claim_records_the_log_path(tmp_path: Path, capsys: pytest.CaptureFixtur
     run(tmp_path, "status", "COM3", "--json")
 
     row = json.loads(capsys.readouterr().out)["resources"][0]
-    assert row["log"] == "runs/rec.log"
+    assert row["declarations"][0]["log"] == "runs/rec.log"
 
 
 def test_claim_records_the_observation_verbatim(
@@ -192,7 +195,7 @@ def test_claim_records_the_observation_verbatim(
     capsys.readouterr()
     run(tmp_path, "status", "\\\\nas\\share", "--json")
 
-    observed = json.loads(capsys.readouterr().out)["resources"][0]["observed"]
+    observed = json.loads(capsys.readouterr().out)["resources"][0]["declarations"][0]["observed"]
     assert observed["note"] == "net use: 接続なし / 空き容量 2.1TB"
     assert observed["found"] == "free"
     assert observed["at"]  # 観測時刻は機械が刻む
@@ -213,31 +216,6 @@ def test_status_without_arguments_lists_only_declared_resources(
     resources = json.loads(capsys.readouterr().out)["resources"]
 
     assert [row["display"] for row in resources] == ["COM3"]
-
-
-def test_wait_does_not_report_release_when_only_joins_remain(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """相乗りだけが残った資源で「既に解放されています」と答えない。
-
-    入口の判定が主宣言しか見ていないと、**実際に使っている者がいるのに解放と報告する**。
-    本体（``wait_for_room``）は主宣言と相乗りの両方を数えているので、入口だけが古い基準だった。
-    """
-    from resource_broker.board import Board, build_entry
-    from resource_broker.naming import normalize
-
-    board = Board(tmp_path)
-    resource = normalize("GPU0")
-    place = str(tmp_path / "works" / "theirs")
-    assert board.add_join(build_entry(resource, job="相乗りのジョブ", cwd=place), place)
-    capsys.readouterr()
-
-    code = run(tmp_path, "wait", "GPU0", "--interval", "0", "--timeout", "0")
-    captured = capsys.readouterr()
-
-    assert code == 1  # まだ使用中である
-    assert "既に解放されています" not in captured.out
-    assert "待機します" in captured.out
 
 
 def test_wait_returns_when_nothing_holds_the_resource(
@@ -355,3 +333,98 @@ def test_status_on_an_empty_board_is_not_flagged_as_partial(
     assert main(["--home", str(tmp_path), "status", "--json"]) == 0
 
     assert json.loads(capsys.readouterr().out)["partial"] is False
+
+
+def test_share_lets_you_declare_alongside(tmp_path: Path) -> None:
+    """``--share`` を付ければ、既に宣言のある資源へ並んで宣言できる。
+
+    **claim と run の両方に配線されていること**まで確かめる。片方だけ繋がっていない
+    状態でテストが全部緑だった——`acquire` 側の分岐だけ見ても、呼び出し側が値を
+    渡していなければ意味が無い。
+    """
+    assert claim(tmp_path, "GPU0", "1 本目") == 0
+    assert claim(tmp_path, "GPU0", "2 本目") == 1, "断らないなら段差の意味が無い"
+
+    assert claim(tmp_path, "GPU0", "2 本目", "--share") == 0
+
+    assert len(Board(tmp_path).list_for(normalize("GPU0"))) == 2
+
+
+def test_share_is_wired_into_run(tmp_path: Path) -> None:
+    """``rb run`` 側にも ``--share`` が繋がっている。"""
+    assert claim(tmp_path, "GPU0", "1 本目") == 0
+
+    code = main(
+        [
+            "--home",
+            str(tmp_path),
+            "run",
+            "--res",
+            "GPU0",
+            "--job",
+            "2 本目",
+            "--observed",
+            "見た",
+            "--eta",
+            "10m",
+            "--share",
+            "--",
+            sys.executable,
+            "-c",
+            "print('ok')",
+        ]
+    )
+
+    assert code == 0
+
+
+def test_a_declaration_that_lands_before_our_write_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**書く前**に入った宣言は、読み直しで捕まえて断る。
+
+    幽霊を退けている間に他セッションが入ることがある。最初の読み取りだけで判断すると
+    **生きた宣言があるのに気づかずに通す**。退去のあとに読み直せば捕まえられる。
+    """
+    import resource_broker.cli as cli_module
+
+    real = cli_module.assess
+    other = build_entry(normalize("GPU0"), job="ほぼ同時の相手", session="other")
+
+    def racing(board, resource_id, observation=None):  # type: ignore[no-untyped-def]
+        result = real(board, resource_id, observation)
+        if not result:
+            board.declare(other)  # 読み終えた直後に他セッションが入る
+        return result
+
+    monkeypatch.setattr(cli_module, "assess", racing)
+
+    assert claim(tmp_path, "GPU0", "私のジョブ") == 1, "読み直していない"
+
+
+def test_a_declaration_that_lands_after_our_write_is_reported(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**書いた後**に入った宣言は止められない。**その場で知らせる。**
+
+    条件付き書き込みのプリミティブが OS に無いので、書いてから次に読むまでの窓は
+    塞げない。**この通知は片側にしか届かない**——先に読み直したほうは、まだ書いて
+    いない相手を見ない。それでも黙るよりはよい（DESIGN.md「Known Residuals」）。
+    """
+    other = build_entry(normalize("GPU0"), job="後から来た相手", session="other")
+    real_declare = Board.declare
+
+    def declare_then_race(self, entry):  # type: ignore[no-untyped-def]
+        ok = real_declare(self, entry)
+        if entry.job == "私のジョブ":
+            real_declare(self, other)  # 自分が書いた直後に相手が入る
+        return ok
+
+    monkeypatch.setattr(Board, "declare", declare_then_race)
+    capsys.readouterr()
+
+    assert claim(tmp_path, "GPU0", "私のジョブ") == 0
+
+    err = capsys.readouterr().err
+    assert "ほぼ同時" in err, err
+    assert "後から来た相手" in err, err

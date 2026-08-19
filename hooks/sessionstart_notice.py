@@ -189,10 +189,6 @@ def fetch_status() -> list[dict[str, object]] | None:
     return None
 
 
-#: 申告が読めない主宣言の代わりに置く holder。**空にしない**（下の理由は本文にある）。
-UNREADABLE_HOLDER: dict[str, object] = {"session": "?", "job": "(申告が読めない)"}
-
-
 def read_entries_directly() -> list[dict[str, object]] | None:
     """``rb`` を経ずに掲示板のファイルを直接読む。**最後の砦。**
 
@@ -256,50 +252,30 @@ def read_entries_directly() -> list[dict[str, object]] | None:
                 found.append(data)
         return found
 
-    for data in load(board):
-        holder = data.get("holder")
-        row: dict[str, object] = {
-            "resource": data.get("resource"),
-            "display": data.get("display"),
-            # **主宣言があるのに「主宣言なし」と見せない。** 申告が読めないファイルでも、
-            # そのファイルがある限り取得は塞がれている。``describe`` は holder が空の行を
-            # 「主宣言なし / 相乗りのみ」と表示するので、事実と逆の通知になる。
-            "holder": holder if isinstance(holder, dict) and holder else UNREADABLE_HOLDER,
-            "since": data.get("since"),
-            "log": data.get("log"),
-            "observed": data.get("observed"),
-            "eta": data.get("eta"),
-            "usage": data.get("usage"),
-            "sharing": data.get("sharing"),
-            "occupied": True,
-            "joins": [],
-        }
-        rows.append(row)
-        key = data.get("resource")
-        if isinstance(key, str):
-            by_resource.setdefault(key, row)
-
-    # **相乗りも読む。** 主宣言が先に解放されて相乗りだけが残った資源は、``board/`` を
-    # 見ただけでは消える。この経路は ``rb`` を起動できなかったときの最後の砦であり、
-    # そこで「掲示板は空です」と出すのは、無言より悪い（実際に使っている者がいるのに
-    # 空きだと告げる）。本体も他のフックも相乗りを読んでいる。ここだけ例外にしない。
-    for data in load(board / "joins"):
+    # **旧い置き場も同じ宣言として読む。** 形式を変えた瞬間に、稼働中のセッションの
+    # 宣言を見失わないためである。主宣言と相乗りという区別は掲示板が持たないので、
+    # ここにも無い。1 資源に宣言が N 件並ぶだけである。
+    for data in load(board) + load(board / "joins"):
         key = data.get("resource")
         row = by_resource.get(key) if isinstance(key, str) else None
         if row is None:
             row = {
                 "resource": key,
                 "display": data.get("display"),
-                "holder": None,
                 "occupied": True,
-                "joins": [],
+                "declarations": [],
             }
             rows.append(row)
             if isinstance(key, str):
                 by_resource[key] = row
-        joins = row.get("joins")
-        if isinstance(joins, list):
-            joins.append(data)
+        declarations = row.get("declarations")
+        if isinstance(declarations, list):
+            declarations.append(data)
+
+    for row in rows:
+        found = row.get("declarations")
+        if isinstance(found, list):
+            found.sort(key=lambda item: str(item.get("since") or ""))
 
     if unreadable and not rows:
         return None  # 何も読めなかった。**空だとは言えない**
@@ -380,37 +356,24 @@ def fit(lines: list[str], limit: int) -> list[str]:
     return kept
 
 
-def describe_holder(holder: object, resource: dict[str, object]) -> list[str]:
-    """主宣言を数行に整形する。宣言が無ければ空。"""
+def describe_declaration(declaration: object) -> list[str]:
+    """宣言 1 件を数行に整形する。**全ての宣言が同じ形である。**"""
+    declaration = declaration if isinstance(declaration, dict) else {}
+    holder = declaration.get("holder")
     holder = holder if isinstance(holder, dict) else {}
-    if not holder:
-        return []
     session = clip(holder.get("session"), MAX_NAME_BYTES) or "?"
-    job = clip(holder.get("job"), MAX_JOB_BYTES) or "(ジョブ未記入)"
-    lines = [f"{DATA_MARK}  主宣言 {session} / {job}"]
-    if resource.get("since"):
-        lines.append(f"{DATA_MARK}    since {clip(resource.get('since'), MAX_NAME_BYTES)}")
-    if resource.get("log"):
-        log = clip(resource.get("log"), MAX_NOTE_BYTES)
+    job = clip(holder.get("job") or declaration.get("job"), MAX_JOB_BYTES) or "(ジョブ未記入)"
+    lines = [f"{DATA_MARK}  {session} / {job}"]
+    if declaration.get("since"):
+        lines.append(f"{DATA_MARK}    since {clip(declaration.get('since'), MAX_NAME_BYTES)}")
+    if declaration.get("log"):
+        log = clip(declaration.get("log"), MAX_NOTE_BYTES)
         lines.append(f"{DATA_MARK}    log   {log}  (進捗はここで読める)")
-    observed = resource.get("observed")
+    observed = declaration.get("observed")
     if isinstance(observed, dict) and observed.get("note"):
         lines.append(f"{DATA_MARK}    観測  {clip(observed.get('note'), MAX_NOTE_BYTES)}")
-    return lines
-
-
-def describe_join(join: object) -> list[str]:
-    """相乗り 1 件を数行に整形する。"""
-    join = join if isinstance(join, dict) else {}
-    holder = join.get("holder")
-    holder = holder if isinstance(holder, dict) else {}
-    session = clip(holder.get("session"), MAX_NAME_BYTES) or "?"
-    job = clip(join.get("job") or holder.get("job"), MAX_JOB_BYTES) or "(ジョブ未記入)"
-    lines = [f"{DATA_MARK}  相乗り {session} / {job}"]
-    if join.get("since"):
-        lines.append(f"{DATA_MARK}    since {clip(join.get('since'), MAX_NAME_BYTES)}")
-    if join.get("log"):
-        lines.append(f"{DATA_MARK}    log   {clip(join.get('log'), MAX_NOTE_BYTES)}")
+    if declaration.get("sharing"):
+        lines.append(f"{DATA_MARK}    共有  {clip(declaration.get('sharing'), MAX_NOTE_BYTES)}")
     return lines
 
 
@@ -446,31 +409,24 @@ def board_label(resource: dict[str, object]) -> str:
 
 
 def describe(resource: dict[str, object]) -> list[str]:
-    """1 資源の状態を数行に整形する。**主宣言と相乗りを別々に整形する。**
+    """1 資源の状態を数行に整形する。**宣言を古い順に並べるだけ。**
 
-    ``rb status --json`` は相乗りを ``joins`` に入れるため、相乗りだけが残った資源では
-    ``holder`` が None になる。1 つの型に押し込めると ``GPU0 <- ? / (ジョブ未記入)``
-    という行になり、**誰が使っているかもログも隠れる**。実際に使っている者がいるのに
-    「誰か分からない」と出すのは、このフックが出しうる最も役に立たない情報である。
+    主宣言と相乗りを分けていた頃は、相乗りだけが残った資源で ``holder`` が None に
+    なり、1 つの型に押し込めると ``GPU0 <- ? / (ジョブ未記入)`` という行になった。
+    区別が無くなったので、その壊れ方も無い。
     """
     display = board_label(resource)
-    joins = resource.get("joins")
-    joins = [j for j in joins if isinstance(j, dict)] if isinstance(joins, list) else []
-
-    holder = resource.get("holder")
-    primary = describe_holder(holder, resource)
+    declarations = resource.get("declarations")
+    declarations = (
+        [d for d in declarations if isinstance(d, dict)] if isinstance(declarations, list) else []
+    )
 
     # 資源名も申告された文字列である（本ツールは資源を知らないので検査できない）。
     # ここだけ印を外すと、資源名を装った行がフックの文言のように見える。
-    head = (
-        f"{DATA_MARK}{display}"
-        if primary
-        else f"{DATA_MARK}{display}  （主宣言なし / 相乗りのみ）"
-    )
-    lines = [head]
-    lines.extend(primary)
-    for join in joins:
-        lines.extend(describe_join(join))
+    count = f"  （宣言 {len(declarations)} 件）" if len(declarations) > 1 else ""
+    lines = [f"{DATA_MARK}{display}{count}"]
+    for declaration in declarations:
+        lines.extend(describe_declaration(declaration))
     return lines
 
 
