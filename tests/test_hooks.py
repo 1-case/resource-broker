@@ -332,6 +332,84 @@ def test_missing_rb_still_delivers_the_board(tmp_path: Path) -> None:
     assert "rb run" in result.stdout
 
 
+def test_an_unreadable_board_is_never_reported_as_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``board/`` が読めないときに「掲示板は空です」と断定しない。
+
+    実際には使われている資源を全セッションへ「空き」として配ることになる。
+    **空きは宣言を退ける根拠にならない**の裏返しであり、断定してよい側ではない。
+
+    ここは 1 度「直した」つもりで直っていなかった。``Path.glob`` は ``OSError`` を
+    内部で握り潰して空を返すため、**「読めない」が「空」と同じ形で返っていた**。
+    ``board`` が通常ファイルになっている状況で確かめる（3 OS すべてで再現する）。
+    """
+    (tmp_path / "board").write_text("これはディレクトリではない", encoding="utf-8")
+    module = load_hook_module()
+    monkeypatch.setenv("RESOURCE_BROKER_HOME", str(tmp_path))
+
+    assert module.read_entries_directly() is None
+
+
+def test_a_board_denied_by_permissions_is_never_reported_as_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """権限で拒否された掲示板も「空」ではない。
+
+    ``NotADirectoryError`` だけでなく ``PermissionError`` も同じ扱いにする。
+    OS ごとに再現条件が違うので、走査そのものを差し替えて確かめる。
+    """
+    (tmp_path / "board").mkdir()
+    module = load_hook_module()
+    monkeypatch.setenv("RESOURCE_BROKER_HOME", str(tmp_path))
+
+    class DeniedOs:
+        """``os`` の代わり。**このフックモジュールにだけ**差し替える。"""
+
+        def __init__(self, real: object) -> None:
+            self._real = real
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._real, name)
+
+        def scandir(self, _path: object) -> object:
+            raise PermissionError("拒否された")
+
+    monkeypatch.setattr(module, "os", DeniedOs(module.os))
+
+    assert module.read_entries_directly() is None
+
+
+def test_a_partially_readable_board_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """一部だけ読めたときは「これで全部とは限らない」と言う。
+
+    黙ると、読む側は「宣言はこれで全部だ」と読む。Windows の共有違反で 1 件だけ
+    読めないのは日常的に起きる。
+    """
+    declare(tmp_path, "GPU0", job="E059 eval")
+    (tmp_path / "board" / "読めない.json").write_text("{}", encoding="utf-8")
+    module = load_hook_module()
+    monkeypatch.setenv("RESOURCE_BROKER_HOME", str(tmp_path))
+
+    real = Path.read_text
+
+    def flaky(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name == "読めない.json":
+            raise PermissionError("共有違反")
+        return real(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", flaky)
+
+    rows = module.read_entries_directly()
+
+    assert rows is not None
+    notice = module.build_notice(rows)
+    assert "GPU0" in notice
+    assert "全部とは限りません" in notice, notice
+
+
 def test_a_board_that_was_never_created_reads_as_empty_not_as_unreadable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
