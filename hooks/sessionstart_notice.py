@@ -224,11 +224,16 @@ def read_entries_directly() -> list[dict[str, object]] | None:
         """
         nonlocal unreadable
         try:
-            names = sorted(
-                entry.name
-                for entry in os.scandir(directory)
-                if entry.name.endswith(".json") and entry.is_file()
-            )
+            names = []
+            for entry in os.scandir(directory):
+                if not entry.name.endswith(".json"):
+                    continue
+                if entry.is_file():
+                    names.append(entry.name)
+                elif entry.is_symlink():
+                    # 壊れたリンク。``is_file()`` は False に畳むので、ここで数える。
+                    unreadable = True
+            names.sort()
         except FileNotFoundError:
             return []  # まだ誰も宣言していない。これは「空」であって「読めない」ではない
         except OSError:

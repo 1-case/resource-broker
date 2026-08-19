@@ -101,6 +101,43 @@ def board_root() -> Path:
     return Path.home() / ".resource-broker"
 
 
+def json_files(directory: Path) -> tuple[list[Path], bool]:
+    """``*.json`` を並べる。**「読めない」を「空」と混ぜない。**
+
+    ``Path.glob`` は ``OSError`` を内部で握り潰して空を返すので、掲示板が通常ファイルに
+    なっている・権限で拒否されている・切断されたネットワークパスを指している、の
+    いずれもが**空の掲示板と同じ形**になる。それを「空きです」と全セッションへ配るのは、
+    このツールが最もやってはならないことである。``os.scandir`` は投げるので区別できる。
+
+    :func:`clip` と同じ理由で 3 つのフックへ意図的に重複させてある（フックは素の
+    ``python`` で単体起動されるため、互いを import できない）。
+
+    Returns
+    -------
+    tuple of (list of Path, bool)
+        読めたファイルと、**読めなかったものがあったか**。
+    """
+    found: list[Path] = []
+    unreadable = False
+    try:
+        for entry in os.scandir(directory):
+            if not entry.name.endswith(".json"):
+                continue
+            if entry.is_file():
+                found.append(Path(entry.path))
+                continue
+            # **壊れたリンクを黙って落とさない。** ``is_file()`` は
+            # ``FileNotFoundError`` を内部で False に畳むので、リンク先を失った
+            # 宣言が「そもそも無かった」と同じ形になる。
+            if entry.is_symlink():
+                unreadable = True
+    except FileNotFoundError:
+        return [], False  # まだ誰も宣言していない。これは「空」であって「読めない」ではない
+    except OSError:
+        return [], True
+    return sorted(found), unreadable
+
+
 def clip(value: object, limit: int) -> str:
     """掲示板の自由記述を**1 行に潰し、バイト長で切る**。
 
@@ -266,7 +303,7 @@ def declarations_for(root: Path, resource: str | None) -> list[dict[str, object]
     found: list[dict[str, object]] = []
     for directory, is_join in ((board, False), (board / "joins", True)):
         try:
-            paths = sorted(directory.glob("*.json"))
+            paths, _ = json_files(directory)
         except OSError:
             continue
         for path in paths:
