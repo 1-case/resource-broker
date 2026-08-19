@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from . import audit, clock
-from .board import Board, Entry
+from .board import Board, Entry, first_declaration
 
 #: ポーリングの既定間隔（秒）。
 DEFAULT_INTERVAL_S = 10.0
@@ -181,7 +181,7 @@ def wait_for_room(
                 reason=SHRANK,
                 polls=polls,
                 waited_s=elapsed,
-                last=board.read(resource_id),
+                last=first_declaration(board, resource_id),
                 holders=len(keys),
             )
 
@@ -198,7 +198,7 @@ def wait_for_room(
                 reason=TIMEOUT,
                 polls=polls,
                 waited_s=elapsed,
-                last=board.read(resource_id),
+                last=first_declaration(board, resource_id),
                 holders=len(keys),
             )
 

@@ -24,7 +24,10 @@ def test_claim_is_exclusive(board: Board) -> None:
     second = build_entry("pc-a::GPU0", job="2 本目")
 
     assert board.declare(first) is True
-    assert board.declare(second) is False
+    # 宣言は**必ず残せる**（ファイル名は nonce）。断るのは CLI の判断であって
+    # 掲示板の仕事ではない。
+    assert board.declare(second) is True
+    assert len(board.list_for("pc-a::GPU0")) == 2
 
 
 def test_claim_after_release_succeeds(board: Board) -> None:
@@ -89,7 +92,7 @@ def test_list_all_skips_unreadable_entries(board: Board) -> None:
 
 def test_remove_reports_absence(board: Board) -> None:
     """存在しない宣言の削除は False を返す（例外にしない）。"""
-    assert board.remove_all("pc-a::GPU0", reason="テスト") is False
+    assert board.remove_all("pc-a::GPU0", reason="テスト") == 0
 
 
 def test_audit_records_claim_and_removal(board: Board) -> None:

@@ -498,7 +498,7 @@ def test_the_board_can_be_read_without_rb(tmp_path: Path, monkeypatch: pytest.Mo
     assert rows is not None
     assert len(rows) == 1
     assert rows[0]["resource"] == normalize("GPU0")
-    assert rows[0]["holder"]["job"] == "E059 eval"
+    assert rows[0]["declarations"][0]["holder"]["job"] == "E059 eval"
     assert rows[0]["occupied"] is True
 
 

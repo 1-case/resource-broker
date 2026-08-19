@@ -485,7 +485,14 @@ class OwnRemoval:
     """消せたもの。"""
 
     failed: list[Entry]
-    """自分のものだが消せなかったもの。**残っている**。"""
+    """自分のものだが消せなかったもの（共有違反など）。**残っている**。"""
+
+    swapped: list[Entry]
+    """読んでから消すまでに**別の宣言へ入れ替わっていた**もの。
+
+    ``failed`` と畳まない。I/O の失敗は再試行の話だが、入れ替わりは**他セッションが
+    その資源を取り直した**という話で、次にやることがまるで違う。
+    """
 
     foreign: list[Entry]
     """自分のものではないので触らなかったもの。"""
@@ -493,7 +500,7 @@ class OwnRemoval:
     @property
     def any_here(self) -> bool:
         """その資源に宣言が 1 件でもあったか。"""
-        return bool(self.removed or self.failed or self.foreign)
+        return bool(self.removed or self.failed or self.swapped or self.foreign)
 
 
 class Board:
@@ -706,6 +713,46 @@ class Board:
                 found.append((path, entry))
         return found, unreadable or legacy_unreadable
 
+    def unreadable_paths(self) -> list[Path]:
+        """**どの資源にも紐づけられないファイル**を返す。
+
+        壊れていて ``resource`` が読めない宣言は、資源を指して消すことができない。
+        平坦化する前は ``board/<資源>.json`` という名前だったので名指しで消せたが、
+        ファイル名が身元を持たなくなった以上、**中身が読めなければ持ち主も分からない**。
+
+        塞ぐものは無い（宣言のファイル名は nonce なので、壊れたファイルがあっても
+        新しい宣言は作れる）。残るのは掃除の手段だけなので、**場所を教える**。
+        """
+        found: list[Path] = []
+        for directory in (self.entries_dir, self.entries_dir / "joins"):
+            paths, _ = _json_files(directory)
+            for path in paths:
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError, ValueError):
+                    found.append(path)
+                    continue
+                if Entry.from_dict(data) is None:
+                    found.append(path)
+        return sorted(found)
+
+    def remove_unreadable(self, *, reason: str) -> list[Path]:
+        """読めないファイルを消す。消せたものを返す。
+
+        資源を指定しない。**指定できない**——中身が読めないので、どの資源のものか
+        分からない。``rb release --force`` が資源ごとに動くのと対照的だが、
+        それは対象が「誰のものでもないゴミ」だからである。
+        """
+        removed: list[Path] = []
+        for path in self.unreadable_paths():
+            result, error = _unlink_with_retry(path)
+            if result is RemovalResult.REMOVED:
+                removed.append(path)
+                self.audit("unreadable_removed", path=str(path), reason=reason)
+            elif result is RemovalResult.FAILED:
+                self.audit("remove_failed", path=str(path), error=error)
+        return removed
+
     def list_for(self, resource_id: str) -> list[Entry]:
         """その資源の宣言を**古い順**に返す。
 
@@ -807,8 +854,14 @@ class Board:
         """
         # 1. 先読み。**中身で探す。** ファイル名から場所を組み立てない——名前の付け方を
         #    変えた瞬間に「見つからない」へ黙って倒れる（実際に一度そうなった）。
-        found = [(path, e) for path, e in self.pairs_for(resource_id) if e.nonce == expect_nonce]
+        pairs = self.pairs_for(resource_id)
+        found = [(path, e) for path, e in pairs if e.nonce == expect_nonce]
         if not found:
+            # **「無い」と「別物になっている」を畳まない。** 宣言が残っているのに
+            # nonce が違うのは、解放と再取得が挟まったということで、対処が違う。
+            if pairs:
+                self.audit("remove_refused", resource=resource_id, reason="nonce が一致しない")
+                return RemovalResult.NOT_OWNED
             return RemovalResult.ABSENT
 
         path, _ = found[0]
@@ -867,7 +920,10 @@ class Board:
         # 閉じてしまい、まだ走っている宣言が「解放済み」に見える（掲示板は正しいのに
         # 監査だけが嘘をつく）。呼び出し側が join_removed を書くのでここは黙る。
         if audit_as:
-            self.audit(audit_as, resource=resource_id, reason=reason)
+            # **job も残す。** `rb history` は宣言と解放を (資源, job) で突き合わせる。
+            # 資源だけで対応させると、同じ資源に並ぶ別の作業の解放を自分の宣言に
+            # 結び付けてしまい、実所要が無関係な値になる。
+            self.audit(audit_as, resource=resource_id, job=captured.job, reason=reason)
         return RemovalResult.REMOVED
 
     def _restore(self, tombstone: Path, path: Path, resource_id: str) -> None:
@@ -941,6 +997,7 @@ class Board:
         """
         removed: list[Entry] = []
         failed: list[Entry] = []
+        swapped: list[Entry] = []
         foreign: list[Entry] = []
         with self.locked(resource_id) as lock:
             if lock is not LockState.ACQUIRED:
@@ -955,8 +1012,10 @@ class Board:
                     foreign.append(entry)
                     continue
                 if entry.nonce:
-                    result = self._capture_and_remove(
-                        path, expect_nonce=entry.nonce, resource_id=resource_id, reason=reason
+                    # **CAS の入り口を 1 つに寄せる。** ここだけ `_capture_and_remove` を
+                    # 直に呼ぶと、公開の入り口を差し替えても効かない経路ができる。
+                    result = self.remove_if_nonce(
+                        resource_id, expect_nonce=entry.nonce, reason=reason
                     )
                 else:
                     # nonce を持たない古い宣言。照合できる値が無いので素直に消す。
@@ -969,9 +1028,13 @@ class Board:
                     removed.append(entry)
                 elif result is RemovalResult.ABSENT:
                     pass  # 読んだ直後に誰かが消した。**残っていない**ので失敗ではない
+                elif result is RemovalResult.NOT_OWNED:
+                    # 読んでから消すまでに入れ替わった。**新しい宣言を消さなかった**、
+                    # というのがここで守れた性質である。
+                    swapped.append(entry)
                 else:
                     failed.append(entry)
-        return OwnRemoval(removed=removed, failed=failed, foreign=foreign)
+        return OwnRemoval(removed=removed, failed=failed, swapped=swapped, foreign=foreign)
 
     def owns_any(self, resource_id: str, *, cwd: str | None = None) -> bool:
         """その資源に**自分の宣言があるか**。"""
@@ -1165,6 +1228,16 @@ class Board:
     def audit(self, event: str, **fields: object) -> None:
         """監査ログに 1 行追記する。失敗しても黙って諦める。"""
         audit.append(self.root, event, **fields)
+
+
+def first_declaration(board: Board, resource_id: str) -> Entry | None:
+    """その資源の**最初の宣言**（無ければ None）。
+
+    平坦化で「主宣言」は無くなった。表示や説明のために 1 件だけ挙げたい場面のための
+    補助であり、**判断には使わない**（判断は宣言 1 件ずつ独立している）。
+    """
+    found = board.list_for(resource_id)
+    return found[0] if found else None
 
 
 def build_entry(

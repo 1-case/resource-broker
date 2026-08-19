@@ -119,7 +119,7 @@ def test_release_refuses_another_sessions_declaration(
     plant(board, THEIRS)
 
     assert run(tmp_path, "release", "GPU0") == 1
-    assert "他セッションの宣言は解放できません" in capsys.readouterr().err
+    assert "自分の宣言はありません" in capsys.readouterr().err
     assert _first(board, RESOURCE) is not None
 
 
@@ -137,7 +137,7 @@ def test_release_removes_my_own_declaration(tmp_path: Path) -> None:
     claim(tmp_path)
 
     assert run(tmp_path, "release", "GPU0") == 0
-    assert Board(tmp_path).read(RESOURCE) is None
+    assert _first(Board(tmp_path), RESOURCE) is None
 
 
 def test_update_refuses_another_sessions_declaration(tmp_path: Path) -> None:
@@ -159,8 +159,9 @@ def test_update_rewrites_my_own_declaration(
 
     run(tmp_path, "status", "GPU0", "--json")
     row = json.loads(capsys.readouterr().out)["resources"][0]
-    assert row["usage"]["peak"] == "VRAM 2GB"
-    assert row["sharing"] == "可"
+    declaration = row["declarations"][0]
+    assert declaration["usage"]["peak"] == "VRAM 2GB"
+    assert declaration["sharing"] == "可"
 
 
 def test_update_does_not_clobber_a_newer_declaration(tmp_path: Path) -> None:
@@ -288,7 +289,7 @@ def test_remove_if_owned_refuses_a_reclaimed_declaration(tmp_path: Path) -> None
 
     result = board.remove_own(RESOURCE, reason="rb run の終了", nonce=mine.nonce)
 
-    assert result is RemovalResult.NOT_OWNED
+    assert result.foreign and not result.removed
     current = _first(board, RESOURCE)
     assert current is not None
     assert current.job == "他人のジョブ"
@@ -302,11 +303,11 @@ def test_remove_if_owned_reports_absence_and_success_separately(tmp_path: Path) 
     """
     board = Board(tmp_path)
 
-    assert board.remove_own(RESOURCE, reason="テスト", nonce="なんでも") is (RemovalResult.ABSENT)
+    assert not board.remove_own(RESOURCE, reason="テスト", nonce="なんでも").any_here
 
     mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
     assert board.declare(mine)
-    assert board.remove_own(RESOURCE, reason="テスト", nonce=mine.nonce) is (RemovalResult.REMOVED)
+    assert board.remove_own(RESOURCE, reason="テスト", nonce=mine.nonce).removed
 
 
 def test_remove_reports_failure_apart_from_absence(
@@ -327,7 +328,7 @@ def test_remove_reports_failure_apart_from_absence(
     monkeypatch.setattr(Path, "unlink", refuse)
     monkeypatch.setattr("resource_broker.board.UNLINK_DELAY_S", 0.0)
 
-    assert board.remove_all(RESOURCE, reason="テスト") is RemovalResult.FAILED
+    assert board.remove_all(RESOURCE, reason="テスト") == 0
 
 
 def test_unlink_is_retried_before_giving_up(
@@ -350,7 +351,7 @@ def test_unlink_is_retried_before_giving_up(
     monkeypatch.setattr(Path, "unlink", flaky)
     monkeypatch.setattr("resource_broker.board.UNLINK_DELAY_S", 0.0)
 
-    assert board.remove_all(RESOURCE, reason="テスト") is RemovalResult.REMOVED
+    assert board.remove_all(RESOURCE, reason="テスト") == 1
     assert attempts["n"] == 3
 
 
@@ -620,7 +621,7 @@ def test_two_sessions_seeing_one_ghost_do_not_both_acquire(
                 )
                 == 0
             )
-        return original(self, resource_id, nonce=expect_nonce, reason=reason)
+        return original(self, resource_id, expect_nonce=expect_nonce, reason=reason)
 
     monkeypatch.setattr(Board, "remove_if_nonce", interleave)
 
@@ -674,7 +675,7 @@ def test_conditional_removal_restores_what_it_captured(
     plant(board, THEIRS)  # 実体は他人のもの
 
     # 先読みだけが自分の宣言を返す状況（読んだ直後に入れ替わった）を作る
-    monkeypatch.setattr(Board, "read", lambda self, resource_id: mine)
+    monkeypatch.setattr(Board, "list_for", lambda self, resource_id: [mine])
 
     assert board.remove_if_nonce(RESOURCE, expect_nonce=mine.nonce, reason="テスト") is (
         RemovalResult.NOT_OWNED
@@ -731,7 +732,7 @@ def test_release_does_not_remove_a_declaration_reclaimed_mid_flight(
                 )
                 == 0
             )
-        return original(self, resource_id, nonce=expect_nonce, reason=reason)
+        return original(self, resource_id, expect_nonce=expect_nonce, reason=reason)
 
     monkeypatch.setattr(Board, "remove_if_nonce", interleave)
     capsys.readouterr()
@@ -787,19 +788,23 @@ def test_creation_falls_back_when_hard_links_are_unavailable(
     board = Board(tmp_path)
 
     assert board.declare(build_entry(RESOURCE, job="1 本目", cwd=MINE)) is True
-    assert board.declare(build_entry(RESOURCE, job="2 本目", cwd=THEIRS)) is False
-    current = _first(board, RESOURCE)
-    assert current is not None
-    assert current.job == "1 本目"
+    # **2 本目も残る。** ファイル名は nonce なので上書きしない。ハードリンクが
+    # 使えない環境でも、作成の退避路（O_EXCL）が同じ結果を出す。
+    assert board.declare(build_entry(RESOURCE, job="2 本目", cwd=THEIRS)) is True
+    assert sorted(e.job for e in board.list_for(RESOURCE)) == ["1 本目", "2 本目"]
 
 
 # --- 壊れたエントリからの回復 ---------------------------------------------------
 
 
 def corrupt(board: Board) -> None:
-    """読めないエントリを仕込む。"""
+    """読めないファイルを仕込む。
+
+    平坦化でファイル名は nonce になったので、**壊れたファイルはどの資源のものか
+    分からない**。名前で資源を指せないので、置く場所も任意である。
+    """
     board.entries_dir.mkdir(parents=True, exist_ok=True)
-    _path_of(board, RESOURCE).write_text("{ これは JSON ではない", encoding="utf-8")
+    (board.entries_dir / "壊れている.json").write_text("{ これは JSON ではない", encoding="utf-8")
 
 
 def test_a_corrupt_declaration_can_be_cleaned_with_force(tmp_path: Path) -> None:
@@ -814,7 +819,7 @@ def test_a_corrupt_declaration_can_be_cleaned_with_force(tmp_path: Path) -> None
     corrupt(board)
 
     assert run(tmp_path, "release", "GPU0", "--force") == 0
-    assert _path_of(board, RESOURCE).exists() is False
+    assert board.list_for(RESOURCE) == []
     assert claim(tmp_path) == 0  # 掃除したあとは普通に取れる
 
 
@@ -833,10 +838,13 @@ def test_claim_names_the_corrupt_entry_instead_of_failing_silently(
     captured = capsys.readouterr()
 
     assert code == 0  # 判断材料が無いだけ。作業は止めない（fail-open）
+    # **壊れたファイルは何も塞がない。** 平坦化でファイル名が nonce になったので、
+    # 読めないファイルがあっても新しい宣言は作れる（以前は `board/<資源>.json` が
+    # 埋まって、その資源について掲示板が恒久的に機能停止していた）。
+    # 残るのは掃除の手段だけなので、場所と掃除の道を示す。
     assert "壊れたエントリ" in captured.err
-    assert "--force" in captured.err
-    assert "掲示板に残せていません" in captured.err
-    assert "宣言しました" not in captured.out
+    assert "--clean" in captured.err
+    assert "宣言しました" in captured.out
 
 
 # --- 幽霊判定の境界 -------------------------------------------------------------
@@ -1020,7 +1028,7 @@ def test_a_second_session_in_the_same_place_cannot_release_my_declaration(
 
     assert run(tmp_path, "release", "GPU0") == 1  # 自分は "mine"
     assert _first(board, RESOURCE) is not None
-    assert "他セッションの宣言は解放できません" in capsys.readouterr().err
+    assert "自分の宣言はありません" in capsys.readouterr().err
 
 
 def test_a_second_session_in_the_same_place_cannot_update_my_declaration(
@@ -1080,7 +1088,7 @@ def test_my_own_session_id_is_recorded_on_the_board(tmp_path: Path) -> None:
         == 0
     )
 
-    entry = Board(tmp_path).read(RESOURCE)
+    entry = _first(Board(tmp_path), RESOURCE)
     assert entry is not None
     assert entry.holder["session_id"] == "mine"
 

@@ -33,6 +33,7 @@ from .board import (
     UpdateResult,
     build_entry,
     build_eta,
+    first_declaration,
 )
 from .liveness import Observation, Verdict
 
@@ -161,6 +162,24 @@ def _describe(entry: Entry) -> dict[str, object]:
     }
 
 
+def _report_unreadable(board: Board) -> None:
+    """読めないファイルの**場所を教える**。
+
+    どの資源のものか分からない（中身が読めない）ので、資源を指して消せない。
+    何も塞いではいないが、掲示板が「一部を読めない」と言い続ける原因にはなる。
+    黙って放置すると、読む側は理由の分からない留保だけを受け取る。
+    """
+    paths = board.unreadable_paths()
+    if not paths:
+        return
+    print(f"  読めないファイルが {len(paths)} 件あります（どの資源のものか判別できません）")
+    for path in paths[:5]:
+        print(f"    {path}")
+    if len(paths) > 5:
+        print(f"    ほか {len(paths) - 5} 件")
+    print("  掃除するなら rb release --clean（資源は指定しない）")
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     board = Board(args.home)
     if args.resource:
@@ -186,7 +205,17 @@ def _cmd_status(args: argparse.Namespace) -> int:
                 "label": naming.label(resource_id, first.display if first else ""),
                 "occupied": occupied,
                 "holders": len(living),
-                "declarations": [_describe(entry) for entry in living],
+                # **幽霊も載せる。** 掲示板にあるものを一覧から消してはならない——
+                # 資源が「空き」と出るだけでは、古い宣言が残っていることに気づけず、
+                # 誰も掃除しない。判定は 1 件ずつ付ける。
+                "declarations": [
+                    {
+                        **_describe(entry),
+                        "verdict": str(verdict),
+                        "reason": liveness.explain(verdict),
+                    }
+                    for verdict, entry in judged
+                ],
                 "reason": (
                     f"{len(living)} 件の宣言がある"
                     if occupied
@@ -207,6 +236,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
             print("掲示板を読めませんでした。**空とは限りません**")
             print(f"  掲示板の場所: {board.root}")
             print("  権限・パス・ネットワークドライブの接続を確かめること")
+            _report_unreadable(board)
             return EXIT_OK
         print("掲示板は空です（誰も資源を宣言していません）")
         print("使う前に自分で資源の状態を調べ、rb claim で宣言すること")
@@ -214,6 +244,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
     if unreadable:
         print("注意: 掲示板の一部を読めませんでした。**これで全部とは限りません**")
+        _report_unreadable(board)
 
     for row in rows:
         mark = "使用中" if row["occupied"] else "空き"
@@ -222,13 +253,14 @@ def _cmd_status(args: argparse.Namespace) -> int:
         # **宣言を古い順に並べるだけ。** 役割で分けない——どれが先かは since に出ている。
         for index, declaration in enumerate(row["declarations"], start=1):
             holder = declaration["holder"] or {}
+            ghost = " ※幽霊と判定" if declaration.get("verdict") == "free" else ""
             job = declaration["job"] or "(ジョブ未記入)"
             # **PID を出す。** 自動回収は「猶予経過 + 実測空き + PID 死亡」の 3 条件が
             # 揃ったときだけで、揃わない宣言は残る。どれが死んでいるかを読む側が
             # 見分けられないと、記録している意味が無い。
             pid = holder.get("pid")
             marker = f" (pid {pid})" if isinstance(pid, int) and not isinstance(pid, bool) else ""
-            print(f"{'':<24} 宣言{index}  {holder.get('session', '?')}{marker} / {job}")
+            print(f"{'':<24} 宣言{index}  {holder.get('session', '?')}{marker} / {job}{ghost}")
 
             held = declaration["held_for_seconds"]
             elapsed = f"（{_format_duration(held)} 経過）" if held is not None else ""
@@ -277,14 +309,14 @@ def acquire(
 ) -> Acquisition:
     """宣言を 1 件出す。``claim`` と ``run`` で共通の判断である。
 
-    **断る根拠は「誰が先に取ったか」ではない。** 根拠は 2 つあり、どちらも実測と
-    申告から出る。(1) 自分で ``--found busy`` と申告した（実測が使用中なら単独で
-    確定する）。(2) 生きた宣言があるのに ``--found free`` と申告した（**「空き」は
-    宣言を退ける根拠にならない**——宣言はジョブが資源を掴む前に出る）。
+    **生きた宣言があれば断る。** 段差であって壁ではない——``--share`` で並べるし、
+    ``--force`` で退けられる。断らなければ掲示板は書き込み専用になり、**見ないから
+    作ったツール**という前提が崩れる。
 
-    ``--share`` は「既に使われていることを承知で並ぶ」という**意思表示**であって、
+    ``--share`` は「既に使われていることを承知で並ぶ」という**意思表示**であり、
     掲示板には**役割として記録されない**。宣言が 1 件増えるだけである。どれが先に
-    取ったかは ``since`` に出ているので、記録する必要が無い。
+    取ったかは ``since`` に出ているので、記録する必要が無い（かつての ``rb join``
+    は「相乗り」という別の種類の記録を作っていた。それが要らない）。
 
     Parameters
     ----------
@@ -298,6 +330,12 @@ def acquire(
         if lock is not LockState.ACQUIRED:
             # **囲えなくても続行する。** ロックは競り合いを減らすだけで、正しさは
             # nonce の CAS が担保している（DESIGN.md「Locking」）。
+            #
+            # **黙って続行しない。** ロックが取れないのは本ツール側の事情であって
+            # 資源の競合ではない。混同すると「使用中」と読まれる。
+            notices.append(
+                f"[rb] 掲示板のロックを取れませんでした（{lock}）。**排他を弱めて続行**します"
+            )
             board.audit("claim_unlocked", resource=resource_id, lock=str(lock))
 
         judged = assess(board, resource_id, observation)
@@ -321,27 +359,48 @@ def acquire(
                 ):
                     living.remove(entry)
 
-        # **断る根拠は 2 つある。どちらも「役割」ではなく実測と申告から出る。**
-        refusal = ""
-        if found == "busy":
-            # 実測が使用中なら、それだけで確定する（DESIGN.md「Liveness Judgment」）。
-            # 掲示板が空でも同じ——誰かが宣言せずに使っている、という状態である。
-            refusal = "自分で busy と申告している"
-        elif living:
-            # 生きた宣言があるのに free と申告している。**「空き」は宣言を退ける根拠に
-            # ならない**（宣言はジョブが資源を掴む前に出る）。どちらかが古い。
-            refusal = "生きた宣言があるのに free と申告している"
-
-        if refusal and not share and not force:
+        # **生きた宣言があれば断る。** これは「投稿させない」のではなく「止まれ、他に
+        # 人がいる。見てから、意図してそうだと言え」である。``--share`` 一つで通るので
+        # 壁ではなく段差であり、**この段差が製品そのもの**である——セッションが掲示板を
+        # 見ないから作ったツールで、断らなければ掲示板は書き込み専用になる。
+        #
+        # **役割は記録しない。** ``--share`` を付けて出した宣言は、他の宣言と 1 バイトも
+        # 変わらない。どれが先かは ``since`` に出ている。
+        # **自分で busy と申告したときも断る。** 掲示板が空でも同じ——誰かが宣言せずに
+        # 使っている、という状態であり、実測は単独で確定する（DESIGN.md「実測の非対称性」）。
+        if (living or found == "busy") and not share and not force:
             label = naming.label(resource_id, living[0].display if living else "")
-            notices.append(f"[rb] {label} は取得できません（{refusal}）")
-            notices.extend(f"  {e.session} / {e.job}（since {e.since}）" for e in living)
-            notices.append(
-                "  承知のうえで並ぶなら --share。宣言が古いと判断したなら --force で退けること"
+            if living:
+                notices.append(
+                    f"[rb] {label} は使用中です（既に {len(living)} 件の宣言があります）"
+                )
+            else:
+                notices.append(f"[rb] {label} は使用中です（自分で busy と申告している）")
+            notices.extend(
+                f"  {e.session} / {e.job}（since {e.since}）"
+                + (f"  申し送り: {e.sharing}" if e.sharing else "")
+                for e in living
             )
+            if found == "free":
+                # 申告と掲示板が食い違っている。**「空き」は宣言を退ける根拠にならない**
+                # （宣言はジョブが資源を掴む前に出る）ので、掲示板の側を採る。
+                notices.append("  あなたの申告は free です。**どちらかが古い。**")
+            notices.append(
+                "  並んで使うなら --share。宣言が古いと判断したなら --force で退けること"
+            )
+            # **待つ道を必ず示す。** 断るだけで次の手を示さないと、待つ側は
+            # 同じコマンドを繰り返すしかない。
+            notices.append(f"  空くのを待つなら rb wait {resource_id}")
             for text in notices:
                 _say(text, err=True)
-            board.audit("refused", resource=resource_id, reason=refusal, holders=len(living))
+            board.audit(
+                "claim_refused",
+                resource=resource_id,
+                reason="生きた宣言がある" if living else "自分で busy と申告している",
+                holder=living[0].session if living else None,
+                sharing=(living[0].sharing or None) if living else None,
+                holders=len(living),
+            )
             return Acquisition(None, EXIT_BUSY)
 
         new_entry = build_entry(
@@ -358,7 +417,15 @@ def acquire(
         )
         declared = board.declare(new_entry)
         if not declared:
-            notices.append("警告: 宣言を掲示板に残せませんでした（他セッションからは見えません）")
+            notices.append("警告: 宣言を掲示板に残せていません（他セッションからは見えません）")
+
+        # 読めないファイルは何も塞がないが、`status` が留保を出し続ける原因になる。
+        # 取得の場面でも場所を教えておく（掃除の道を示さないと放置される）。
+        stray = board.unreadable_paths()
+        if stray:
+            notices.append(
+                f"[rb] 壊れたエントリが {len(stray)} 件あります（掃除: rb release --clean）"
+            )
 
     if living:
         notices.append(f"[rb] この資源には既に {len(living)} 件の宣言があります")
@@ -419,6 +486,7 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         display=args.display or "",
         log=args.log,
         force=args.force,
+        share=args.share,
     )
     if result.entry is None:
         return result.code
@@ -561,6 +629,8 @@ def _release_after_run(
         result = board.remove_own(resource_id, reason=reason, nonce=entry.nonce)
         if result.removed:
             _say(f"解放しました: {naming.label(resource_id, entry.display)}")
+        elif result.swapped:
+            _say("宣言が入れ替わりました（解放していません）", err=True)
         elif result.failed:
             _say(
                 "警告: 宣言を取り下げられませんでした（掲示板に残っています）",
@@ -625,7 +695,7 @@ def _cmd_wait(args: argparse.Namespace) -> int:
         print(f"既に解放されています: {naming.display_default(resource_id)}")
         return EXIT_OK
 
-    entry = board.read(resource_id)
+    entry = first_declaration(board, resource_id)
     if entry is None:
         print(f"待機します: {naming.display_default(resource_id)}")
     else:
@@ -672,7 +742,7 @@ def _cmd_wait(args: argparse.Namespace) -> int:
         f"上限に達しました（{result.polls} 回確認 / {result.waited_s:.0f} 秒）。まだ使用中です",
         file=sys.stderr,
     )
-    holder = board.read(resource_id)
+    holder = first_declaration(board, resource_id)
     if holder is not None:
         held = _held_for(holder)
         print(
@@ -927,7 +997,7 @@ def _cmd_update(args: argparse.Namespace) -> int:
 
 def _update_locked(board: Board, resource_id: str, args: argparse.Namespace) -> int:
     """``update`` の本体。呼び出し側がロックを保持している前提である。"""
-    entry = board.read(resource_id)
+    entry = first_declaration(board, resource_id)
 
     if entry is None:
         print("宣言が見つかりませんでした", file=sys.stderr)
@@ -1002,6 +1072,16 @@ def _cmd_release(args: argparse.Namespace) -> int:
     2 件とも消える。他人のものまで消すのは ``--force`` だけである。
     """
     board = Board(args.home)
+    if args.clean:
+        removed = board.remove_unreadable(reason="release --clean")
+        if removed:
+            _say(f"読めないファイルを {len(removed)} 件消しました")
+            for path in removed:
+                _say(f"  {path}")
+        else:
+            _say("読めないファイルはありませんでした")
+        return EXIT_OK
+
     resource_id = naming.normalize(args.resource)
     if args.force:
         return _release_forced(board, resource_id)
@@ -1048,13 +1128,22 @@ def _release_own(board: Board, resource_id: str) -> int:
         for entry in result.removed:
             _say(f"  {entry.session} / {entry.job}（since {entry.since}）")
 
+    if result.swapped:
+        # **他セッションが取り直していた。** 新しい宣言は消していない（CAS が守った）。
+        # 0 を返すと「解放した」と読まれるので返さない。
+        _say("宣言が入れ替わりました（解放していません）", err=True)
+        for entry in board.list_for(resource_id):
+            _say(f"  現在: {entry.session} / {entry.job}（since {entry.since}）", err=True)
+        return EXIT_BUSY
+
     if result.failed:
         # **消せなかったことを「無かった」と混ぜない。** 残っているのに消えたと読まれる。
         _say(
             f"警告: {len(result.failed)} 件を消せませんでした（他プロセスが読んでいる可能性）",
             err=True,
         )
-    if result.removed or result.failed:
+        return EXIT_BUSY
+    if result.removed:
         return EXIT_OK
 
     if not result.any_here:
@@ -1104,16 +1193,19 @@ def _add_declaration_options(parser: argparse.ArgumentParser, *, with_force: boo
     parser.add_argument(
         "--sharing",
         default=None,
-        help="相乗りの可否と条件（例: '可（VRAM 残 6GB まで）' '不可'）。本ツールは解釈しない",
+        help=(
+            "次に来る人への申し送り（例: 'VRAM 残 6GB まで空き' '15 コア占有'）。"
+            "**許可を与える旗ではない**（与える保持者がいない）。本ツールは解釈しない"
+        ),
     )
     parser.add_argument("--log", default=None, help="進捗が読めるログのパス")
     parser.add_argument("--display", default=None, help="表示名")
     # **承知で並ぶ意思表示。掲示板には役割として記録されない。**
-    # 記録しないので、どれが先かは since から導出できる。
+    # かつての `rb join` が作っていた「相乗り」という種類の記録は無い。
     parser.add_argument(
         "--share",
         action="store_true",
-        help="既に使われていることを承知で並ぶ（誰の宣言も消さない）",
+        help="既に宣言がある資源へ並んで使う（誰の宣言も消さない）",
     )
     if with_force:
         parser.add_argument(
@@ -1159,9 +1251,14 @@ def build_parser() -> argparse.ArgumentParser:
             "他セッションの宣言まで消すのは --force だけである。"
         ),
     )
-    release.add_argument("resource", help="資源 ID")
+    release.add_argument("resource", nargs="?", help="資源 ID（--clean のときは不要）")
     release.add_argument(
         "--force", action="store_true", help="他セッションの宣言も強制的に解放する"
+    )
+    release.add_argument(
+        "--clean",
+        action="store_true",
+        help="読めないファイルを消す（どの資源のものか判別できないので資源は指定しない）",
     )
     release.set_defaults(func=_cmd_release)
 
@@ -1191,7 +1288,7 @@ def build_parser() -> argparse.ArgumentParser:
     update.add_argument("--eta", default=None, help="終わるまでの見込み")
     update.add_argument("--peak", default=None, help="利用見積もりの瞬時最大")
     update.add_argument("--avg", default=None, help="利用見積もりの平均")
-    update.add_argument("--sharing", default=None, help="相乗りの可否と条件")
+    update.add_argument("--sharing", default=None, help="次に来る人への申し送り")
     update.add_argument("--log", default=None, help="進捗が読めるログのパス")
     update.add_argument("--force", action="store_true", help="他者の宣言でも書き換える")
     update.set_defaults(func=_cmd_update)

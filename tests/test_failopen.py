@@ -56,7 +56,10 @@ CORRUPT_PAYLOADS = [
 def test_corrupt_entry_reads_as_absent(board: Board, payload: str) -> None:
     """壊れたエントリは「存在しない」と同じ扱いになり、例外を投げない。"""
     board.entries_dir.mkdir(parents=True, exist_ok=True)
-    _path_of(board, "pc-a::GPU0").write_text(payload, encoding="utf-8")
+    # **場所は任意でよい。** ファイル名は身元を持たないので、壊れた宣言を
+    # 「その資源の場所」に置くという概念が無い。
+    board.entries_dir.mkdir(parents=True, exist_ok=True)
+    (board.entries_dir / "壊れている.json").write_text(payload, encoding="utf-8")
 
     assert _first(board, "pc-a::GPU0") is None
 

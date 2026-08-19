@@ -358,7 +358,7 @@ def test_refusal_shows_the_holders_sharing_flag(
     err = capsys.readouterr().err
 
     assert "可（VRAM 残 5GB まで）" in err
-    assert "rb join" in err
+    assert "--share" in err
     assert "rb wait" in err
 
 
@@ -378,7 +378,7 @@ def test_refusal_does_not_interpret_the_sharing_flag(
     err = capsys.readouterr().err
 
     assert "不可（VRAM を使い切る）" in err
-    assert "rb join" in err
+    assert "--share" in err
 
 
 def test_refusal_is_recorded_in_the_audit_log(tmp_path: Path) -> None:
