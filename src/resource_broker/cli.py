@@ -427,6 +427,34 @@ def acquire(
                 f"[rb] 壊れたエントリが {len(stray)} 件あります（掃除: rb release --clean）"
             )
 
+        # **書いた直後に読み直す。** 平坦にした代償として、`O_EXCL` による「先着 1 名」が
+        # 無くなった。読んでから書くまでの窓で 2 セッションが同時に通り抜けられる
+        # （実測: 窓を意図的に開くと 12 プロセス全員が通る）。
+        #
+        # **窓は塞げない。** 条件付き書き込みのプリミティブが OS に無いのは、この
+        # プロジェクトが何度も突き当たっている壁である（DESIGN.md「Known Residuals」）。
+        # できるのは**見えるようにすること**で、それはこのツールの本来の仕事でもある。
+        # ここで読み直せば、同じ瞬間に入った相手は必ず双方から見える——止めないが、
+        # 気づかないまま進むことはない。
+        if declared:
+            latecomers = [
+                e
+                for e in live_declarations(board, resource_id, observation)
+                if e.nonce != new_entry.nonce and e.nonce not in {x.nonce for x in living}
+            ]
+            if latecomers:
+                notices.append(
+                    f"[rb] **ほぼ同時に {len(latecomers)} 件の宣言が入りました。**"
+                    "先着を決める仕組みはありません"
+                )
+                notices.extend(f"  {e.session} / {e.job}（since {e.since}）" for e in latecomers)
+                notices.append("  重なって困るなら、どちらかが rb release して rb wait すること")
+                board.audit(
+                    "simultaneous",
+                    resource=resource_id,
+                    others=len(latecomers),
+                )
+
     if living:
         notices.append(f"[rb] この資源には既に {len(living)} 件の宣言があります")
         notices.extend(

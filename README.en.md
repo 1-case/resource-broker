@@ -249,10 +249,16 @@ holder set to shrink, you identify the holder from the board and ask them direct
   (`since < boot`), or (grace elapsed **and** measured free **and** the declaring process is
   dead) all three together, or an explicit `release` / `--force`.
 - **Every timestamp is machine-generated.** An LLM is never asked to write or estimate a time.
-- **Exclusion rests on a nonce compare-and-swap, not on a lock.** The lock is a performance
-  optimization; correctness is identical whether or not it is acquired. Verified end-to-end by racing
-  5 real processes against one board: exactly one wins.
-- **One file per resource.** Damage stays local and `O_EXCL` settles acquisition races.
+- **Removal rests on a nonce compare-and-swap, not on a lock.** The lock is a performance
+  optimization; correctness is identical whether or not it is acquired. What the CAS guarantees is
+  that you never delete a declaration other than the one you read.
+- **There is no first-come-wins.** Declarations are equal and a declaration always succeeds, so two
+  sessions declaring in the same instant both land on the board. The tool cannot prevent that — the
+  filesystem offers no conditional write — so it does the next thing: **each of them is told, right
+  then, that someone else arrived at the same moment.** Verified by racing 12 real processes with the
+  read-then-write window forced open: all 12 declared, all 12 were told.
+- **One file per declaration, named by its nonce.** Damage stays local, and the filename carries no
+  identity — deriving identity from a filename is what broke this code once already.
 
 The method, spec and constraints as they currently stand live in
 [docs/DESIGN.md](docs/DESIGN.md) (Japanese). It documents **the end state only** — the road

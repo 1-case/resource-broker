@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from resource_broker.board import Board
+from resource_broker.board import Board, build_entry
 from resource_broker.cli import main
 from resource_broker.naming import normalize
 
@@ -376,3 +376,34 @@ def test_share_is_wired_into_run(tmp_path: Path) -> None:
     )
 
     assert code == 0
+
+
+def test_a_simultaneous_declaration_is_reported_to_both(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同じ瞬間に入った宣言は、**入れた側にその場で知らされる**。
+
+    平坦化の代償として `O_EXCL` による「先着 1 名」が無くなった。読んでから書くまでの
+    窓で 2 セッションが同時に通り抜けられる（窓を意図的に開くと 12 プロセス全員が通る）。
+    条件付き書き込みのプリミティブが OS に無いので**窓は塞げない**。できるのは
+    見えるようにすることで、それはこのツールの本来の仕事でもある。
+    """
+    import resource_broker.cli as cli_module
+
+    real = cli_module.assess
+    other = build_entry(normalize("GPU0"), job="ほぼ同時の相手", session="other")
+
+    def racing(board, resource_id, observation=None):  # type: ignore[no-untyped-def]
+        result = real(board, resource_id, observation)
+        if not result:
+            board.declare(other)  # 読み終えた直後に他セッションが入る
+        return result
+
+    monkeypatch.setattr(cli_module, "assess", racing)
+    capsys.readouterr()
+
+    assert claim(tmp_path, "GPU0", "私のジョブ") == 0
+
+    err = capsys.readouterr().err
+    assert "ほぼ同時" in err, err
+    assert "ほぼ同時の相手" in err, err

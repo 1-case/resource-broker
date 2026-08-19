@@ -109,7 +109,7 @@ uv run rb run --res GPU0 --job "E009 学習" --observed "..." --eta 40m -- uv ru
 | 掲示板の場所 | `%LOCALAPPDATA%\resource-broker\board\`（無ければ `~/.resource-broker/board/`）。**マシン全体で 1 箇所**に置く（全アセットから参照するため、プロジェクト配下には置かない） |
 | エントリ | 資源 1 つにつき 1 ファイル。単一ファイルに集約しない（破損を局所化する） |
 | 旧い置き場 | `board/<safe-name>.json` と `board/joins/*.json`。**ただの宣言として読む**（形式を変えた瞬間に稼働中の宣言を見失わないため）。新しく作ることはない |
-| 取得 | `O_CREAT｜O_EXCL` 相当。先着 1 名。負けた側は待機に回る |
+| 宣言 | `O_CREAT｜O_EXCL` 相当だが、名前が nonce なので**必ず成功する**。**先着を決める仕組みは無い**——条件付き書き込みのプリミティブが OS に無い。書いた直後に読み直し、同時に入った相手を双方へ知らせる |
 | 排他区間のロック | `board/<safe-name>.lock`。資源ごとに 1 つ |
 | 待機列 | **未実装（Phase 4 の予定）**。`<safe-name>.waiters.jsonl`（append-only）を想定する |
 | 監査ログ / ログ | `audit\` と `logs\` を同じルートに置く（他セッションから読めることが要件）。どちらも追跡対象外 |
