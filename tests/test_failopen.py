@@ -20,8 +20,26 @@ from pathlib import Path
 import pytest
 
 from resource_broker import audit, clock, platform_info, runner
-from resource_broker.board import Board, build_entry
+from resource_broker.board import Board, Entry, build_entry
 from resource_broker.cli import main
+
+
+def _first(board: Board, resource_id: str) -> Entry | None:
+    """その資源の**最初の宣言**（無ければ None）。順序は ``since``。"""
+    found = board.list_for(resource_id)
+    return found[0] if found else None
+
+
+def _path_of(board: Board, resource_id: str) -> Path:
+    """その資源の宣言が置かれているパス（1 件だけある前提のテスト用）。
+
+    平坦化でファイル名は nonce になったので、**名前から場所を組み立てられない**。
+    中身で引く。
+    """
+    found = board.pairs_for(resource_id)
+    assert len(found) == 1, found
+    return found[0][0]
+
 
 CORRUPT_PAYLOADS = [
     "",
@@ -38,28 +56,28 @@ CORRUPT_PAYLOADS = [
 def test_corrupt_entry_reads_as_absent(board: Board, payload: str) -> None:
     """壊れたエントリは「存在しない」と同じ扱いになり、例外を投げない。"""
     board.entries_dir.mkdir(parents=True, exist_ok=True)
-    board.path_for("pc-a::GPU0").write_text(payload, encoding="utf-8")
+    _path_of(board, "pc-a::GPU0").write_text(payload, encoding="utf-8")
 
-    assert board.read("pc-a::GPU0") is None
+    assert _first(board, "pc-a::GPU0") is None
 
 
 def test_missing_board_directory_reads_as_empty(tmp_path: Path) -> None:
     """掲示板ディレクトリが存在しなくても、読み取りは静かに空を返す。"""
     board = Board(tmp_path / "存在しない")
 
-    assert board.read("pc-a::GPU0") is None
+    assert _first(board, "pc-a::GPU0") is None
     assert board.list_all() == []
 
 
 def test_unreadable_entry_does_not_raise(board: Board, monkeypatch: pytest.MonkeyPatch) -> None:
     """OS レベルの読み取りエラーでも例外を外に出さない。"""
-    board.try_claim(build_entry("pc-a::GPU0", job="学習"))
+    board.declare(build_entry("pc-a::GPU0", job="学習"))
 
     def explode(*_args: object, **_kwargs: object) -> str:
         raise OSError("読めない")
 
     monkeypatch.setattr(Path, "read_text", explode)
-    assert board.read("pc-a::GPU0") is None
+    assert _first(board, "pc-a::GPU0") is None
 
 
 def test_old_audit_logs_are_pruned(tmp_path: Path) -> None:

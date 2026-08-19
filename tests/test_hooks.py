@@ -69,7 +69,7 @@ def declare(home: Path, resource: str, *, job: str, log: str | None = None) -> N
         session="folnet",
         observed={"note": "nvidia-smi: compute apps 1 件"},
     )
-    assert board.try_claim(entry)
+    assert board.declare(entry)
 
 
 # --- 注入される内容 -------------------------------------------------------------
@@ -104,7 +104,7 @@ def test_a_resource_held_only_by_joiners_is_reported(tmp_path: Path) -> None:
     joiner = build_entry(
         normalize("GPU0"), job="相乗りのジョブ", cwd=place, session="malm", log="C:\\logs\\j.log"
     )
-    assert board.add_join(joiner, place)
+    assert board.declare(joiner)
 
     result = run_hook(home=tmp_path)
 
@@ -114,21 +114,6 @@ def test_a_resource_held_only_by_joiners_is_reported(tmp_path: Path) -> None:
     assert "相乗りのジョブ" in result.stdout, "相乗りのジョブが出ていない"
     assert "j.log" in result.stdout, "相乗りのログが出ていない"
     assert "(ジョブ未記入)" not in result.stdout
-
-
-def test_joiners_are_shown_alongside_the_primary(tmp_path: Path) -> None:
-    """主宣言と相乗りが同居していれば、両方の実体を出す。"""
-    declare(tmp_path, "GPU0", job="E059 eval")
-    board = Board(tmp_path)
-    place = str(tmp_path / "works" / "malm")
-    assert board.add_join(
-        build_entry(normalize("GPU0"), job="小さめの推論", cwd=place, session="malm"), place
-    )
-
-    text = run_hook(home=tmp_path).stdout
-
-    assert "folnet" in text and "E059 eval" in text
-    assert "malm" in text and "小さめの推論" in text
 
 
 # --- 使い方の例がそのまま打てること ---------------------------------------------
@@ -191,7 +176,7 @@ def test_a_long_declaration_cannot_flood_every_session(tmp_path: Path) -> None:
         session="folnet",
         observed={"note": "い" * 20000},
     )
-    assert board.try_claim(entry)
+    assert board.declare(entry)
 
     text = run_hook(home=tmp_path).stdout
 
@@ -497,29 +482,6 @@ def test_an_empty_disable_value_does_not_silence_the_hook(tmp_path: Path) -> Non
     assert "GPU0" in result.stdout
 
 
-def test_a_primary_declaration_is_never_reported_as_absent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """申告が読めない主宣言を「主宣言なし」と出さない。
-
-    ファイルがある限り取得は塞がれている。「主宣言なし / 相乗りのみ」と表示すれば、
-    通知が事実と逆になる。
-    """
-    (tmp_path / "board").mkdir(parents=True)
-    (tmp_path / "board" / "gpu0.json").write_text(
-        '{"resource": "pc::GPU0", "holder": "壊れている"}', encoding="utf-8"
-    )
-    module = load_hook_module()
-    monkeypatch.setenv("RESOURCE_BROKER_HOME", str(tmp_path))
-
-    rows = module.read_entries_directly()
-
-    assert rows is not None
-    assert len(rows) == 1
-    assert isinstance(rows[0]["holder"], dict) and rows[0]["holder"], rows[0]
-    assert "主宣言なし" not in module.build_notice(rows)
-
-
 def test_the_board_can_be_read_without_rb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """``rb`` を経ずに掲示板を直接読める（最後の砦）。
 
@@ -538,60 +500,6 @@ def test_the_board_can_be_read_without_rb(tmp_path: Path, monkeypatch: pytest.Mo
     assert rows[0]["resource"] == normalize("GPU0")
     assert rows[0]["holder"]["job"] == "E059 eval"
     assert rows[0]["occupied"] is True
-
-
-def test_reading_the_board_directly_shows_joiners(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``rb`` を経ない経路でも**相乗りを読む**。
-
-    主宣言が先に解放されて相乗りだけが残った資源は、``board/`` を見ただけでは消える。
-    この経路は ``rb`` を起動できなかったときの最後の砦であり、そこで「掲示板は空です」
-    と告げるのは、無言より悪い——実際に使っている者がいるのに空きだと報告する。
-    """
-    board = Board(tmp_path)
-    place = str(tmp_path / "works" / "malm")
-    joiner = build_entry(
-        normalize("GPU0"),
-        job="相乗りのジョブ",
-        cwd=place,
-        session="malm",
-        log="C:\\logs\\j.log",
-    )
-    assert board.add_join(joiner, place)
-    module = load_hook_module()
-    monkeypatch.setenv("RESOURCE_BROKER_HOME", str(tmp_path))
-    rows = module.read_entries_directly()
-
-    assert rows is not None
-    assert len(rows) == 1, rows
-    assert rows[0]["resource"] == normalize("GPU0")
-    assert rows[0]["holder"] is None, "主宣言が無いのに holder が埋まっている"
-    assert [j["holder"]["session"] for j in rows[0]["joins"]] == ["malm"]
-    assert "相乗りのジョブ" in module.build_notice(rows)
-
-
-def test_reading_the_board_directly_attaches_joiners_to_the_primary(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """主宣言と相乗りが同居していれば、1 行にまとめる（資源を 2 回並べない）。"""
-    declare(tmp_path, "GPU0", job="E059 eval")
-    board = Board(tmp_path)
-    place = str(tmp_path / "works" / "malm")
-    joiner = build_entry(normalize("GPU0"), job="相乗りのジョブ", cwd=place, session="malm")
-    assert board.add_join(joiner, place)
-    module = load_hook_module()
-    monkeypatch.setenv("RESOURCE_BROKER_HOME", str(tmp_path))
-    rows = module.read_entries_directly()
-
-    assert rows is not None
-    assert len(rows) == 1, rows
-    assert rows[0]["holder"]["job"] == "E059 eval"
-    assert len(rows[0]["joins"]) == 1
-
-    notice = module.build_notice(rows)
-    assert "E059 eval" in notice
-    assert "相乗りのジョブ" in notice
 
 
 def test_reading_the_board_directly_survives_corruption(
@@ -678,7 +586,7 @@ def test_a_display_name_does_not_hide_which_resource_is_held(tmp_path: Path) -> 
     初めて意味を持つ**。読めない通知は通知が無いのと変わらない。
     """
     board = Board(tmp_path)
-    assert board.try_claim(
+    assert board.declare(
         build_entry(
             normalize("GPU0"),
             job="E017 A/B 学習 10 本",

@@ -277,7 +277,7 @@ def test_sh_hook_launcher_actually_runs_the_hook(tmp_path: Path) -> None:
     実際に cp932 でそうやって壊れた。ここだけは「出た」ことを見る。
     """
     board = Board(tmp_path)
-    assert board.try_claim(build_entry(normalize("GPU0"), job="E059 eval", session="folnet"))
+    assert board.declare(build_entry(normalize("GPU0"), job="E059 eval", session="folnet"))
 
     result = run_sh(BIN / "rb-hook", "prompt_board_reminder", home=tmp_path)
 
@@ -289,7 +289,7 @@ def test_sh_hook_launcher_actually_runs_the_hook(tmp_path: Path) -> None:
 def test_cmd_hook_launcher_actually_runs_the_hook(tmp_path: Path) -> None:
     """cmd 版でも同じ。**Windows でだけ沈黙する壊れ方を許さない。**"""
     board = Board(tmp_path)
-    assert board.try_claim(build_entry(normalize("GPU0"), job="E059 eval", session="folnet"))
+    assert board.declare(build_entry(normalize("GPU0"), job="E059 eval", session="folnet"))
 
     result = run_cmd(BIN / "rb-hook.cmd", "prompt_board_reminder", home=tmp_path)
 

@@ -288,7 +288,7 @@ def owned_by(declared_cwd: str, cwd: str) -> bool:
 
 
 def declarations_for(root: Path, resource: str | None) -> list[dict[str, object]]:
-    """その資源の宣言（主宣言と相乗り）を返す。
+    """その資源の宣言を返す。**全て対等に扱う。**
 
     資源が特定されていない判定行では**無関係な宣言を返さない**。以前は掲示板の先頭 1 件を
     返しており、GPU を使うコマンドの直前に COM3 の宣言が「現状」として出ていた。
@@ -301,7 +301,7 @@ def declarations_for(root: Path, resource: str | None) -> list[dict[str, object]
 
     board = root / "board"
     found: list[dict[str, object]] = []
-    for directory, is_join in ((board, False), (board / "joins", True)):
+    for directory in (board, board / "joins"):
         try:
             paths, _ = json_files(directory)
         except OSError:
@@ -314,7 +314,6 @@ def declarations_for(root: Path, resource: str | None) -> list[dict[str, object]
             if not isinstance(entry, dict) or not entry.get("resource"):
                 continue
             if bare_resource(str(entry["resource"])) == bare_resource(resource):
-                entry["_join"] = is_join
                 found.append(entry)
     return found
 
@@ -360,7 +359,7 @@ def describe(entry: dict[str, object]) -> list[str]:
     """宣言 1 件を数行に整形する。**中身は他セッションが書いた自由記述である。**"""
     holder = entry.get("holder")
     holder = holder if isinstance(holder, dict) else {}
-    kind = "相乗り" if entry.get("_join") else "現状"
+    kind = "現状"
     session = clip(holder.get("session"), MAX_NAME_BYTES) or "?"
     job = clip(holder.get("job"), MAX_JOB_BYTES) or "(ジョブ未記入)"
     since = clip(entry.get("since"), MAX_NAME_BYTES) or "?"

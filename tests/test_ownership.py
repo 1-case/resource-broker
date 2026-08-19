@@ -19,9 +19,27 @@ from pathlib import Path
 import pytest
 
 from resource_broker import clock
-from resource_broker.board import Board, LockState, RemovalResult, UpdateResult, build_entry
+from resource_broker.board import Board, Entry, LockState, RemovalResult, UpdateResult, build_entry
 from resource_broker.cli import main
 from resource_broker.naming import normalize
+
+
+def _first(board: Board, resource_id: str) -> Entry | None:
+    """その資源の**最初の宣言**（無ければ None）。順序は ``since``。"""
+    found = board.list_for(resource_id)
+    return found[0] if found else None
+
+
+def _path_of(board: Board, resource_id: str) -> Path:
+    """その資源の宣言が置かれているパス（1 件だけある前提のテスト用）。
+
+    平坦化でファイル名は nonce になったので、**名前から場所を組み立てられない**。
+    中身で引く。
+    """
+    found = board.pairs_for(resource_id)
+    assert len(found) == 1, found
+    return found[0][0]
+
 
 RESOURCE = normalize("GPU0")
 
@@ -81,7 +99,7 @@ def plant(board: Board, cwd: str, *, job: str = "他人のジョブ", session: s
     cwd だけでなく ``session_id`` でも身元を分ける。同じ場所で動く 2 つのセッションは
     cwd では区別できないため、そこが所有判定の主材料になっている。
     """
-    assert board.try_claim(
+    assert board.declare(
         build_entry(RESOURCE, job=job, cwd=cwd, session=session, session_id=session)
     )
 
@@ -102,7 +120,7 @@ def test_release_refuses_another_sessions_declaration(
 
     assert run(tmp_path, "release", "GPU0") == 1
     assert "他セッションの宣言は解放できません" in capsys.readouterr().err
-    assert board.read(RESOURCE) is not None
+    assert _first(board, RESOURCE) is not None
 
 
 def test_release_with_force_removes_it(tmp_path: Path) -> None:
@@ -111,7 +129,7 @@ def test_release_with_force_removes_it(tmp_path: Path) -> None:
     plant(board, THEIRS)
 
     assert run(tmp_path, "release", "GPU0", "--force") == 0
-    assert board.read(RESOURCE) is None
+    assert _first(board, RESOURCE) is None
 
 
 def test_release_removes_my_own_declaration(tmp_path: Path) -> None:
@@ -153,17 +171,17 @@ def test_update_does_not_clobber_a_newer_declaration(tmp_path: Path) -> None:
     """
     board = Board(tmp_path)
     claim(tmp_path)
-    entry = board.read(RESOURCE)
+    entry = _first(board, RESOURCE)
     assert entry is not None
 
     # 解放と再取得が起きた状況を作る
-    board.remove(RESOURCE, reason="テスト")
+    board.remove_all(RESOURCE, reason="テスト")
     plant(board, THEIRS)
 
     assert (
         board.replace(entry, reason="古い内容", expect_nonce=entry.nonce) is UpdateResult.CONFLICT
     )
-    current = board.read(RESOURCE)
+    current = _first(board, RESOURCE)
     assert current is not None
     assert current.job == "他人のジョブ"
 
@@ -178,7 +196,7 @@ def test_replace_separates_io_failure_from_conflict(
     """
     board = Board(tmp_path)
     entry = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
-    assert board.try_claim(entry)
+    assert board.declare(entry)
 
     def refuse(*_args: object, **_kwargs: object) -> None:
         raise PermissionError("共有違反")
@@ -187,7 +205,7 @@ def test_replace_separates_io_failure_from_conflict(
     monkeypatch.setattr("resource_broker.board.UNLINK_DELAY_S", 0.0)
 
     assert board.replace(entry, reason="更新", expect_nonce=entry.nonce) is UpdateResult.FAILED
-    assert board.read(RESOURCE) is not None  # 元の宣言は消えていない
+    assert _first(board, RESOURCE) is not None  # 元の宣言は消えていない
 
 
 def test_replace_retries_a_sharing_violation(
@@ -196,7 +214,7 @@ def test_replace_retries_a_sharing_violation(
     """置換も ``unlink`` と同じように数回やり直す。1 回で諦めると更新できない。"""
     board = Board(tmp_path)
     entry = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
-    assert board.try_claim(entry)
+    assert board.declare(entry)
 
     original = os.replace
     attempts = {"n": 0}
@@ -212,7 +230,7 @@ def test_replace_retries_a_sharing_violation(
 
     entry.holder["job"] = "書き換え後"
     assert board.replace(entry, reason="更新", expect_nonce=entry.nonce) is UpdateResult.REPLACED
-    current = board.read(RESOURCE)
+    current = _first(board, RESOURCE)
     assert current is not None
     assert current.job == "書き換え後"
 
@@ -233,7 +251,7 @@ def test_an_ancestor_directory_does_not_own_the_declaration(
     capsys.readouterr()
 
     assert run(tmp_path, "release", "GPU0") == 1
-    assert board.read(RESOURCE) is not None
+    assert _first(board, RESOURCE) is not None
     assert run(tmp_path, "update", "GPU0", "--eta", "5m") == 1
 
 
@@ -251,7 +269,7 @@ def test_a_subdirectory_still_owns_its_declaration(
     monkeypatch.setattr(os, "getcwd", lambda: deeper)
 
     assert run(tmp_path, "release", "GPU0") == 0
-    assert board.read(RESOURCE) is None
+    assert _first(board, RESOURCE) is None
 
 
 def test_remove_if_owned_refuses_a_reclaimed_declaration(tmp_path: Path) -> None:
@@ -262,16 +280,16 @@ def test_remove_if_owned_refuses_a_reclaimed_declaration(tmp_path: Path) -> None
     """
     board = Board(tmp_path)
     mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
-    assert board.try_claim(mine)
+    assert board.declare(mine)
 
     # 他セッションが --force で取り直した状況を作る
-    board.remove(RESOURCE, reason="テスト")
+    board.remove_all(RESOURCE, reason="テスト")
     plant(board, THEIRS)
 
-    result = board.remove_if_owned(RESOURCE, reason="rb run の終了", nonce=mine.nonce)
+    result = board.remove_own(RESOURCE, reason="rb run の終了", nonce=mine.nonce)
 
     assert result is RemovalResult.NOT_OWNED
-    current = board.read(RESOURCE)
+    current = _first(board, RESOURCE)
     assert current is not None
     assert current.job == "他人のジョブ"
 
@@ -284,15 +302,11 @@ def test_remove_if_owned_reports_absence_and_success_separately(tmp_path: Path) 
     """
     board = Board(tmp_path)
 
-    assert board.remove_if_owned(RESOURCE, reason="テスト", nonce="なんでも") is (
-        RemovalResult.ABSENT
-    )
+    assert board.remove_own(RESOURCE, reason="テスト", nonce="なんでも") is (RemovalResult.ABSENT)
 
     mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
-    assert board.try_claim(mine)
-    assert board.remove_if_owned(RESOURCE, reason="テスト", nonce=mine.nonce) is (
-        RemovalResult.REMOVED
-    )
+    assert board.declare(mine)
+    assert board.remove_own(RESOURCE, reason="テスト", nonce=mine.nonce) is (RemovalResult.REMOVED)
 
 
 def test_remove_reports_failure_apart_from_absence(
@@ -305,7 +319,7 @@ def test_remove_reports_failure_apart_from_absence(
     """
     board = Board(tmp_path)
     mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
-    assert board.try_claim(mine)
+    assert board.declare(mine)
 
     def refuse(*_args: object, **_kwargs: object) -> None:
         raise PermissionError("共有違反")
@@ -313,7 +327,7 @@ def test_remove_reports_failure_apart_from_absence(
     monkeypatch.setattr(Path, "unlink", refuse)
     monkeypatch.setattr("resource_broker.board.UNLINK_DELAY_S", 0.0)
 
-    assert board.remove_detailed(RESOURCE, reason="テスト") is RemovalResult.FAILED
+    assert board.remove_all(RESOURCE, reason="テスト") is RemovalResult.FAILED
 
 
 def test_unlink_is_retried_before_giving_up(
@@ -322,7 +336,7 @@ def test_unlink_is_retried_before_giving_up(
     """共有違反は数回やり直す。1 回で諦めると宣言が残る。"""
     board = Board(tmp_path)
     mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
-    assert board.try_claim(mine)
+    assert board.declare(mine)
 
     original = Path.unlink
     attempts = {"n": 0}
@@ -336,7 +350,7 @@ def test_unlink_is_retried_before_giving_up(
     monkeypatch.setattr(Path, "unlink", flaky)
     monkeypatch.setattr("resource_broker.board.UNLINK_DELAY_S", 0.0)
 
-    assert board.remove_detailed(RESOURCE, reason="テスト") is RemovalResult.REMOVED
+    assert board.remove_all(RESOURCE, reason="テスト") is RemovalResult.REMOVED
     assert attempts["n"] == 3
 
 
@@ -365,7 +379,7 @@ def test_a_contended_lock_is_not_reported_as_a_busy_resource(
 
     assert claim(tmp_path) == 0
     assert "排他を弱めて続行" in capsys.readouterr().err
-    assert board.read(RESOURCE) is not None
+    assert _first(board, RESOURCE) is not None
 
 
 def test_stale_lock_is_stolen(tmp_path: Path) -> None:
@@ -384,7 +398,7 @@ def test_stale_lock_is_stolen(tmp_path: Path) -> None:
     os.utime(lock, (old, old))
 
     assert claim(tmp_path) == 0
-    assert board.read(RESOURCE) is not None
+    assert _first(board, RESOURCE) is not None
 
 
 def test_lock_is_released_after_claim(tmp_path: Path) -> None:
@@ -554,7 +568,7 @@ def ghost(board: Board, monkeypatch: pytest.MonkeyPatch) -> None:
         RESOURCE, job="落ちたセッション", cwd=THEIRS, session="theirs", session_id="theirs"
     )
     entry.since = clock.to_iso(clock.now() - timedelta(hours=2))
-    assert board.try_claim(entry)
+    assert board.declare(entry)
     monkeypatch.setattr(
         "resource_broker.platform_info.boot_time", lambda: clock.now() - timedelta(hours=1)
     )
@@ -606,12 +620,12 @@ def test_two_sessions_seeing_one_ghost_do_not_both_acquire(
                 )
                 == 0
             )
-        return original(self, resource_id, expect_nonce=expect_nonce, reason=reason)
+        return original(self, resource_id, nonce=expect_nonce, reason=reason)
 
     monkeypatch.setattr(Board, "remove_if_nonce", interleave)
 
     assert claim(tmp_path) == 1  # A は諦める
-    current = board.read(RESOURCE)
+    current = _first(board, RESOURCE)
     assert current is not None
     assert current.job == "B のジョブ"  # B の宣言が生き残っている
 
@@ -620,14 +634,14 @@ def test_conditional_removal_refuses_a_replaced_declaration(tmp_path: Path) -> N
     """読んだ宣言と違うものは消さない（CAS の基本性質）。"""
     board = Board(tmp_path)
     mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
-    assert board.try_claim(mine)
-    board.remove(RESOURCE, reason="テスト")
+    assert board.declare(mine)
+    board.remove_all(RESOURCE, reason="テスト")
     plant(board, THEIRS)
 
     result = board.remove_if_nonce(RESOURCE, expect_nonce=mine.nonce, reason="テスト")
 
     assert result is RemovalResult.NOT_OWNED
-    current = board.read(RESOURCE)
+    current = _first(board, RESOURCE)
     assert current is not None
     assert current.job == "他人のジョブ"
 
@@ -636,12 +650,12 @@ def test_conditional_removal_removes_a_matching_declaration(tmp_path: Path) -> N
     """一致していれば消す。「無い」と「消した」を畳まない。"""
     board = Board(tmp_path)
     mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
-    assert board.try_claim(mine)
+    assert board.declare(mine)
 
     assert board.remove_if_nonce(RESOURCE, expect_nonce=mine.nonce, reason="テスト") is (
         RemovalResult.REMOVED
     )
-    assert board.read(RESOURCE) is None
+    assert _first(board, RESOURCE) is None
     assert board.remove_if_nonce(RESOURCE, expect_nonce=mine.nonce, reason="テスト") is (
         RemovalResult.ABSENT
     )
@@ -667,7 +681,7 @@ def test_conditional_removal_restores_what_it_captured(
     )
 
     monkeypatch.undo()
-    current = board.read(RESOURCE)
+    current = _first(board, RESOURCE)
     assert current is not None
     assert current.job == "他人のジョブ"  # 戻っている
 
@@ -717,14 +731,14 @@ def test_release_does_not_remove_a_declaration_reclaimed_mid_flight(
                 )
                 == 0
             )
-        return original(self, resource_id, expect_nonce=expect_nonce, reason=reason)
+        return original(self, resource_id, nonce=expect_nonce, reason=reason)
 
     monkeypatch.setattr(Board, "remove_if_nonce", interleave)
     capsys.readouterr()
 
     assert run(tmp_path, "release", "GPU0") == 1
     assert "宣言が入れ替わりました" in capsys.readouterr().err
-    current = board.read(RESOURCE)
+    current = _first(board, RESOURCE)
     assert current is not None
     assert current.job == "T のジョブ"  # T の宣言が生き残っている
 
@@ -749,12 +763,12 @@ def test_a_declaration_becomes_visible_only_when_it_is_complete(
     def spy(source: object, target: object, **kwargs: object) -> None:
         seen["before"] = Path(str(target)).exists()  # 名前を付ける前は存在しない
         original(source, target, **kwargs)  # type: ignore[arg-type]
-        visible = board.read(RESOURCE)
+        visible = _first(board, RESOURCE)
         seen["after"] = visible.job if visible is not None else None
 
     monkeypatch.setattr(os, "link", spy)
 
-    assert board.try_claim(build_entry(RESOURCE, job="学習", cwd=MINE))
+    assert board.declare(build_entry(RESOURCE, job="学習", cwd=MINE))
 
     assert seen["before"] is False
     assert seen["after"] == "学習"  # 名前が見えた瞬間には中身が揃っている
@@ -772,9 +786,9 @@ def test_creation_falls_back_when_hard_links_are_unavailable(
     monkeypatch.setattr(os, "link", refuse)
     board = Board(tmp_path)
 
-    assert board.try_claim(build_entry(RESOURCE, job="1 本目", cwd=MINE)) is True
-    assert board.try_claim(build_entry(RESOURCE, job="2 本目", cwd=THEIRS)) is False
-    current = board.read(RESOURCE)
+    assert board.declare(build_entry(RESOURCE, job="1 本目", cwd=MINE)) is True
+    assert board.declare(build_entry(RESOURCE, job="2 本目", cwd=THEIRS)) is False
+    current = _first(board, RESOURCE)
     assert current is not None
     assert current.job == "1 本目"
 
@@ -785,7 +799,7 @@ def test_creation_falls_back_when_hard_links_are_unavailable(
 def corrupt(board: Board) -> None:
     """読めないエントリを仕込む。"""
     board.entries_dir.mkdir(parents=True, exist_ok=True)
-    board.path_for(RESOURCE).write_text("{ これは JSON ではない", encoding="utf-8")
+    _path_of(board, RESOURCE).write_text("{ これは JSON ではない", encoding="utf-8")
 
 
 def test_a_corrupt_declaration_can_be_cleaned_with_force(tmp_path: Path) -> None:
@@ -800,7 +814,7 @@ def test_a_corrupt_declaration_can_be_cleaned_with_force(tmp_path: Path) -> None
     corrupt(board)
 
     assert run(tmp_path, "release", "GPU0", "--force") == 0
-    assert board.path_for(RESOURCE).exists() is False
+    assert _path_of(board, RESOURCE).exists() is False
     assert claim(tmp_path) == 0  # 掃除したあとは普通に取れる
 
 
@@ -864,7 +878,7 @@ def test_future_since_can_only_be_displaced_by_force(tmp_path: Path) -> None:
         RESOURCE, job="時計がずれた宣言", cwd=THEIRS, session="theirs", session_id="theirs"
     )
     entry.since = clock.to_iso(clock.now() + timedelta(days=1))
-    assert board.try_claim(entry)
+    assert board.declare(entry)
 
     assert claim(tmp_path, "--found", "free") == 1
     assert claim(tmp_path, "--found", "free", "--force") == 0
@@ -883,53 +897,6 @@ def test_boolean_pid_is_rejected(tmp_path: Path) -> None:
 # --- 相乗りが残った資源 ---------------------------------------------------------
 
 
-def test_joins_only_resource_is_occupied_but_claimable(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """主宣言が消えて相乗りだけ残った資源は「使用中」だが、主宣言の枠は取れる。
-
-    `free`（主宣言の枠が取れるか）と `occupied`（誰か 1 人でも宣言しているか）は
-    別の問いである。混ぜると、status が「使用中」と出しているものを claim が素通しする
-    という食い違いが起きる。フックの表示は occupied で絞る（空きと報告すると
-    **実際に使っている者がいるのに通知から消える**）。
-    """
-    board = Board(tmp_path)
-    joiner = build_entry(
-        RESOURCE, job="相乗りのジョブ", cwd=THEIRS, session="theirs", session_id="theirs"
-    )
-    assert board.add_join(joiner, THEIRS)
-
-    run(tmp_path, "status", "GPU0", "--json")
-    row = json.loads(capsys.readouterr().out)["resources"][0]
-
-    assert row["occupied"] is True  # 誰かが使っている
-    assert row["free"] is True  # 主宣言の枠は空いている
-    assert row["has_primary"] is False
-    assert row["holders"] == 1
-    assert len(row["joins"]) == 1
-
-
-def test_claim_over_a_joined_resource_warns_but_passes(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """相乗りだけがある資源の claim は、件数を知らせてから通す。
-
-    **止めない。** 相乗りしてよいかを決めるのは当事者であって本ツールではない
-    （DESIGN.md「Sharing」）。ただし黙って通すと、掲示板が「使用中」と出している
-    ものを CLI が素通しすることになる。
-    """
-    board = Board(tmp_path)
-    joiner = build_entry(
-        RESOURCE, job="相乗りのジョブ", cwd=THEIRS, session="theirs", session_id="theirs"
-    )
-    assert board.add_join(joiner, THEIRS)
-    capsys.readouterr()
-
-    assert claim(tmp_path) == 0
-    assert "相乗りが 1 件" in capsys.readouterr().err
-    assert board.read(RESOURCE) is not None
-
-
 def test_joins_only_resource_is_listed_without_arguments(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -938,7 +905,7 @@ def test_joins_only_resource_is_listed_without_arguments(
     joiner = build_entry(
         RESOURCE, job="相乗りのジョブ", cwd=THEIRS, session="theirs", session_id="theirs"
     )
-    assert board.add_join(joiner, THEIRS)
+    assert board.declare(joiner)
 
     run(tmp_path, "status", "--json")
     resources = json.loads(capsys.readouterr().out)["resources"]
@@ -953,7 +920,7 @@ def test_join_requires_a_primary_declaration(tmp_path: Path) -> None:
     """主宣言が無ければ相乗りではなく claim を使わせる。"""
     code = run(
         tmp_path,
-        "join",
+        "claim",
         "--res",
         "GPU0",
         "--job",
@@ -967,267 +934,7 @@ def test_join_requires_a_primary_declaration(tmp_path: Path) -> None:
     assert code == 2
 
 
-def test_join_is_allowed_even_when_found_busy(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """``--found busy`` でも相乗りは申告できる。
-
-    相乗りは「使われている」ことが前提である。claim が逆に止めるのと対になる。
-    """
-    plant(Board(tmp_path), THEIRS)
-    capsys.readouterr()
-
-    code = run(
-        tmp_path,
-        "join",
-        "--res",
-        "GPU0",
-        "--job",
-        "相乗り",
-        "--observed",
-        "使用中と分かっている",
-        "--eta",
-        "10m",
-        "--found",
-        "busy",
-    )
-
-    assert code == 0
-    assert "相乗りを申告しました" in capsys.readouterr().out
-
-
-def test_join_reports_an_io_failure_apart_from_a_duplicate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """掲示板に残せなかったことを「既に申告しています」と言わない。
-
-    ``add_join`` の失敗には mkdir・書き込み・ハードリンクの失敗も含まれる。
-    それを「既にある」と畳むと、**掲示板に 1 件も残っていないのに利用者を安心させる**。
-    他セッションから見えない利用が始まるのは、掲示板が防ごうとしているものそのものである。
-
-    **作業は止めない**（fail-open）。掲示板に書けないのはインフラの故障であって
-    資源の競合ではない。
-    """
-    plant(Board(tmp_path), THEIRS)
-
-    def refuse(*_args: object, **_kwargs: object) -> None:
-        raise OSError("相乗りのディレクトリが作れない")
-
-    monkeypatch.setattr(Path, "mkdir", refuse)
-    capsys.readouterr()
-
-    code = run(
-        tmp_path,
-        "join",
-        "--res",
-        "GPU0",
-        "--job",
-        "相乗り",
-        "--observed",
-        "調べた",
-        "--eta",
-        "10m",
-    )
-    captured = capsys.readouterr()
-
-    assert code == 0  # 止めない
-    assert "既に相乗りを申告しています" not in captured.out
-    assert "掲示板に残せていません" in captured.err
-    assert "相乗りを申告しました" not in captured.out
-
-
-def test_join_twice_from_the_same_place_is_refused(tmp_path: Path) -> None:
-    """同じ作業ディレクトリから二重には申告できない。"""
-    plant(Board(tmp_path), THEIRS)
-    argv = ["join", "--res", "GPU0", "--job", "相乗り", "--observed", "調べた", "--eta", "10m"]
-
-    assert run(tmp_path, *argv) == 0
-    assert len(Board(tmp_path).list_joins(RESOURCE)) == 1
-
-    run(tmp_path, *argv)
-    assert len(Board(tmp_path).list_joins(RESOURCE)) == 1
-
-
 # --- 相乗りが消せること ---------------------------------------------------------
-
-
-def test_a_join_from_before_the_reboot_is_discarded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """再起動をまたいだ相乗りは破棄する。
-
-    相乗りには主宣言と違って幽霊を退ける経路が無い。落ちたセッションの申告が
-    永久に残ると、その資源は「使用中」に固定され、``rb wait`` は二度と戻らず、
-    フックは全セッションの全プロンプトに出し続ける。
-
-    捨てる条件は ``since < 現在の起動時刻`` の 1 つだけである（再起動で全 PID が
-    無効になるため推測を含まない）。
-    """
-    board = Board(tmp_path)
-    joiner = build_entry(
-        RESOURCE, job="落ちたセッション", cwd=THEIRS, session="theirs", session_id="theirs"
-    )
-    assert board.add_join(joiner, THEIRS)
-
-    # 起動時刻が宣言より後 = 再起動をまたいでいる（境界の余裕より十分に大きく取る）
-    monkeypatch.setattr(
-        "resource_broker.platform_info.boot_time", lambda: clock.now() + timedelta(minutes=10)
-    )
-
-    assert board.list_joins(RESOURCE) == []
-    assert board.join_path(RESOURCE, THEIRS, "theirs").exists() is False  # 掃除まで行う
-
-
-def test_a_join_within_the_boot_margin_survives(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """起動時刻を**わずかに**下回る相乗りは捨てない。
-
-    ``boot`` は起動からの経過時間から逆算した値なので、NTP が時計を前方へ飛ばすと、
-    直前に出したばかりの相乗りが起動より前に見える。境界に余裕を持たせて、
-    生きている申告を巻き込む余地をゼロにする。失うのは再起動直後の掃除の遅れだけである。
-    """
-    board = Board(tmp_path)
-    joiner = build_entry(
-        RESOURCE, job="出したばかりの相乗り", cwd=THEIRS, session="theirs", session_id="theirs"
-    )
-    assert board.add_join(joiner, THEIRS)
-
-    monkeypatch.setattr(
-        "resource_broker.platform_info.boot_time", lambda: clock.now() + timedelta(seconds=30)
-    )
-
-    assert len(board.list_joins(RESOURCE)) == 1
-
-
-def test_two_sessions_in_one_directory_are_both_visible(tmp_path: Path) -> None:
-    """同じ場所から出た 2 セッションの相乗りが、**両方とも掲示板に載る**。
-
-    同じリポジトリで 2 つのセッションを立てるのは日常である（片方が実装、片方が
-    レビュー等）。鍵が ``(資源, cwd)`` だけだと 2 人目は申告を残せず、1 人目が先に
-    終わって取り下げた瞬間、**まだ資源を使っている 2 人目が掲示板から完全に消える**。
-    相乗りは「見えるようにする」ためだけの仕組みなのに、見えなくなる方向へ倒れる。
-    """
-    board = Board(tmp_path)
-    first = build_entry(RESOURCE, job="実装", cwd=THEIRS, session="a", session_id="a")
-    second = build_entry(RESOURCE, job="レビュー", cwd=THEIRS, session="b", session_id="b")
-
-    assert board.add_join(first, THEIRS)
-    assert board.add_join(second, THEIRS), "2 人目が申告を残せていない"
-
-    assert sorted(join.job for join in board.list_joins(RESOURCE)) == ["レビュー", "実装"]
-
-    # 1 人目が取り下げても 2 人目は残る
-    board.remove_own_join(RESOURCE, THEIRS, reason="テスト", expect_nonce=first.nonce)
-
-    assert [join.job for join in board.list_joins(RESOURCE)] == ["レビュー"]
-
-
-def test_one_session_can_run_two_wrapped_jobs_side_by_side(tmp_path: Path) -> None:
-    """同じセッションが同じ場所から**並行して 2 本**相乗りしても、両方が残る。
-
-    背景ジョブを 2 本投げるのは普通の使い方である。鍵がセッションまでだと 2 本目は
-    申告を残せず、1 本目が終わって取り下げた瞬間に**まだ走っている 2 本目が掲示板から
-    消える**。相乗りは「見えるようにする」ためだけの仕組みで、見えなくなるのは
-    唯一許されない壊れ方である。
-    """
-    board = Board(tmp_path)
-    first = build_entry(RESOURCE, job="ジョブ A", cwd=MINE, session="a", session_id="a")
-    second = build_entry(RESOURCE, job="ジョブ B", cwd=MINE, session="a", session_id="a")
-
-    assert board.add_join(first, MINE, unique=True)
-    assert board.add_join(second, MINE, unique=True), "2 本目が申告を残せていない"
-
-    assert sorted(join.job for join in board.list_joins(RESOURCE)) == ["ジョブ A", "ジョブ B"]
-
-    board.remove_own_join(RESOURCE, MINE, reason="A が終わった", expect_nonce=first.nonce)
-
-    assert [join.job for join in board.list_joins(RESOURCE)] == ["ジョブ B"]
-
-
-def test_the_same_session_cannot_join_twice_from_one_directory(tmp_path: Path) -> None:
-    """同じセッションが同じ場所から二重に申告することはできない（従来どおり）。
-
-    セッションを鍵に混ぜたのは**別のセッションを区別する**ためであって、
-    1 つのセッションの二重申告を許すためではない。
-    """
-    board = Board(tmp_path)
-    entry = build_entry(RESOURCE, job="実装", cwd=THEIRS, session="a", session_id="a")
-
-    assert board.add_join(entry, THEIRS)
-    assert board.add_join(entry, THEIRS) is False
-
-
-def test_a_stale_join_is_removed_only_when_it_still_matches(tmp_path: Path) -> None:
-    """相乗りの削除も **nonce の CAS** に乗る（読み取りと削除の間の入れ替わり）。
-
-    古い相乗りを読んだ後、消す前に別プロセスが同じ ``(資源, cwd)`` を取り下げて
-    出し直すことがある。無条件の ``unlink`` はその**新しい生きた申告**を消す。
-    主宣言で塞いだのと同じ read-delete race である。
-    """
-    board = Board(tmp_path)
-    old = build_entry(
-        RESOURCE, job="古い相乗り", cwd=THEIRS, session="theirs", session_id="theirs"
-    )
-    assert board.add_join(old, THEIRS)
-
-    # 読み終えた直後に、同じセッションの申告が取り下げられて出し直された状況を作る
-    board.join_path(RESOURCE, THEIRS, "theirs").unlink()
-    assert board.add_join(
-        build_entry(
-            RESOURCE, job="新しい相乗り", cwd=THEIRS, session="theirs", session_id="theirs"
-        ),
-        THEIRS,
-    )
-
-    result = board._capture_and_remove(
-        board.join_path(RESOURCE, THEIRS, "theirs"),
-        expect_nonce=old.nonce,
-        resource_id=RESOURCE,
-        reason="テスト",
-    )
-
-    assert result is RemovalResult.NOT_OWNED
-    assert [join.job for join in board.list_joins(RESOURCE)] == ["新しい相乗り"]
-
-
-def test_stale_join_cleanup_goes_through_the_cas(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """読み取り時の相乗り掃除が、無条件 ``unlink`` ではなく CAS を通ること。
-
-    ここが素通しに戻ると、上のテストが守っている性質は経路ごと迂回される。
-    """
-    board = Board(tmp_path)
-    joiner = build_entry(
-        RESOURCE, job="落ちたセッション", cwd=THEIRS, session="theirs", session_id="theirs"
-    )
-    assert board.add_join(joiner, THEIRS)
-    monkeypatch.setattr(
-        "resource_broker.platform_info.boot_time", lambda: clock.now() + timedelta(minutes=10)
-    )
-
-    seen: list[str] = []
-    original = Board._capture_and_remove
-
-    def spy(
-        self: Board,
-        path: Path,
-        *,
-        expect_nonce: str,
-        resource_id: str,
-        reason: str,
-        **rest: object,
-    ) -> RemovalResult:
-        seen.append(expect_nonce)
-        return original(
-            self, path, expect_nonce=expect_nonce, resource_id=resource_id, reason=reason
-        )
-
-    monkeypatch.setattr(Board, "_capture_and_remove", spy)
-
-    assert board.list_joins(RESOURCE) == []
-    assert seen == [joiner.nonce]
 
 
 def test_a_stale_join_that_cannot_be_removed_is_still_reported(
@@ -1239,7 +946,7 @@ def test_a_stale_join_that_cannot_be_removed_is_still_reported(
     掲示板が出しうる誤りのうち最も危ないのがこれである。
     """
     board = Board(tmp_path)
-    assert board.add_join(build_entry(RESOURCE, job="消せない相乗り", cwd=THEIRS), THEIRS)
+    assert board.declare(build_entry(RESOURCE, job="消せない相乗り", cwd=THEIRS))
     monkeypatch.setattr(
         "resource_broker.platform_info.boot_time", lambda: clock.now() + timedelta(minutes=10)
     )
@@ -1250,7 +957,7 @@ def test_a_stale_join_that_cannot_be_removed_is_still_reported(
     monkeypatch.setattr(os, "rename", refuse)
     monkeypatch.setattr("resource_broker.board.UNLINK_DELAY_S", 0.0)
 
-    assert [join.job for join in board.list_joins(RESOURCE)] == ["消せない相乗り"]
+    assert [join.job for join in board.list_for(RESOURCE)] == ["消せない相乗り"]
 
 
 def test_a_live_join_is_not_discarded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1263,179 +970,25 @@ def test_a_live_join_is_not_discarded(tmp_path: Path, monkeypatch: pytest.Monkey
     joiner = build_entry(
         RESOURCE, job="生きている相乗り", cwd=THEIRS, session="theirs", session_id="theirs"
     )
-    assert board.add_join(joiner, THEIRS)
+    assert board.declare(joiner)
 
     monkeypatch.setattr(
         "resource_broker.platform_info.boot_time", lambda: clock.now() - timedelta(days=1)
     )
 
-    assert len(board.list_joins(RESOURCE)) == 1
-
-
-def test_force_release_also_clears_the_joins(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """``release --force`` は相乗りも消す。
-
-    主宣言だけ消せても、残った相乗りが資源を「使用中」に固定し続ける。
-    強制解放は最後の掃除手段なので、掃除しきれなければ意味がない。
-    """
-    board = Board(tmp_path)
-    plant(board, THEIRS)
-    for place in places(tmp_path, "works/a", "works/b"):
-        assert board.add_join(build_entry(RESOURCE, job="相乗り", cwd=place), place)
-    capsys.readouterr()
-
-    assert run(tmp_path, "release", "GPU0", "--force") == 0
-    assert "相乗り 2 件" in capsys.readouterr().out
-    assert board.read(RESOURCE) is None
-    assert board.list_joins(RESOURCE) == []
+    assert len(board.list_for(RESOURCE)) == 1
 
 
 def test_force_release_clears_joins_without_a_primary(tmp_path: Path) -> None:
     """主宣言が無くても、残った相乗りを強制解放で掃除できる。"""
     board = Board(tmp_path)
-    assert board.add_join(
-        build_entry(RESOURCE, job="相乗り", cwd=THEIRS, session_id="theirs"), THEIRS
-    )
+    assert board.declare(build_entry(RESOURCE, job="相乗り", cwd=THEIRS, session_id="theirs"))
 
     assert run(tmp_path, "release", "GPU0", "--force") == 0
-    assert board.list_joins(RESOURCE) == []
-
-
-def test_a_join_can_be_released_from_a_subdirectory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """申告した場所の配下から ``release`` しても、自分の相乗りを外せる。
-
-    照合を主宣言（``owns``）とそろえる。パスの完全一致にすると、申告時と違う
-    ディレクトリから解放したときにキーが変わって外せない。主宣言は祖先関係を
-    許すのに相乗りだけ完全一致、という非対称は使う側から説明できない。
-    """
-    board = Board(tmp_path)
-    plant(board, THEIRS)
-    place, deeper = places(tmp_path, "works/assets/malm", "works/assets/malm/runs/e008")
-    assert board.add_join(build_entry(RESOURCE, job="相乗り", cwd=place), place)
-
-    monkeypatch.setattr(os, "getcwd", lambda: deeper)
-
-    assert run(tmp_path, "release", "GPU0") == 0
-    assert board.list_joins(RESOURCE) == []
-    assert board.read(RESOURCE) is not None  # 主宣言は他人のものなので残る
-
-
-def test_release_does_not_remove_another_sessions_join(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """他セッションの相乗りは ``--force`` 無しでは外せない。"""
-    board = Board(tmp_path)
-    plant(board, THEIRS)
-    assert board.add_join(
-        build_entry(RESOURCE, job="相乗り", cwd=THEIRS, session_id="theirs"), THEIRS
-    )
-
-    monkeypatch.setattr(os, "getcwd", lambda: MINE)
-
-    assert run(tmp_path, "release", "GPU0") == 1  # 主宣言も他人のもの
-    assert len(board.list_joins(RESOURCE)) == 1
-
-
-def test_release_prefers_my_own_join_over_one_declared_from_an_ancestor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """自分の場所から出した相乗りがあるなら、それを外す。
-
-    祖先関係だけで選ぶと、**宣言者の cwd が自分の祖先でありさえすればどれでも一致する**。
-    このマシンでは全プロジェクトが 1 つのルートの下にあるため、ハブのルートから出された
-    他人の相乗りを配下の全セッションが外せてしまう。完全一致を先に試して塞ぐ。
-    """
-    board = Board(tmp_path)
-    plant(board, THEIRS)
-    hub, mine = places(tmp_path, "works", "works/assets/malm")
-    assert board.add_join(build_entry(RESOURCE, job="ハブの相乗り", cwd=hub), hub)
-    assert board.add_join(build_entry(RESOURCE, job="私の相乗り", cwd=mine), mine)
-
-    monkeypatch.setattr(os, "getcwd", lambda: mine)
-
-    assert run(tmp_path, "release", "GPU0") == 0
-    assert [join.job for join in board.list_joins(RESOURCE)] == ["ハブの相乗り"]
-
-
-def test_release_picks_the_nearest_ancestor_join(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """完全一致が無いときは**最も近い祖先**の相乗りを外す。
-
-    申告時と違うディレクトリから解放するのは普通にある。そのときに「祖先ならどれでも」
-    にすると、より浅い場所から出された他人の申告を消しうる。
-    """
-    board = Board(tmp_path)
-    plant(board, THEIRS)
-    hub, near, deeper = places(
-        tmp_path, "works", "works/assets/malm", "works/assets/malm/runs/e008"
-    )
-    assert board.add_join(build_entry(RESOURCE, job="ハブの相乗り", cwd=hub), hub)
-    assert board.add_join(build_entry(RESOURCE, job="近い相乗り", cwd=near), near)
-
-    monkeypatch.setattr(os, "getcwd", lambda: deeper)
-
-    assert run(tmp_path, "release", "GPU0") == 0
-    assert [join.job for join in board.list_joins(RESOURCE)] == ["ハブの相乗り"]
-
-
-def test_release_keeps_an_ancestors_join_when_i_have_none(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """自分が相乗りしていないなら、祖先から出された**他人の**相乗りは外さない。
-
-    相乗りを先に見ると、ハブのルートから出された申告が ``owns`` の祖先規則を通り、
-    配下のセッションの ``rb release`` がそれを選んで消す。しかも早期 return するため、
-    **他人の申告だけが消え、呼び出し側自身の主宣言は解放されないまま残る**という
-    二重の誤りになる。主宣言を先に見れば、どちらも起きない。
-    """
-    board = Board(tmp_path)
-    hub, mine = places(tmp_path, "works", "works/assets/foo")
-    monkeypatch.setattr(os, "getcwd", lambda: mine)
-    assert claim(tmp_path) == 0  # 主宣言は自分のもの
-    assert board.add_join(build_entry(RESOURCE, job="ハブの相乗り", cwd=hub), hub)
-
-    assert run(tmp_path, "release", "GPU0") == 0
-
-    assert board.read(RESOURCE) is None  # 自分の主宣言が解放されている
-    assert [join.job for join in board.list_joins(RESOURCE)] == ["ハブの相乗り"]
+    assert board.list_for(RESOURCE) == []
 
 
 # --- 強制解放の報告 -------------------------------------------------------------
-
-
-def test_force_release_reports_the_joins_even_when_the_primary_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """主宣言を消せなくても、相乗りを消した事実は報告する。
-
-    早期 return で握りつぶすと「相乗り N 件を消した」が出力から消え、読んだ側は
-    掲示板の状態を誤って把握する。
-    """
-    board = Board(tmp_path)
-    plant(board, THEIRS)
-    assert board.add_join(build_entry(RESOURCE, job="相乗り", cwd=MINE), MINE)
-    primary_path = board.path_for(RESOURCE)
-    original = Path.unlink
-
-    def refuse_primary(self: Path, *args: object, **kwargs: object) -> None:
-        if self == primary_path:
-            raise PermissionError("共有違反")
-        original(self, *args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(Path, "unlink", refuse_primary)
-    monkeypatch.setattr("resource_broker.board.UNLINK_DELAY_S", 0.0)
-    capsys.readouterr()
-
-    assert run(tmp_path, "release", "GPU0", "--force") == 0
-    captured = capsys.readouterr()
-
-    assert "解放に失敗しました" in captured.err
-    assert "相乗り 1 件" in captured.err
 
 
 def shared_primary_and_join(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Board:
@@ -1444,107 +997,11 @@ def shared_primary_and_join(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     shared = str(tmp_path / "同じ場所")
     os.makedirs(shared, exist_ok=True)
 
-    assert board.try_claim(build_entry(RESOURCE, job="S のジョブ", cwd=shared, session="S"))
-    assert board.add_join(build_entry(RESOURCE, job="T の相乗り", cwd=shared, session="T"), shared)
+    assert board.declare(build_entry(RESOURCE, job="S のジョブ", cwd=shared, session="S"))
+    assert board.declare(build_entry(RESOURCE, job="T の相乗り", cwd=shared, session="T"))
 
     monkeypatch.chdir(shared)
     return board
-
-
-def test_release_stops_when_both_a_primary_and_a_join_are_mine(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """主宣言と相乗りの両方が候補になったら、**何も消さずに指定を求める**。
-
-    ここは 5 周にわたって同じ振り子を往復した場所である。相乗りを先に見れば他人の申告を
-    消し、主宣言を先に見れば他人の主宣言を消し、完全一致の相乗りを最優先にすれば
-    主宣言者が ``release`` を打っても相乗りだけが消える。**cwd だけでは S と T を
-    区別できない**以上、どれを選んでも片方が壊れる。
-
-    したがって自動で選ぶのをやめる。掲示板の情報で決められないことを推測しない、
-    というのがこの節の唯一の出口である。
-    """
-    board = shared_primary_and_join(tmp_path, monkeypatch)
-    capsys.readouterr()
-
-    code = run(tmp_path, "release", "GPU0")
-    captured = capsys.readouterr()
-
-    assert code == 2  # 引数の不備として返す（資源の競合ではない）
-    assert "どちらを外すか指定してください" in captured.out
-    assert "--primary" in captured.out and "--join" in captured.out
-    # **どちらも消していない。** 曖昧なまま片方を消すのが、5 周続いた失敗の形である
-    survivor = board.read(RESOURCE)
-    assert survivor is not None and survivor.job == "S のジョブ"
-    assert [join.job for join in board.list_joins(RESOURCE)] == ["T の相乗り"]
-
-
-def test_release_can_target_the_primary_or_the_join(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``--join`` は相乗りだけを、``--primary`` は主宣言だけを外す。
-
-    S（主宣言者）と T（相乗り者）が同じ場所に居るとき、**それぞれが自分のものだけを
-    外せる**ことが要件である。どちらか一方しか外せない実装は、片方のセッションから見て
-    「自分の宣言が解放できない」か「他人の宣言を消してしまう」のどちらかになる。
-    """
-    board = shared_primary_and_join(tmp_path, monkeypatch)
-
-    # T が自分の相乗りを取り下げる
-    assert run(tmp_path, "release", "GPU0", "--join") == 0
-    assert board.list_joins(RESOURCE) == []
-    survivor = board.read(RESOURCE)
-    assert survivor is not None and survivor.job == "S のジョブ", "S の主宣言が消えている"
-
-    # S が自分の主宣言を解放する
-    assert run(tmp_path, "release", "GPU0", "--primary") == 0
-    assert board.read(RESOURCE) is None
-
-
-def test_release_primary_does_not_fall_back_to_the_join(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``--primary`` を指定したら、相乗りには手を出さない。
-
-    指定したものが無かったときに黙って別のものを消すと、明示指定の意味が消える。
-    """
-    board = shared_primary_and_join(tmp_path, monkeypatch)
-    assert board.remove(RESOURCE, reason="テスト")  # 主宣言だけ先に消えた状況
-
-    assert run(tmp_path, "release", "GPU0", "--primary") == 0
-    assert [join.job for join in board.list_joins(RESOURCE)] == ["T の相乗り"]
-
-
-def test_release_join_does_not_fall_back_to_the_primary(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``--join`` を指定したら、主宣言には手を出さない。"""
-    board = shared_primary_and_join(tmp_path, monkeypatch)
-    assert board.remove_joins(RESOURCE, reason="テスト") == 1  # 相乗りだけ先に消えた状況
-
-    assert run(tmp_path, "release", "GPU0", "--join") == 0
-    survivor = board.read(RESOURCE)
-    assert survivor is not None and survivor.job == "S のジョブ"
-
-
-def test_release_still_chooses_automatically_when_only_one_candidate_exists(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """候補が 1 つしか無いときは従来どおり自動で選ぶ。
-
-    曖昧でない場面まで指定を求めると、最もよく打つコマンドが毎回落ちる。
-    止めるのは「決められないとき」だけである。
-    """
-    board = Board(tmp_path)
-    place = str(tmp_path / "私の場所")
-    os.makedirs(place, exist_ok=True)
-    monkeypatch.chdir(place)
-    plant(board, THEIRS)  # 主宣言は他人のもの
-    assert board.add_join(build_entry(RESOURCE, job="私の相乗り", cwd=place), place)
-
-    assert run(tmp_path, "release", "GPU0") == 0
-    assert board.list_joins(RESOURCE) == []
-    assert board.read(RESOURCE) is not None  # 他人の主宣言はそのまま
 
 
 # --- 同じ場所で動く 2 つのセッション ---------------------------------------------
@@ -1562,7 +1019,7 @@ def test_a_second_session_in_the_same_place_cannot_release_my_declaration(
     plant(board, MINE, job="先に始めた側の作業", session="first")
 
     assert run(tmp_path, "release", "GPU0") == 1  # 自分は "mine"
-    assert board.read(RESOURCE) is not None
+    assert _first(board, RESOURCE) is not None
     assert "他セッションの宣言は解放できません" in capsys.readouterr().err
 
 
@@ -1575,7 +1032,7 @@ def test_a_second_session_in_the_same_place_cannot_update_my_declaration(
 
     assert run(tmp_path, "update", "GPU0", "--job", "横取り") == 1
 
-    entry = board.read(RESOURCE)
+    entry = _first(board, RESOURCE)
     assert entry is not None
     assert entry.job == "先に始めた側の作業"
 
@@ -1588,7 +1045,7 @@ def test_i_can_still_release_my_own_declaration_from_the_same_place(
     plant(board, MINE, job="自分の作業", session="mine")
 
     assert run(tmp_path, "release", "GPU0") == 0
-    assert board.read(RESOURCE) is None
+    assert _first(board, RESOURCE) is None
 
 
 def test_a_declaration_without_a_session_id_falls_back_to_cwd(
@@ -1600,10 +1057,10 @@ def test_a_declaration_without_a_session_id_falls_back_to_cwd(
     掲示板のスキーマ変更で稼働中のセッションが動かなくなってはならない。
     """
     board = Board(tmp_path)
-    assert board.try_claim(build_entry(RESOURCE, job="session_id の無い宣言", cwd=MINE))
+    assert board.declare(build_entry(RESOURCE, job="session_id の無い宣言", cwd=MINE))
 
     assert run(tmp_path, "release", "GPU0") == 0
-    assert board.read(RESOURCE) is None
+    assert _first(board, RESOURCE) is None
 
 
 def test_my_own_session_id_is_recorded_on_the_board(tmp_path: Path) -> None:
@@ -1640,76 +1097,3 @@ def test_a_known_nonce_never_falls_back_to_the_directory(tmp_path: Path) -> None
 
     assert board.owns(entry, nonce="", cwd=MINE) is True  # nonce を持たない操作は従来どおり
     assert board.owns(entry, nonce="自分の nonce", cwd=MINE) is False
-
-
-def test_release_stops_when_the_join_came_from_the_wrapper(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """**ラッパー経由の相乗り**でも `rb release` は何も消さずに指定を求める。
-
-    曖昧さの判定をファイル名の一致で見ていたため、鍵にラッパーの nonce が入った瞬間に
-    **恒偽**になった。主宣言と相乗りが両方あるのに「相乗りは無い」と読み、**走行中の
-    主宣言のほうを解放する**。主宣言が消えると相乗りだけが残って `free` になり、
-    別セッションが同じ資源を取れる——掲示板が防ぐと宣言している二重取得である。
-
-    ユニットで `declared_here` だけを見ても足りない。**呼び出し側が使っているか**まで
-    確かめないと、判定を戻しても緑のままになる（実際そうだった）。
-    """
-    board = Board(tmp_path)
-    shared = str(tmp_path / "同じ場所")
-    os.makedirs(shared, exist_ok=True)
-    monkeypatch.setenv("RESOURCE_BROKER_SESSION_ID", "S")
-
-    assert board.try_claim(
-        build_entry(RESOURCE, job="S の本体", cwd=shared, session="S", session_id="S")
-    )
-    assert board.add_join(
-        build_entry(RESOURCE, job="S の 2 本目", cwd=shared, session="S", session_id="S"),
-        shared,
-        unique=True,
-    )
-    monkeypatch.chdir(shared)
-    capsys.readouterr()
-
-    code = run(tmp_path, "release", "GPU0")
-
-    assert code == 2, capsys.readouterr().out
-    assert board.read(RESOURCE) is not None, "主宣言が消えている"
-    assert len(board.list_joins(RESOURCE)) == 1, "相乗りが消えている"
-
-
-def test_a_wrapper_join_still_makes_release_ambiguous(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """主宣言と**ラッパー経由の相乗り**が同居していたら、`rb release` は何も消さない。
-
-    曖昧さの判定を「相乗りのファイル名がこの場所の鍵と一致するか」で見ていたため、
-    鍵にラッパーの nonce が入った瞬間に**恒偽**になった。主宣言と相乗りが両方あるのに
-    「相乗りは無い」と読み、**走行中の主宣言のほうを黙って解放する**。主宣言が消えると
-    相乗りだけが残って `free` になり、別セッションが同じ資源を取れる——掲示板が
-    防ぐと宣言している二重取得そのものである。
-    """
-    monkeypatch.setenv("RESOURCE_BROKER_SESSION_ID", "a")
-    board = Board(tmp_path)
-    primary = build_entry(RESOURCE, job="本体", cwd=MINE, session="a", session_id="a")
-    assert board.try_claim(primary)
-    joined = build_entry(RESOURCE, job="相乗り", cwd=MINE, session="a", session_id="a")
-    assert board.add_join(joined, MINE, unique=True)
-
-    assert board.declared_here(RESOURCE, MINE) is True
-
-
-def test_a_join_from_elsewhere_does_not_make_release_ambiguous(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """**この場所から出していない**相乗りは曖昧さの材料 にしない。
-
-    祖先から出された申告まで数えると、配下の全セッションで `rb release` が
-    毎回「指定しろ」になる。
-    """
-    monkeypatch.setenv("RESOURCE_BROKER_SESSION_ID", "a")
-    board = Board(tmp_path)
-    joined = build_entry(RESOURCE, job="祖先の相乗り", cwd=THEIRS, session="b", session_id="b")
-    assert board.add_join(joined, THEIRS, unique=True)
-
-    assert board.declared_here(RESOURCE, MINE) is False

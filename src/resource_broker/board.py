@@ -25,7 +25,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
@@ -472,6 +472,30 @@ class Entry:
         return extra
 
 
+@dataclass(frozen=True)
+class OwnRemoval:
+    """自分の宣言を消した結果。**3 つを畳まない。**
+
+    「1 件も消えなかった」には理由が 3 通りあり、対処がまるで違う——そもそも宣言が
+    無かった / 全部他人のものだった / 消そうとして失敗した（Windows の共有違反）。
+    畳むと呼び出し側が**事実と違う説明**を出す。
+    """
+
+    removed: list[Entry]
+    """消せたもの。"""
+
+    failed: list[Entry]
+    """自分のものだが消せなかったもの。**残っている**。"""
+
+    foreign: list[Entry]
+    """自分のものではないので触らなかったもの。"""
+
+    @property
+    def any_here(self) -> bool:
+        """その資源に宣言が 1 件でもあったか。"""
+        return bool(self.removed or self.failed or self.foreign)
+
+
 class Board:
     """掲示板。
 
@@ -497,10 +521,6 @@ class Board:
     def audit_dir(self) -> Path:
         """監査ログを置くディレクトリ。"""
         return audit.audit_dir(self.root)
-
-    def path_for(self, resource_id: str) -> Path:
-        """資源 ID に対応するエントリのパスを返す。"""
-        return self.entries_dir / f"{naming.safe_filename(resource_id)}.json"
 
     def lock_path(self, resource_id: str) -> Path:
         """取得の排他区間を守るロックのパス。"""
@@ -649,31 +669,64 @@ class Board:
             return
         _unlink_with_retry(path)
 
-    def read(self, resource_id: str) -> Entry | None:
-        """エントリを読む。存在しない・壊れている場合は None。
+    def declarations(self) -> list[tuple[Path, Entry]]:
+        """掲示板にある**全ての宣言**を読む。読めなかったものは飛ばす。
 
-        **壊れていることと存在しないことを区別しない。** どちらも「情報が無い」
-        として扱い、呼び出し側は通す。壊れていた事実は監査ログに残す。
+        **主宣言と相乗りを区別しない。** 資源を使っている作業が N 件あるだけであり、
+        どれが先かは ``since`` に書いてある（導出できるものを記録しない）。区別を
+        持っていた頃は、片方が消えるともう片方の意味が変わる——主宣言が消えると
+        走っている相乗りがいても「空き」になり、二重取得が成立した——という非対称が
+        あった。対等にすれば、**どれがいつ消えても他の宣言の意味は変わらない。**
+
+        旧い置き場（``board/<資源>.json`` と ``board/joins/*.json``）も**同じ宣言として
+        読む**。稼働中のセッションの宣言を、形式を変えた瞬間に見失わないためである。
         """
-        path = self.path_for(resource_id)
-        try:
-            text = path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return None
-        except OSError as exc:
-            self.audit("read_failed", resource=resource_id, error=str(exc))
-            return None
+        return self.declarations_detailed()[0]
 
-        try:
-            data = json.loads(text)
-        except (json.JSONDecodeError, ValueError) as exc:
-            self.audit("entry_corrupt", resource=resource_id, error=str(exc))
-            return None
+    def declarations_detailed(self) -> tuple[list[tuple[Path, Entry]], bool]:
+        """全ての宣言と、**読めなかったものがあったか**を返す。"""
+        found: list[tuple[Path, Entry]] = []
+        paths, unreadable = _json_files(self.entries_dir)
+        legacy, legacy_unreadable = _json_files(self.entries_dir / "joins")
+        for path in sorted(paths) + sorted(legacy):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                # 読めないのは「壊れている」とは別の事実である。**空だと言わない側。**
+                self.audit("entry_unreadable", path=str(path), error=str(exc))
+                unreadable = True
+                continue
+            try:
+                data = json.loads(text)
+            except (json.JSONDecodeError, ValueError) as exc:
+                self.audit("entry_corrupt", path=str(path), error=str(exc))
+                continue
+            entry = Entry.from_dict(data)
+            if entry is not None:
+                found.append((path, entry))
+        return found, unreadable or legacy_unreadable
 
-        entry = Entry.from_dict(data)
-        if entry is None:
-            self.audit("entry_malformed", resource=resource_id)
-        return entry
+    def list_for(self, resource_id: str) -> list[Entry]:
+        """その資源の宣言を**古い順**に返す。
+
+        順序は ``since`` で決まる。「どれが先に取ったか」を別に記録しない——
+        時間的に後のものが後から来たに決まっている。
+        """
+        return [entry for _, entry in self.pairs_for(resource_id)]
+
+    def pairs_for(self, resource_id: str) -> list[tuple[Path, Entry]]:
+        """その資源の宣言を、パスつきで古い順に返す。"""
+        found = [(path, e) for path, e in self.declarations() if e.resource == resource_id]
+        return sorted(found, key=lambda item: (item[1].since, str(item[0])))
+
+    def declaration_path(self, nonce: str) -> Path:
+        """宣言 1 件のパス。**ファイル名は nonce だけで、身元を持たない。**
+
+        資源 ID や cwd をファイル名へ入れない。入れると「名前が一致するか」で
+        身元を判定したくなり、鍵の構成を変えた瞬間に判定が黙って恒偽になる
+        （実際に一度そうなり、走行中の宣言を解放する経路になった）。
+        """
+        return self.entries_dir / f"{naming.safe_filename(nonce)}.json"
 
     def owns(
         self,
@@ -752,16 +805,15 @@ class Board:
         数回やり直して吸収し、吸収できなければ ``FAILED`` を返して**保守的に諦める**
         （消せていないのに消えたと答えるより、退けられなかったと答えるほうが安全である）。
         """
-        # 1. 先読み。ここで弾ければファイルを動かさずに済み、戻す処理も走らない。
-        current = self.read(resource_id)
-        if current is None:
+        # 1. 先読み。**中身で探す。** ファイル名から場所を組み立てない——名前の付け方を
+        #    変えた瞬間に「見つからない」へ黙って倒れる（実際に一度そうなった）。
+        found = [(path, e) for path, e in self.pairs_for(resource_id) if e.nonce == expect_nonce]
+        if not found:
             return RemovalResult.ABSENT
-        if current.nonce != expect_nonce:
-            self.audit("remove_refused", resource=resource_id, reason="nonce が一致しない")
-            return RemovalResult.NOT_OWNED
 
+        path, _ = found[0]
         return self._capture_and_remove(
-            self.path_for(resource_id),
+            path,
             expect_nonce=expect_nonce,
             resource_id=resource_id,
             reason=reason,
@@ -872,83 +924,82 @@ class Board:
         self.audit("restore_dropped", resource=resource_id, reason="新しい宣言が既にある")
         _unlink_with_retry(tombstone)
 
-    def remove_if_owned(
+    def remove_own(
         self, resource_id: str, *, reason: str, nonce: str | None = None, cwd: str | None = None
-    ) -> RemovalResult:
-        """自分の宣言であるときだけ削除する。
+    ) -> OwnRemoval:
+        """**自分の**宣言を消す。結果は 3 つに分けて返す（:class:`OwnRemoval`）。
 
-        「読んで、所有を確かめて、消す」までが 1 つの操作である。nonce を持つ宣言は
-        :meth:`remove_if_nonce` の CAS で消すため、読んでから消すまでに他セッションが
-        ``claim --force`` で取り直しても**新しい宣言を消さない**。ロックは競り合いを
-        減らすために掛けるだけで、取れなくても正しさは変わらない。
+        平坦化する前は「主宣言か相乗りか」を選ばせていた。役割を記録しないので、
+        選ばせるものが無くなった——**自分の宣言を消す**、それだけである。同じ資源へ
+        並行して 2 本出していれば 2 本とも消える（``nonce`` を渡せばその 1 本だけ）。
 
-        ロックが取れないときは**囲わずに続行する**。解放できずに宣言を残すほうが有害
-        （幽霊が資源を占有し続ける）であり、CAS という主防御は失われないためである。
-        ロック無しで消したことは監査ログに残す。
+        削除は 1 件ずつ nonce の CAS に乗せる。読んでから消すまでに別セッションが
+        取り直しても、**新しい宣言を消さない**。
 
-        Returns
-        -------
-        RemovalResult
-            消した / 無かった / 他人のものだった / 消せなかった。呼び出し側が
-            **事実と違う説明**を出さないよう、4 つを畳まずに返す。
+        ロックが取れないときは**囲わずに続行する**。解放できずに宣言を残すほうが
+        有害であり、CAS という主防御は失われない。
         """
+        removed: list[Entry] = []
+        failed: list[Entry] = []
+        foreign: list[Entry] = []
         with self.locked(resource_id) as lock:
             if lock is not LockState.ACQUIRED:
                 self.audit("remove_unlocked", resource=resource_id, lock=str(lock))
-            entry = self.read(resource_id)
-            if entry is None:
-                return RemovalResult.ABSENT
-            if not self.owns(entry, nonce=nonce, cwd=cwd, session_id=platform_info.session_id()):
-                self.audit("remove_refused", resource=resource_id, reason="他者の宣言のため")
-                return RemovalResult.NOT_OWNED
-            if entry.nonce:
-                return self.remove_if_nonce(resource_id, expect_nonce=entry.nonce, reason=reason)
-            # nonce を持たない古いエントリ。照合できる値が無いので従来どおり消す。
-            return self.remove_detailed(resource_id, reason=reason)
+            for path, entry in self.pairs_for(resource_id):
+                if nonce is not None and entry.nonce != nonce:
+                    foreign.append(entry)
+                    continue
+                if not self.owns(
+                    entry, nonce=nonce, cwd=cwd, session_id=platform_info.session_id()
+                ):
+                    foreign.append(entry)
+                    continue
+                if entry.nonce:
+                    result = self._capture_and_remove(
+                        path, expect_nonce=entry.nonce, resource_id=resource_id, reason=reason
+                    )
+                else:
+                    # nonce を持たない古い宣言。照合できる値が無いので素直に消す。
+                    result, error = _unlink_with_retry(path)
+                    if result is RemovalResult.REMOVED:
+                        self.audit("removed", resource=resource_id, reason=reason)
+                    elif result is RemovalResult.FAILED:
+                        self.audit("remove_failed", resource=resource_id, error=error)
+                if result is RemovalResult.REMOVED:
+                    removed.append(entry)
+                elif result is RemovalResult.ABSENT:
+                    pass  # 読んだ直後に誰かが消した。**残っていない**ので失敗ではない
+                else:
+                    failed.append(entry)
+        return OwnRemoval(removed=removed, failed=failed, foreign=foreign)
+
+    def owns_any(self, resource_id: str, *, cwd: str | None = None) -> bool:
+        """その資源に**自分の宣言があるか**。"""
+        return any(
+            self.owns(entry, cwd=cwd, session_id=platform_info.session_id())
+            for entry in self.list_for(resource_id)
+        )
 
     def list_all(self) -> list[Entry]:
-        """全エントリを読む。読めなかったものは黙って飛ばす。"""
-        return self.list_all_detailed()[0]
+        """全ての宣言を読む。読めなかったものは飛ばす。"""
+        return [entry for _, entry in self.declarations()]
 
     def list_all_detailed(self) -> tuple[list[Entry], bool]:
-        """全エントリと、**読めなかったものがあったか**を返す。
+        """全ての宣言と、**読めなかったものがあったか**を返す。"""
+        found, unreadable = self.declarations_detailed()
+        return [entry for _, entry in found], unreadable
 
-        読めなかったことを呼び出し側へ伝える。伝えないと ``rb status`` が
-        「掲示板は空です」と断定し、実際には使われている資源を空きとして配る。
+    def declare(self, entry: Entry) -> bool:
+        """宣言を 1 件、掲示板に残す。残せたら True。
+
+        **断らない。** 資源を使っている作業が既にあっても、宣言はもう 1 件増えるだけで
+        ある。断るかどうかを決めるのは掲示板ではなく呼び出し側で、その根拠は「誰が
+        先に取ったか」ではなく**申告された実測**である（``--found free`` と言いながら
+        生きた宣言があるなら、その申告か掲示板のどちらかが古い）。
+
+        ファイル名は nonce なので、``O_EXCL`` の作成は必ず成功する。ここでの
+        ``O_EXCL`` は**同じ宣言を二重に書かない**ためだけに残してある。
         """
-        paths, unreadable = _json_files(self.entries_dir)
-
-        entries: list[Entry] = []
-        for path in paths:
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except OSError as exc:
-                # **1 件読めないのも「読めない」である。** 壊れている（JSON として
-                # 不正）とは別の事実であり、こちらは「空」と言ってはいけない側。
-                self.audit("entry_unreadable", path=str(path), error=str(exc))
-                unreadable = True
-                continue
-            except (json.JSONDecodeError, ValueError) as exc:
-                self.audit("entry_corrupt", path=str(path), error=str(exc))
-                continue
-            entry = Entry.from_dict(data)
-            if entry is not None:
-                entries.append(entry)
-        return entries, unreadable
-
-    def try_claim(self, entry: Entry) -> bool:
-        """エントリを作成して資源を宣言する。既にあれば False。
-
-        ``O_CREAT | O_EXCL`` による作成なので、複数セッションが同時に宣言しても
-        成功するのは 1 つだけである。
-
-        Notes
-        -----
-        既存エントリが幽霊かどうかの判断は**ここでは行わない**。判定は
-        :mod:`resource_broker.liveness` の責務で、幽霊を退かしてから
-        取り直すかどうかは呼び出し側（CLI）が決める。
-        """
-        path = self.path_for(entry.resource)
         try:
             self.entries_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -956,7 +1007,9 @@ class Board:
             return False
 
         payload = json.dumps(entry.to_dict(), ensure_ascii=False, indent=2) + "\n"
-        if not self._create_exclusively(path, payload, entry.resource):
+        if not self._create_exclusively(
+            self.declaration_path(entry.nonce), payload, entry.resource
+        ):
             return False
 
         # 見積もりも残す。次に同じ資源を使うとき、前回どう見積もったかを振り返れる
@@ -1021,347 +1074,14 @@ class Board:
             return False
         return True
 
-    @property
-    def joins_dir(self) -> Path:
-        """相乗りの申告を置くディレクトリ。
-
-        主宣言（``board/*.json``）とは**別の場所**に置く。同じ場所に混ぜると
-        ``list_all`` が相乗りを主宣言として拾い、資源が二重に載って見える。
-        """
-        return self.entries_dir / "joins"
-
-    def join_path(self, resource_id: str, cwd: str, session_id: str = "", nonce: str = "") -> Path:
-        """相乗り申告のパス。**セッションごとに 1 つ**（取れないときは作業ディレクトリごと）。
-
-        **cwd だけを鍵にすると、同じ場所の 2 セッション目が掲示板から消える。** 同じ
-        リポジトリで 2 つのセッションを立てるのは日常であり、両方が同じ資源へ
-        ``rb run --join`` すると 2 人目は ``EXISTS`` を受けて申告を残せない。1 人目が
-        先に終わって申告を取り下げると、**まだ資源を使っている 2 人目が掲示板から
-        完全に消える**。相乗りは「見えるようにする」ためだけの仕組みなのに、
-        見えなくなる方向へ倒れていた。
-
-        ``session_id`` が取れないときは従来どおり cwd だけを鍵にする。**無いことを
-        理由に厳しくしない**（:func:`platform_info.session_id` と同じ方針）。
-        """
-        parts = [resource_id, os.path.normcase(cwd)]
-        if session_id:
-            parts.append(session_id)
-        # **ラッパー経由の申告だけは一意にする。** 1 つのセッションが同じ場所から
-        # 背景ジョブを 2 本投げるのは普通の使い方で、鍵がセッションまでだと 2 本目は
-        # 申告を残せない。1 本目が終わって取り下げた瞬間、**まだ走っている 2 本目が
-        # 掲示板から消える**。手動の ``rb join`` は nonce を渡さないので、
-        # 「同じ場所から二重に申告できない」という意図した性質がそのまま残る。
-        if nonce:
-            parts.append(nonce)
-        key = naming.safe_filename("|".join(parts))
-        return self.joins_dir / f"{key}.json"
-
-    def add_join(self, entry: Entry, cwd: str, *, unique: bool = False) -> bool:
-        """相乗りを申告する。**残せたときだけ** True。
-
-        「既にある」と「残せなかった」を区別する必要があるときは
-        :meth:`add_join_detailed` を使う。
-        """
-        return self.add_join_detailed(entry, cwd, unique=unique) is JoinResult.ADDED
-
-    def add_join_detailed(self, entry: Entry, cwd: str, *, unique: bool = False) -> JoinResult:
-        """相乗りを申告し、結果を 3 値で返す。同じ作業ディレクトリから二重には申告できない。
-
-        Returns
-        -------
-        JoinResult
-            追加した / 既にある / 掲示板に残せなかった。**畳まない**
-            （:class:`JoinResult` 参照）。
-
-        Notes
-        -----
-        **相乗りしてよいかは判定しない。** 保持者が ``sharing`` に何を書いていようと、
-        本ツールは可否を決めない。可否は当事者の合意事項であり、ここでやるのは
-        「入ったことを見えるようにする」ことだけである。黙って入られるより遥かによい。
-        """
-        holder = entry.holder if isinstance(entry.holder, dict) else {}
-        path = self.join_path(
-            entry.resource,
-            cwd,
-            str(holder.get("session_id") or ""),
-            entry.nonce if unique else "",
-        )
-        try:
-            self.joins_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            self.audit("join_mkdir_failed", resource=entry.resource, error=str(exc))
-            return JoinResult.FAILED
-
-        payload = json.dumps(entry.to_dict(), ensure_ascii=False, indent=2) + "\n"
-        if not self._create_exclusively(path, payload, entry.resource, kind="join"):
-            # 作れなかった理由を分ける。**ファイルがあるかどうか**でしか区別できないが、
-            # 「既に自分（誰か）の申告がある」と「書けなかった」は対処がまるで違う。
-            if path.exists():
-                return JoinResult.EXISTS
-            self.audit("join_failed", resource=entry.resource, cwd=cwd)
-            return JoinResult.FAILED
-
-        # **主宣言と同じ項目を残す。** 落とすと `rb history` で相乗りだけ申告と実績を
-        # 突き合わせられない。相乗りで走ったジョブも見積もりの精度は上げたい。
-        self.audit(
-            "joined",
-            resource=entry.resource,
-            job=entry.job,
-            cwd=cwd,
-            # **PID も残す。** ラッパー経由の申告はこれが唯一の生存の手掛かりであり、
-            # 掲示板から消えた後に「どの申告が死んでいたか」を追える場所がここしかない。
-            pid=entry.pid,
-            eta=entry.eta,
-            usage=entry.usage,
-            sharing=entry.sharing or None,
-        )
-        return JoinResult.ADDED
-
-    def _load_joins(self) -> list[tuple[Path, Entry]]:
-        """相乗り申告をパスつきで読む。読めなかったものは飛ばす。
-
-        **確定的な幽霊だけをここで捨てる。** 相乗りには主宣言と違って幽霊を退ける経路が
-        無い（``claim`` に相当する操作が無い）ため、落ちたセッションの申告が永久に残り、
-        その資源を「使用中」に固定してしまう。``rb wait`` は二度と RELEASED を返さず、
-        フックは全セッションの全プロンプトに出し続ける。
-
-        捨てるのは ``since < 現在の起動時刻`` の 1 つだけとする。再起動で全 PID が無効に
-        なるため推測を含まない。**猶予や PID を使った推測はしない**（実測が「空き」でも
-        宣言が幽霊である証明にはならないという非対称性を崩さないため。
-        CLAUDE.md「Liveness Judgment」）。
-
-        **捨てるときも無条件では消さない。** 読んでから消すまでの間に、別セッションが
-        同じ ``(資源, cwd)`` の申告を取り下げて出し直すことがある。無条件の ``unlink``
-        はその**新しい生きた申告**を消す。主宣言で塞いだ read-delete race と同じものなので、
-        同じ捕獲型 CAS（:meth:`_capture_and_remove`）に載せる。
-        """
-        paths, self._joins_unreadable = _json_files(self.joins_dir)
-
-        boot = platform_info.boot_time()
-        # **境界に余裕を持たせる。** boot は起動からの経過時間から逆算した値なので、
-        # NTP が時計を前方へ飛ばすと、直前に出したばかりの相乗りが起動より前に見える。
-        # 1 分引いておけばその窓がゼロになる。
-        #
-        # **代償は「遅れ」ではなく「免除」である。** 再起動の直前 1 分間に出た相乗りは
-        # cutoff より新しいので、その起動中ずっと自動では消えない（`rb release --join`
-        # か `--force` か次の再起動で消える）。生きた申告を消さないほうを取る、という
-        # 実測の非対称性そのものの選択であり、残す側へ倒すのは意図である。
-        cutoff = boot - timedelta(seconds=JOIN_BOOT_MARGIN_S) if boot is not None else None
-        loaded: list[tuple[Path, Entry]] = []
-        for path in paths:
-            try:
-                text = path.read_text(encoding="utf-8")
-            except OSError:
-                self._joins_unreadable = True
-                continue
-            try:
-                data = json.loads(text)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            entry = Entry.from_dict(data)
-            if entry is None:
-                continue
-            since = entry.since_dt
-            if cutoff is not None and since is not None and since < cutoff:
-                removed = self._capture_and_remove(
-                    path,
-                    expect_nonce=entry.nonce,
-                    resource_id=entry.resource,
-                    reason="再起動をまたいだ相乗り",
-                    audit_as=None,  # join_stale_removed を呼び出し側が書く
-                )
-                if removed is RemovalResult.REMOVED:
-                    self.audit("join_stale_removed", resource=entry.resource, since=entry.since)
-                    continue
-                if removed is RemovalResult.ABSENT:
-                    continue  # 読んだ直後に誰かが消した。もう無い
-                # 消せなかった、または捕まえたら別物だった（新しい申告が出ている）。
-                # **消せていないものを「無い」と答えない。** 資源が空きに見えて
-                # 他セッションが取りにくる。読めた事実のほうを残す。
-                loaded.append((path, entry))
-                continue
-            loaded.append((path, entry))
-        return loaded
-
-    def list_joins(self, resource_id: str) -> list[Entry]:
-        """その資源への相乗り申告を読む。読めなかったものは飛ばす。"""
-        return [entry for _, entry in self._load_joins() if entry.resource == resource_id]
-
-    def list_all_joins(self) -> list[Entry]:
-        """全ての相乗り申告を読む。資源の一覧を作るときに使う。"""
-        return [entry for _, entry in self._load_joins()]
-
-    def list_all_joins_detailed(self) -> tuple[list[Entry], bool]:
-        """全ての相乗り申告と、**読めなかったものがあったか**を返す。"""
-        joins = [entry for _, entry in self._load_joins()]
-        return joins, self._joins_unreadable
-
-    def declared_here(self, resource_id: str, cwd: str) -> bool:
-        """**この場所から自分が出した相乗り**があるか。
-
-        **ファイル名で判定しない。** 鍵の構成（資源 + cwd + session_id +（ラッパーなら）
-        nonce）は運用の都合で変わる。実際、ラッパー経由の申告に nonce を足したときに
-        「パスが一致するか」で見ていた 3 箇所が**すべて恒偽**になり、そのうち 1 つは
-        ``rb release`` の曖昧判定だった——主宣言と相乗りが両方あるのに「相乗りは無い」と
-        読み、**走行中の主宣言を黙って解放する**経路になっていた。
-
-        中身（宣言された cwd）で見れば、鍵をどう変えても壊れない。
-        """
-        here = os.path.normcase(os.path.normpath(cwd))
-        for _, entry in self._load_joins():
-            if entry.resource != resource_id:
-                continue
-            if not self.owns(entry, cwd=cwd, session_id=platform_info.session_id()):
-                continue
-            declared = str(entry.holder.get("cwd") or "")
-            if declared and os.path.normcase(os.path.normpath(declared)) == here:
-                return True
-        return False
-
-    def remove_join(self, resource_id: str, cwd: str, *, reason: str) -> bool:
-        """指定した作業ディレクトリの相乗り申告を取り下げる（パスの完全一致）。
-
-        **テスト専用に近い。** 実運用の経路は :meth:`remove_own_join`（中身で選ぶ）で
-        あり、こちらはファイル名で指すので鍵の構成に依存する。
-        """
-        result, error = _unlink_with_retry(
-            self.join_path(resource_id, cwd, platform_info.session_id())
-        )
-        if result is RemovalResult.FAILED:
-            self.audit("join_remove_failed", resource=resource_id, error=error)
-        if result is not RemovalResult.REMOVED:
-            return False
-        self.audit("join_removed", resource=resource_id, cwd=cwd, reason=reason)
-        return True
-
-    def find_own_join(
-        self, resource_id: str, cwd: str, *, expect_nonce: str | None = None
-    ) -> tuple[Path, Entry] | None:
-        """自分の相乗り申告を**探すだけ**。消さない。
-
-        照合は主宣言（:meth:`owns`）と**同じ規則**にする。パスの完全一致だけにすると、
-        申告したときと違うディレクトリから ``release`` したときに
-        ``join_path`` のキーが変わって自分の申告を外せない。主宣言は祖先関係を
-        許すのに相乗りだけ完全一致、という非対称は使う側から見て説明できない。
-
-        ただし**完全一致を先に試す**。祖先関係だけで選ぶと、宣言者の cwd が自分の
-        祖先でありさえすればどれでも一致するため、ハブのルートから出された**他人の**
-        相乗りを配下の全セッションが外せてしまう。祖先候補が複数あるときは
-        ``declared_cwd`` が最長（＝最も自分に近い）ものを選ぶ。同じ理由で、
-        自分がまさにその場所から出した申告があるなら、それ以外を選ぶ理由は無い。
-
-        探索と削除を分けてあるのは、呼び出し側が**消す前に候補の有無を知る**必要が
-        あるためである（``rb release`` は主宣言と相乗りの両方が候補になるとき、
-        どちらも消さずに指定を求める。DESIGN.md「Ownership」）。
-
-        Returns
-        -------
-        tuple of (Path, Entry) or None
-            選んだ申告のパスと中身。候補が無ければ None。
-        """
-        loaded = [
-            (path, entry) for path, entry in self._load_joins() if entry.resource == resource_id
-        ]
-
-        if expect_nonce:
-            # **nonce を知っているなら、それだけで決める。祖先フォールバックを使わない。**
-            # 祖先まで広げると、別セッションが祖先 cwd から出した申告が候補に入り、
-            # 自分の申告が既に消えている場面（--force や再起動掃除の後）で
-            # **他人の生きた申告を選ぶ**。
-            return next(((p, e) for p, e in loaded if e.nonce == expect_nonce), None)
-
-        # **ファイル名ではなく宣言された cwd で見る。** 鍵にラッパーの nonce が入って
-        # からは、パスの一致は成立しない（それに気づかず 1 周、この分岐は恒偽だった）。
-        here = os.path.normcase(os.path.normpath(cwd))
-        candidates = [
-            (path, entry)
-            for path, entry in loaded
-            if self.owns(entry, cwd=cwd, session_id=platform_info.session_id())
-        ]
-        for path, entry in candidates:
-            declared = str(entry.holder.get("cwd") or "")
-            if declared and os.path.normcase(os.path.normpath(declared)) == here:
-                return (path, entry)
-        if candidates:
-            # 最も近い祖先を選ぶ。declared_cwd が長いほど自分に近い。
-            return max(candidates, key=lambda item: len(str(item[1].holder.get("cwd") or "")))
-        return None
-
-    def remove_own_join(
-        self, resource_id: str, cwd: str, *, reason: str, expect_nonce: str | None = None
-    ) -> Entry | None:
-        """自分の相乗り申告を取り下げる。選び方は :meth:`find_own_join` と同じ。
-
-        Returns
-        -------
-        Entry or None
-            取り下げた申告。外せるものが無ければ None。**bool ではなく申告そのものを返す**
-            のは、呼び出し側が「どの場所から出された申告を消したか」を表示できるように
-            するためである。祖先フォールバックで他人の申告を消したとき、誤爆が
-            目視できなければ気づく手段が無い。
-        """
-        chosen = self.find_own_join(resource_id, cwd, expect_nonce=expect_nonce)
-        if chosen is None:
-            return None
-
-        path, entry = chosen
-
-        # **捕まえてから確かめて消す（CAS）。** 読んでから消すまでの間に、別プロセスが
-        # 同じ名前を消して作り直しうる。無条件の unlink は、そこで**新しい生きた申告**を
-        # 消す。同じ競合を `_load_joins` では塞いでいるのに、利用者が実際に通る経路
-        # （`rb release --join` と `rb run --join` の後始末）だけ素通しだった。
-        #
-        # **分岐は `expect_nonce` の有無ではなく、選んだ候補が nonce を持つかで行う。**
-        # 手動の `rb release --join` は nonce を知らないが、選んだ候補は持っている。
-        # 前者で分けると、候補選択を変えずに原子性だけ足すことができない。
-        if entry.nonce:
-            result = self._capture_and_remove(
-                path,
-                expect_nonce=entry.nonce,
-                resource_id=resource_id,
-                reason=reason,
-                audit_as=None,
-            )
-            if result is RemovalResult.REMOVED:
-                self.audit("join_removed", resource=resource_id, cwd=cwd, reason=reason)
-                return entry
-            return None
-
-        result, error = _unlink_with_retry(path)
-        if result is RemovalResult.FAILED:
-            self.audit("join_remove_failed", resource=resource_id, error=error)
-            return None
-        if result is RemovalResult.REMOVED:
-            self.audit("join_removed", resource=resource_id, cwd=cwd, reason=reason)
-            return entry
-        return None
-
-    def remove_joins(self, resource_id: str, *, reason: str) -> int:
-        """その資源の相乗り申告を**全て**取り下げる。消せた件数を返す。
-
-        ``release --force`` から使う。主宣言だけ強制解放できても、残った相乗りが
-        資源を「使用中」に固定し続けるため、掃除する手段が無いことになる。
-        """
-        removed = 0
-        for path, entry in self._load_joins():
-            if entry.resource != resource_id:
-                continue
-            result, error = _unlink_with_retry(path)
-            if result is RemovalResult.REMOVED:
-                removed += 1
-                self.audit("join_removed", resource=resource_id, reason=reason)
-            elif result is RemovalResult.FAILED:
-                self.audit("join_remove_failed", resource=resource_id, error=error)
-        return removed
-
     def replace(
         self, entry: Entry, *, reason: str, expect_nonce: str | None = None
     ) -> UpdateResult:
         """既存のエントリを差し替える。取得ではなく**更新**である。
 
-        ``try_claim`` と違い ``O_EXCL`` は使わない。ここは資源の取得ではなく、
-        既に持っている宣言の書き換えだからである。取り違えないよう、
-        **資源の取得は ``try_claim`` だけ**が担う。
+        ``declare`` と違い ``O_EXCL`` は使わない。ここは宣言を増やすのではなく、
+        既に出している宣言の書き換えだからである。取り違えないよう、
+        **宣言を増やすのは ``declare`` だけ**が担う。
 
         Parameters
         ----------
@@ -1393,13 +1113,15 @@ class Board:
         nonce の持ち主が既にいないので、``rb release --force`` でしか消せない。
         照合が防ぐのは「古い内容で新しい宣言を潰す」向きだけであり、この向きは防げない。
         """
-        if expect_nonce is not None:
-            current = self.read(entry.resource)
-            if current is None or current.nonce != expect_nonce:
-                self.audit("update_conflict", resource=entry.resource, expected=expect_nonce)
-                return UpdateResult.CONFLICT
+        # **書き換える 1 件を中身で引く。** 場所を名前から組み立てない（旧い置き場に
+        # ある宣言も同じ経路で書き換えられる、という副次的な利点もある）。
+        wanted = expect_nonce if expect_nonce is not None else entry.nonce
+        found = [path for path, e in self.pairs_for(entry.resource) if e.nonce == wanted]
+        if expect_nonce is not None and not found:
+            self.audit("update_conflict", resource=entry.resource, expected=expect_nonce)
+            return UpdateResult.CONFLICT
 
-        path = self.path_for(entry.resource)
+        path = found[0] if found else self.declaration_path(entry.nonce)
         try:
             self.entries_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -1425,27 +1147,20 @@ class Board:
         self.audit("updated", resource=entry.resource, reason=reason)
         return UpdateResult.REPLACED
 
-    def remove(self, resource_id: str, *, reason: str) -> bool:
-        """エントリを削除する。消せたときだけ True。理由は監査ログに残す。
+    def remove_all(self, resource_id: str, *, reason: str) -> int:
+        """その資源の宣言を**全部**消す。消せた件数を返す。``--force`` の実体である。
 
-        「無かった」と「消せなかった」を区別する必要があるときは
-        :meth:`remove_detailed` を使う。
+        所有を見ない。見ないことが ``--force`` の意味である。
         """
-        return self.remove_detailed(resource_id, reason=reason) is RemovalResult.REMOVED
-
-    def remove_detailed(self, resource_id: str, *, reason: str) -> RemovalResult:
-        """エントリを削除し、結果を 3 値で返す。
-
-        Windows では他プロセスが読んでいる最中の削除が共有違反になる。フックが
-        全セッションの全プロンプトで掲示板を読むため、「消せなかった」は実際に起こる。
-        「無かった」と畳むと、呼び出し側が嘘の説明を出すことになる。
-        """
-        result, error = _unlink_with_retry(self.path_for(resource_id))
-        if result is RemovalResult.REMOVED:
-            self.audit("removed", resource=resource_id, reason=reason)
-        elif result is RemovalResult.FAILED:
-            self.audit("remove_failed", resource=resource_id, error=error)
-        return result
+        removed = 0
+        for path, entry in self.pairs_for(resource_id):
+            result, error = _unlink_with_retry(path)
+            if result is RemovalResult.REMOVED:
+                removed += 1
+                self.audit("removed", resource=resource_id, job=entry.job, reason=reason)
+            elif result is RemovalResult.FAILED:
+                self.audit("remove_failed", resource=resource_id, error=error)
+        return removed
 
     def audit(self, event: str, **fields: object) -> None:
         """監査ログに 1 行追記する。失敗しても黙って諦める。"""

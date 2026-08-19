@@ -41,8 +41,15 @@ def claim(tmp_path: Path, *extra: str, eta: str = "30m") -> int:
 
 
 def row(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
+    """その資源の**最初の宣言**を機械可読な形で取り出す。
+
+    平坦化で資源ごとの行は ``declarations`` の配列を持つようになった。1 件だけを
+    見たいテストのための入り口である。
+    """
     run(tmp_path, "status", "GPU0", "--json")
-    return json.loads(capsys.readouterr().out)["resources"][0]
+    resource = json.loads(capsys.readouterr().out)["resources"][0]
+    declarations = resource["declarations"]
+    return {**resource, **(declarations[0] if declarations else {})}
 
 
 # --- ETA -------------------------------------------------------------------------
@@ -331,7 +338,7 @@ def hold(tmp_path: Path, *, sharing: str = "") -> None:
         cwd=str(tmp_path / "other-session"),
         sharing=sharing,
     )
-    assert board.try_claim(entry)
+    assert board.declare(entry)
 
 
 def test_refusal_shows_the_holders_sharing_flag(
@@ -411,185 +418,7 @@ def test_refusal_without_a_sharing_flag_still_points_somewhere(
 # --- 相乗りも振り返りの対象にする -------------------------------------------------
 
 
-def test_history_includes_joins(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """相乗りで走ったジョブも申告と実績を突き合わせられる。
-
-    落とすと、相乗りだけ振り返りの材料が無い。見積もりを上げたいのは同じである。
-    """
-    base = clock.now()
-    board = Board(tmp_path)
-    assert board.try_claim(build_entry(normalize("GPU0"), job="主宣言", session="folnet"))
-
-    monkeypatch.setattr(clock, "now", lambda: base)
-    joined = build_entry(normalize("GPU0"), job="相乗り学習", session="malm", eta="20m")
-    assert board.add_join(joined, str(tmp_path / "malm"))
-
-    monkeypatch.setattr(clock, "now", lambda: base + timedelta(minutes=10))
-    assert board.remove_join(normalize("GPU0"), str(tmp_path / "malm"), reason="rb run の終了")
-    capsys.readouterr()
-
-    assert run(tmp_path, "history", "GPU0") == 0
-    out = capsys.readouterr().out
-
-    assert "相乗り" in out
-    assert "相乗り学習" in out
-    assert "20m" in out  # 申告
-    assert "0.50 倍" in out  # 実績 10m / 申告 20m
-
-
-def test_history_matches_joins_by_working_directory(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """同じ資源への相乗りが複数あっても取り違えない。
-
-    相乗りは何人でも入れるので、資源だけで対応させると**別セッションの取り下げを
-    自分の申告に結び付ける**。実所要が実際と無関係な値になる。
-    ここでは B が先に抜けるので、資源だけで見ると A の実績が B の分になる。
-    """
-    resource = normalize("GPU0")
-    board = Board(tmp_path)
-    assert board.try_claim(build_entry(resource, job="主宣言", session="folnet"))
-    base = clock.now()
-
-    def at(minutes: int) -> None:
-        monkeypatch.setattr(clock, "now", lambda: base + timedelta(minutes=minutes))
-
-    at(0)
-    assert board.add_join(build_entry(resource, job="A", session="a"), str(tmp_path / "a"))
-    at(1)
-    assert board.add_join(build_entry(resource, job="B", session="b"), str(tmp_path / "b"))
-    at(3)
-    assert board.remove_join(resource, str(tmp_path / "b"), reason="B の終了")
-    at(30)
-    assert board.remove_join(resource, str(tmp_path / "a"), reason="A の終了")
-    capsys.readouterr()
-
-    assert run(tmp_path, "history", "GPU0", "--json") == 0
-    claims = json.loads(capsys.readouterr().out)["claims"]
-
-    elapsed = {c["job"]: c["elapsed_seconds"] for c in claims if c["event"] == "joined"}
-    assert elapsed == {"A": 30 * 60, "B": 2 * 60}
-
-
-def test_a_join_records_the_same_fields_as_a_claim(tmp_path: Path) -> None:
-    """相乗りの監査記録に ETA と見積もりが残る。
-
-    主宣言と同じ項目を残さないと、相乗りだけ history で突き合わせられない。
-    """
-    board = Board(tmp_path)
-    assert board.try_claim(build_entry(normalize("GPU0"), job="主宣言", session="folnet"))
-    entry = build_entry(
-        normalize("GPU0"), job="相乗り", session="malm", eta="20m", peak="VRAM 2GB", sharing="可"
-    )
-    assert board.add_join(entry, str(tmp_path / "malm"))
-
-    events = [
-        json.loads(line)
-        for path in sorted((tmp_path / "audit").glob("*.jsonl"))
-        for line in path.read_text(encoding="utf-8").splitlines()
-    ]
-    (joined,) = [e for e in events if e.get("event") == "joined"]
-
-    assert joined["eta"]["stated"] == "20m"
-    assert joined["usage"]["peak"] == "VRAM 2GB"
-    assert joined["sharing"] == "可"
-
-
 # --- 相乗りの合計超過を隠さない ---------------------------------------------------
-
-
-def test_joining_shows_everyone_already_in(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """相乗りした直後に、**今入っている全員**を見積もり付きで出す。
-
-    相乗りには取得の排他が無い。それは欠陥ではなく目的である（何人でも入れるための
-    仕組み）。しかしその帰結として、各自が「空きを確かめてから入る」を守っても、
-    **同時に入れば合計は超過する**。実測: 「残り 5GB まで可」の資源へ 3GB のつもりの
-    4 者が同時に入り、合計 12GB になった。全員が正しく振る舞っている。
-
-    本ツールはこれを防げない（単位も尺度も資源ごとに違い、足し算にはその資源を知る
-    必要がある）。**防げない代わりに隠さない。**
-    """
-    board = Board(tmp_path)
-    assert board.try_claim(
-        build_entry(
-            normalize("GPU0"),
-            job="本命の学習",
-            session="holder",
-            cwd=str(tmp_path / "holder"),
-            peak="VRAM 3GB",
-            sharing="可（VRAM 残 5GB まで）",
-        )
-    )
-    先客 = build_entry(normalize("GPU0"), job="先に入った相乗り", session="first", peak="VRAM 3GB")
-    assert board.add_join(先客, str(tmp_path / "first"))
-    capsys.readouterr()
-
-    assert (
-        run(
-            tmp_path,
-            "join",
-            "--res",
-            "GPU0",
-            "--job",
-            "あとから入る相乗り",
-            "--observed",
-            "nvidia-smi: 残り 5GB",
-            "--eta",
-            "20m",
-            "--peak",
-            "VRAM 3GB",
-        )
-        == 0
-    )
-    out = capsys.readouterr().out
-
-    # 主宣言も先客も自分も、見積もり付きで見えること。
-    assert "本命の学習" in out
-    assert "先に入った相乗り" in out
-    assert "あとから入る相乗り" in out
-    assert out.count("VRAM 3GB") >= 3
-
-
-def test_joining_does_not_add_up_the_estimates(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """**足し算をしない**ことを明示する。
-
-    足し算をした瞬間、単位を知ることになる（VRAM の GB、CPU のコア数、
-    API のリクエスト毎分）。judgment はセッションに残す。
-    """
-    board = Board(tmp_path)
-    assert board.try_claim(
-        build_entry(normalize("GPU0"), job="本命", session="holder", peak="VRAM 3GB")
-    )
-    capsys.readouterr()
-
-    assert (
-        run(
-            tmp_path,
-            "join",
-            "--res",
-            "GPU0",
-            "--job",
-            "相乗り",
-            "--observed",
-            "調べた",
-            "--eta",
-            "20m",
-            "--peak",
-            "VRAM 3GB",
-        )
-        == 0
-    )
-    out = capsys.readouterr().out
-
-    assert "足し算しない" in out
-    assert "自分で確かめる" in out
-    assert "rb release --join" in out  # 降りる道を示す
 
 
 def test_a_declared_timestamp_cannot_override_the_machine_one() -> None:

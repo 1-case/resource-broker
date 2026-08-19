@@ -28,7 +28,6 @@ from . import clock, liveness, naming, platform_info, runner, waiting
 from .board import (
     Board,
     Entry,
-    JoinResult,
     LockState,
     RemovalResult,
     UpdateResult,
@@ -61,29 +60,47 @@ SPAWN: runner.Spawn = runner.default_spawn
 
 def assess(
     board: Board, resource_id: str, observation: Observation | None = None
-) -> tuple[Verdict, Entry | None]:
-    """資源の状態を判定する。掲示板・OS 情報・申告された実測を liveness に渡す。
+) -> list[tuple[Verdict, Entry]]:
+    """その資源の宣言を**1 件ずつ**判定する。古い順に返す。
+
+    **どれが先に取ったかで扱いを変えない。** 宣言は対等であり、生きているか幽霊かは
+    それぞれの ``since`` / ``boot`` / PID で決まる。役割を持たせていた頃は、
+    片方（主宣言）が消えるともう片方（相乗り）の意味が変わってしまい、走っている
+    作業がいるのに「空き」と答える経路になっていた。
 
     Parameters
     ----------
-    board : Board
-        掲示板。
-    resource_id : str
-        正規化済みの資源 ID。
     observation : Observation, optional
         セッションが調べた結果。省略時は「調べていない」として扱う。
         **本関数は資源を調べない**。資源の種別で分岐する箇所はここに存在しない。
+        実測は資源の状態であって宣言ごとの状態ではないので、**全ての宣言に同じ値を
+        渡す**（「使用中」は誰か 1 人でも生きていれば真、という向きで効く）。
     """
-    entry = board.read(resource_id)
-    verdict = liveness.judge(
-        has_entry=entry is not None,
-        since=entry.since_dt if entry else None,
-        boot=platform_info.boot_time(),
-        observation=observation or Observation(),
-        pid_alive=platform_info.pid_alive(entry.pid) if entry else None,
-        now=clock.now(),
-    )
-    return verdict, entry
+    now = clock.now()
+    boot = platform_info.boot_time()
+    judged: list[tuple[Verdict, Entry]] = []
+    for entry in board.list_for(resource_id):
+        verdict = liveness.judge(
+            has_entry=True,
+            since=entry.since_dt,
+            boot=boot,
+            observation=observation or Observation(),
+            pid_alive=platform_info.pid_alive(entry.pid),
+            now=now,
+        )
+        judged.append((verdict, entry))
+    return judged
+
+
+def live_declarations(
+    board: Board, resource_id: str, observation: Observation | None = None
+) -> list[Entry]:
+    """幽霊と判定されなかった宣言だけを古い順に返す。"""
+    return [
+        e
+        for verdict, e in assess(board, resource_id, observation)
+        if not liveness.is_free(verdict)
+    ]
 
 
 def _known_resources(board: Board) -> list[str]:
@@ -94,22 +111,18 @@ def _known_resources(board: Board) -> list[str]:
 def _known_resources_detailed(board: Board) -> tuple[list[str], bool]:
     """掲示板に載っている資源と、**読めなかったものがあったか**を返す。
 
-    主宣言だけでなく**相乗りだけが残っている資源**も拾う。主宣言が先に解放されて
-    相乗りが残る場合があり、そこを取りこぼすと「誰も使っていない」に見えてしまう。
-
     読めなかったことを畳まない。畳むと「掲示板は空です」と断定してしまい、
     **実際には使われている資源を空きとして配る**（DESIGN.md「Liveness Judgment」の
     非対称性の裏返しであり、断定してよい側ではない）。
     """
     entries, unreadable = board.list_all_detailed()
-    resources = [entry.resource for entry in entries]
-    seen = set(resources)
-    joins, joins_unreadable = board.list_all_joins_detailed()
-    for join in joins:
-        if join.resource not in seen:
-            seen.add(join.resource)
-            resources.append(join.resource)
-    return resources, unreadable or joins_unreadable
+    resources: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if entry.resource not in seen:
+            seen.add(entry.resource)
+            resources.append(entry.resource)
+    return resources, unreadable
 
 
 @dataclass(frozen=True)
@@ -133,9 +146,11 @@ class Acquisition:
 
 
 def _describe(entry: Entry) -> dict[str, object]:
-    """1 つの宣言を機械可読な形にする。相乗りも同じ形で並べる。"""
+    """1 つの宣言を機械可読な形にする。**全ての宣言が同じ形である。**"""
     return {
         "holder": entry.holder,
+        "display": entry.display,
+        "held_for_seconds": _held_seconds(entry),
         "job": entry.job,
         "since": entry.since,
         "log": entry.log,
@@ -155,46 +170,30 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
     rows = []
     for resource_id in targets:
-        verdict, entry = assess(board, resource_id)
-        joins = board.list_joins(resource_id)
-        # **「空き」と「誰も使っていない」は別の問いである。** 2 つに分けて両方載せる。
-        #
-        # free     : 主宣言の枠が取れるか。相乗りは影響しない（相乗りがあっても
-        #            主宣言は取れる）。`claim` の可否と一致する
-        # occupied : 誰か 1 人でも宣言しているか（主宣言または相乗り）。表示と
-        #            フックの絞り込みはこちらを使う。相乗りだけが残った資源を
-        #            「空き」と出すと、実際に使っている者がいるのに通知から消える
-        free = liveness.is_free(verdict)
-        occupied = (not free) or bool(joins)
+        judged = assess(board, resource_id)
+        living = [e for verdict, e in judged if not liveness.is_free(verdict)]
+        # **「空き」と「誰も使っていない」は同じ問いになった。** 役割が無いので、
+        # 生きた宣言が 1 件でもあれば使用中、無ければ空きである。分けていた頃は
+        # 「主宣言の枠は空いているが相乗りがいる」という状態があり、そこが
+        # 「空き」に見えることが事故の元だった。
+        occupied = bool(living)
+        first = living[0] if living else None
         rows.append(
             {
-                "joins": [_describe(join) for join in joins],
-                "holders": (1 if entry else 0) + len(joins),
-                "has_primary": entry is not None,
                 "resource": resource_id,
-                "display": (entry.display if entry else "") or naming.display_default(resource_id),
+                "display": (first.display if first else "") or naming.display_default(resource_id),
                 # 一覧の見出し。**資源 ID を必ず含める**（display による置き換えを許さない）。
-                "label": naming.label(resource_id, entry.display if entry else ""),
-                "verdict": str(verdict),
-                "reason": (
-                    liveness.explain(verdict)
-                    if entry is not None
-                    else f"主宣言は無いが相乗りが {len(joins)} 件ある"
-                )
-                if occupied
-                else liveness.explain(verdict),
-                "free": free,
+                "label": naming.label(resource_id, first.display if first else ""),
                 "occupied": occupied,
-                "holder": entry.holder if entry else None,
-                "since": entry.since if entry else None,
-                # 宣言してからの経過。**表示のためだけの値**であり、判断には使わない。
-                # 長く持っていることは幽霊である証拠にならない。
-                "held_for_seconds": _held_seconds(entry) if entry else None,
-                "log": entry.log if entry else None,
-                "observed": entry.observed if entry else None,
-                "eta": entry.eta if entry else None,
-                "usage": entry.usage if entry else None,
-                "sharing": (entry.sharing or None) if entry else None,
+                "holders": len(living),
+                "declarations": [_describe(entry) for entry in living],
+                "reason": (
+                    f"{len(living)} 件の宣言がある"
+                    if occupied
+                    else liveness.explain(judged[0][0])
+                    if judged
+                    else "宣言が無い"
+                ),
             }
         )
 
@@ -217,62 +216,45 @@ def _cmd_status(args: argparse.Namespace) -> int:
         print("注意: 掲示板の一部を読めませんでした。**これで全部とは限りません**")
 
     for row in rows:
-        # 表示は occupied（誰か 1 人でも宣言しているか）で決める。
         mark = "使用中" if row["occupied"] else "空き"
         print(f"{row['label']:<24} {mark:<6} {row['reason']}")
-        holder = row["holder"] or {}
-        if holder:
-            job = holder.get("job") or "(ジョブ未記入)"
-            print(f"{'':<24} 宣言   {holder.get('session', '?')} / {job}")
-            held = row["held_for_seconds"]
-            elapsed = f"（{_format_duration(held)} 経過）" if held is not None else ""
-            print(f"{'':<24} since  {row['since']}{elapsed}")
-        eta = row["eta"] or {}
-        if eta.get("stated"):
-            at = f"（{eta['at']} 頃）" if eta.get("at") else ""
-            print(f"{'':<24} ETA    {eta['stated']}{at}  ※申告であって約束ではない")
-        usage = row["usage"] or {}
-        if usage.get("peak") or usage.get("avg"):
-            print(
-                f"{'':<24} 見積   瞬時最大 {usage.get('peak') or '-'}"
-                f" / 平均 {usage.get('avg') or '-'}"
-            )
-        if row["sharing"]:
-            print(f"{'':<24} 相乗り {row['sharing']}")
-        if row["log"]:
-            print(f"{'':<24} log    {row['log']}")
-        observed = row["observed"] or {}
-        if observed.get("note"):
-            print(f"{'':<24} 観測   {observed['note']}")
-            print(f"{'':<24}        （{observed.get('at', '時刻不明')} 時点の申告）")
 
-        for index, join in enumerate(row["joins"], start=1):
-            holder = join["holder"] or {}
-            # **PID を出す。** 相乗りの自動回収は無い（退去の根拠を 3 つから増やさない）
-            # ので、死んだ申告を見分けて `rb release --join` を選ぶのは読む側の仕事に
-            # なる。記録してあるのに読めない場所に置いたままでは、記録した意味が無い。
+        # **宣言を古い順に並べるだけ。** 役割で分けない——どれが先かは since に出ている。
+        for index, declaration in enumerate(row["declarations"], start=1):
+            holder = declaration["holder"] or {}
+            job = declaration["job"] or "(ジョブ未記入)"
+            # **PID を出す。** 自動回収は「猶予経過 + 実測空き + PID 死亡」の 3 条件が
+            # 揃ったときだけで、揃わない宣言は残る。どれが死んでいるかを読む側が
+            # 見分けられないと、記録している意味が無い。
             pid = holder.get("pid")
             marker = f" (pid {pid})" if isinstance(pid, int) and not isinstance(pid, bool) else ""
-            print(f"{'':<24} 相乗り{index} {holder.get('session', '?')}{marker} / {join['job']}")
-            print(f"{'':<24}        since {join['since']}")
-            join_eta = join["eta"] or {}
-            if join_eta.get("stated"):
-                print(f"{'':<24}        ETA {join_eta['stated']}")
-            join_usage = join["usage"] or {}
-            if join_usage.get("peak") or join_usage.get("avg"):
-                print(
-                    f"{'':<24}        見積 瞬時最大 {join_usage.get('peak') or '-'}"
-                    f" / 平均 {join_usage.get('avg') or '-'}"
-                )
-            if join["log"]:
-                print(f"{'':<24}        log {join['log']}")
+            print(f"{'':<24} 宣言{index}  {holder.get('session', '?')}{marker} / {job}")
 
-        if row["holders"] > 1 or (row["joins"] and not row["has_primary"]):
-            primary = 1 if row["has_primary"] else 0
-            print(
-                f"{'':<24} 合計   {row['holders']} 件の宣言"
-                f"（主 {primary} + 相乗り {len(row['joins'])}）"
-            )
+            held = declaration["held_for_seconds"]
+            elapsed = f"（{_format_duration(held)} 経過）" if held is not None else ""
+            print(f"{'':<24}        since {declaration['since']}{elapsed}")
+
+            eta = declaration["eta"] or {}
+            if eta.get("stated"):
+                at = f"（{eta['at']} 頃）" if eta.get("at") else ""
+                print(f"{'':<24}        ETA {eta['stated']}{at}  ※申告であって約束ではない")
+            usage = declaration["usage"] or {}
+            if usage.get("peak") or usage.get("avg"):
+                print(
+                    f"{'':<24}        見積 瞬時最大 {usage.get('peak') or '-'}"
+                    f" / 平均 {usage.get('avg') or '-'}"
+                )
+            if declaration["sharing"]:
+                print(f"{'':<24}        共有 {declaration['sharing']}")
+            if declaration["log"]:
+                print(f"{'':<24}        log {declaration['log']}")
+            observed = declaration["observed"] or {}
+            if observed.get("note"):
+                print(f"{'':<24}        観測 {observed['note']}")
+                print(f"{'':<24}             （{observed.get('at', '時刻不明')} 時点の申告）")
+
+        if row["holders"] > 1:
+            print(f"{'':<24} 合計   {row['holders']} 件の宣言")
     return EXIT_OK
 
 
@@ -290,113 +272,77 @@ def acquire(
     display: str = "",
     log: str | None = None,
     force: bool = False,
+    share: bool = False,
     pid: int | None = None,
 ) -> Acquisition:
-    """宣言を取得する。``claim`` と ``run`` で共通の判断である。
+    """宣言を 1 件出す。``claim`` と ``run`` で共通の判断である。
+
+    **断る根拠は「誰が先に取ったか」ではない。** 根拠は 2 つあり、どちらも実測と
+    申告から出る。(1) 自分で ``--found busy`` と申告した（実測が使用中なら単独で
+    確定する）。(2) 生きた宣言があるのに ``--found free`` と申告した（**「空き」は
+    宣言を退ける根拠にならない**——宣言はジョブが資源を掴む前に出る）。
+
+    ``--share`` は「既に使われていることを承知で並ぶ」という**意思表示**であって、
+    掲示板には**役割として記録されない**。宣言が 1 件増えるだけである。どれが先に
+    取ったかは ``since`` に出ているので、記録する必要が無い。
 
     Parameters
     ----------
     pid : int, optional
         宣言者として記録する PID。**手動の ``claim`` では渡さない**。
-        渡してよいのはラッパー（``run``）だけで、そこではラッパー自身が
-        ジョブと同じ寿命を持つため生存確認が意味を持つ。
-
-    Returns
-    -------
-    Acquisition
-        取得できたエントリ・終了コード・掲示板に残せたか。
+        すぐ終わる CLI プロセスの PID を記録すると、幽霊判定が「死んでいる」を
+        返すだけの材料になる。
     """
-    # 自分で調べて使用中だったのなら、掲示板を読むまでもなく宣言してはならない。
-    if observation.busy is True:
-        print("自分の調査で使用中と分かっているため宣言できません", file=sys.stderr)
-        print(f"  観測  : {observation.note}", file=sys.stderr)
-        return Acquisition(None, EXIT_BUSY)
-
-    # **排他区間の中で I/O をしない。** ここで stderr へ直接書くと、パイプが詰まったときに
-    # ロックを 30 秒以上保持し、他セッションに steal される。文言は溜めて区間の外で出す。
     notices: list[str] = []
-    # 監査も同じ理由で溜める。ファイルへの追記は区間の外で行う。
-    deferred_audit: list[tuple[str, dict[str, object]]] = []
+    with board.locked(resource_id) as lock:
+        if lock is not LockState.ACQUIRED:
+            # **囲えなくても続行する。** ロックは競り合いを減らすだけで、正しさは
+            # nonce の CAS が担保している（DESIGN.md「Locking」）。
+            board.audit("claim_unlocked", resource=resource_id, lock=str(lock))
 
-    def under_lock(lock: LockState) -> Acquisition:
-        """ロックを保持したまま行う判断。**正しさはロックではなく CAS に乗る。**
+        judged = assess(board, resource_id, observation)
+        ghosts = [e for verdict, e in judged if liveness.is_free(verdict)]
+        living = [e for verdict, e in judged if not liveness.is_free(verdict)]
 
-        **ロックが取れないことを理由に諦めない。** どちらの取れなさも、資源が使用中で
-        あるという証拠を 1 バイトも含んでいない（掲示板をまだ読んでいない）。ここで
-        ``EXIT_BUSY`` を返すと 2 つの嘘をつくことになる。他セッションが ``release``
-        の最中でもロックは握られるので**資源が今まさに空こうとしている瞬間に「使用中」**
-        と答え、ロックを持ったままプロセスが死ねば ``LOCK_STALE_S`` のあいだ
-        **全セッションの取得が「使用中」で止まる**。本ツールの故障を資源の競合として
-        報告することは CLAUDE.md「Fail-Open」が名指しで禁じている。
-
-        続行しても安全性は落ちない。正しさは nonce の CAS と ``try_claim`` の
-        ``O_EXCL`` が担保しており、本当に競っていれば ``try_claim`` が負けて
-        **真の busy** が返る。
-        """
-        if lock is LockState.CONTENDED:
-            notices.append(
-                "[rb] 他のセッションが同じ資源を操作中です。排他を弱めて続行します"
-                "（監査ログを参照）"
-            )
-        elif lock is LockState.UNAVAILABLE:
-            notices.append("[rb] ロックが使えないため排他を弱めて続行します（監査ログを参照）")
-
-        verdict, entry = assess(board, resource_id, observation)
-
-        if entry is not None and not liveness.is_free(verdict) and not force:
-            notices.append(f"使用中のため宣言できません: {liveness.explain(verdict)}")
-            notices.append(f"  宣言者: {entry.session} / {entry.job}")
-            notices.append(f"  since : {entry.since}")
-            # **保持者が立てた旗をそのまま見せる。中身は解釈しない。**
-            # ここを出さないと、保持者が「相乗り可」と書いていても、はじかれた側には
-            # 「使用中」しか見えない。実際にあるセッションが相乗り可の GPU を諦めて CPU へ
-            # 逃げた（掲示板には可と書いてあった）。掲示板が持っている材料を
-            # **判断が必要なその場で**出せていなければ、載せていないのと同じである。
-            if entry.sharing:
-                notices.append(f"  相乗り: {entry.sharing}  ※保持者の申告")
-            if entry.log:
-                notices.append(f"  log   : {entry.log}")
-            # 可否は当事者が決める（本ツールは判断しない）。**次の一手を必ず示す。**
-            # 分岐しているのは「旗が立っているか」だけで、旗の中身では分岐しない。
-            hint = naming.display_default(resource_id)
-            notices.append(
-                f"  → 相乗りするなら rb join --res {hint} ...、空くまで待つなら rb wait {hint}"
-            )
-            deferred_audit.append(
-                (
-                    "claim_refused",
-                    {
-                        "resource": resource_id,
-                        "verdict": str(verdict),
-                        "holder": entry.session,
-                        "sharing": entry.sharing or "",
-                    },
-                )
-            )
-            return Acquisition(None, EXIT_BUSY)
-
-        # **相乗りがいることは知らせるが、止めない。** 主宣言の枠が空いていることと、
-        # 誰も資源を使っていないことは別である。相乗りしてよいかは当事者が決める
-        # （CLAUDE.md「Resource Agnosticism」/ DESIGN.md「Sharing」）。
-        joins = board.list_joins(resource_id)
-        if joins:
-            notices.append(
-                f"[rb] この資源には相乗りが {len(joins)} 件あります"
-                "（主宣言の枠は空いています。可否は当事者で決めること）"
-            )
-            notices.extend(f"  相乗り: {join.session} / {join.job}" for join in joins)
-
-        if entry is not None:
-            # **読んだ宣言と一致するときだけ消す（CAS）。** 無条件に消すと、ロックが
-            # 外れている間に A と B が同じ幽霊を見たとき、A が取り直した直後に B が
-            # **A の生きた宣言を消して**両方とも取得に成功する。二重取得そのものである。
-            reason = "強制取得" if force else f"幽霊と判定した（{liveness.explain(verdict)}）"
-            removal = board.remove_if_nonce(resource_id, expect_nonce=entry.nonce, reason=reason)
+        # **幽霊は退ける。** 根拠は 3 つのいずれかで、判定は 1 件ずつ独立している。
+        for ghost in ghosts:
+            reason = "強制取得" if force else "幽霊と判定した"
+            removal = board.remove_if_nonce(resource_id, expect_nonce=ghost.nonce, reason=reason)
             if removal not in (RemovalResult.REMOVED, RemovalResult.ABSENT):
-                # ABSENT は「読んだ直後に誰かが消した」であり、枠は空いている。
-                # 先着は次の try_claim（O_EXCL）が決めるのでそのまま進んでよい。
+                # 消せていないものを消えたことにしない。**残っている事実のほうを残す。**
                 notices.append(_explain_failed_displacement(removal))
-                return Acquisition(None, EXIT_BUSY)
+                living.append(ghost)
+
+        if force:
+            for entry in list(living):
+                if (
+                    board.remove_if_nonce(resource_id, expect_nonce=entry.nonce, reason="強制取得")
+                    is RemovalResult.REMOVED
+                ):
+                    living.remove(entry)
+
+        # **断る根拠は 2 つある。どちらも「役割」ではなく実測と申告から出る。**
+        refusal = ""
+        if found == "busy":
+            # 実測が使用中なら、それだけで確定する（DESIGN.md「Liveness Judgment」）。
+            # 掲示板が空でも同じ——誰かが宣言せずに使っている、という状態である。
+            refusal = "自分で busy と申告している"
+        elif living:
+            # 生きた宣言があるのに free と申告している。**「空き」は宣言を退ける根拠に
+            # ならない**（宣言はジョブが資源を掴む前に出る）。どちらかが古い。
+            refusal = "生きた宣言があるのに free と申告している"
+
+        if refusal and not share and not force:
+            label = naming.label(resource_id, living[0].display if living else "")
+            notices.append(f"[rb] {label} は取得できません（{refusal}）")
+            notices.extend(f"  {e.session} / {e.job}（since {e.since}）" for e in living)
+            notices.append(
+                "  承知のうえで並ぶなら --share。宣言が古いと判断したなら --force で退けること"
+            )
+            for text in notices:
+                _say(text, err=True)
+            board.audit("refused", resource=resource_id, reason=refusal, holders=len(living))
+            return Acquisition(None, EXIT_BUSY)
 
         new_entry = build_entry(
             resource_id,
@@ -410,50 +356,20 @@ def acquire(
             avg=avg,
             sharing=sharing,
         )
-        if not board.try_claim(new_entry):
-            # 誰かが先に取ったのか、掲示板が書けないのかを見分ける。
-            current = board.read(resource_id)
-            if current is not None:
-                notices.append("ほぼ同時に他セッションが宣言しました")
-                notices.append(f"  宣言者: {current.session} / {current.job}")
-                return Acquisition(None, EXIT_BUSY)
-            if board.path_for(resource_id).exists():
-                # ファイルはあるのに読めない = 壊れたエントリが居座っている。放っておくと
-                # status に出ず、wait は即座に解放と答え、claim は永久に失敗する。
-                # **人間がファイルを手で消すしか回復手段が無い状態を作らない。**
-                notices.append(
-                    "[rb] 壊れたエントリが居座っています（読めないファイルが掲示板にあります）"
-                )
-                notices.append(
-                    f"  掃除: rb release {resource_id} --force（そのあと改めて claim すること）"
-                )
-                return Acquisition(new_entry, EXIT_OK, declared=False)
-            # 掲示板に書けない。**これは資源の競合ではない**ので通す（fail-open）。
-            # ただし宣言は残っていないので、呼び出し側が嘘を言わないよう declared=False。
-            notices.append(
-                "[rb] 宣言を掲示板に残せませんでした（監査ログを参照）。作業は止めません"
-            )
-            return Acquisition(new_entry, EXIT_OK, declared=False)
+        declared = board.declare(new_entry)
+        if not declared:
+            notices.append("警告: 宣言を掲示板に残せませんでした（他セッションからは見えません）")
 
-        return Acquisition(new_entry, EXIT_OK, declared=True)
-
-    # **溜めた説明は例外が飛んでも出す。** 途中で落ちたときこそ「相乗りが N 件ある」
-    # 「排他を弱めて続行した」は読む側に必要な材料であり、そこで消えると
-    # 何も起きなかったように見える。
-    try:
-        with board.locked(resource_id) as lock:
-            result = under_lock(lock)
-    finally:
-        # **掲示板へ書いた後なので、ここで例外を出さない**（`_say` の docstring 参照）。
-        for line in notices:
-            _say(line, err=True)
-        # **はじいたことを必ず残す。** 記録が無いと「誰が GPU を諦めたか」を
-        # 後から追えない（実際に追えなかった）。判定したのに黙るのは、監視が
-        # 死んだのと区別が付かない（CLAUDE.md「Silence Is Not Success」）。
-        # Board.audit は失敗しても黙って諦めるので、finally の中で呼んでよい。
-        for event, fields in deferred_audit:
-            board.audit(event, **fields)
-    return result
+    if living:
+        notices.append(f"[rb] この資源には既に {len(living)} 件の宣言があります")
+        notices.extend(
+            f"  {e.session} / {e.job}（since {e.since}）"
+            + (f" 共有: {e.sharing}" if e.sharing else "")
+            for e in living
+        )
+    for text in notices:
+        _say(text, err=True)
+    return Acquisition(new_entry, EXIT_OK, declared=declared)
 
 
 def _say(text: str, *, err: bool = False) -> None:
@@ -471,121 +387,6 @@ def _say(text: str, *, err: bool = False) -> None:
         print(text, file=sys.stderr if err else sys.stdout)
     except Exception:  # noqa: BLE001 - 出せなかったことが作業の成否に影響してはならない
         pass
-
-
-def _print_occupants(board: Board, resource_id: str) -> None:
-    """**今この資源に入っている全員**を出す。相乗りを申告した直後に必ず呼ぶ。
-
-    相乗りには取得の排他が無い。**それは欠陥ではなく目的である**（何人でも入れるための
-    仕組みである）。しかしその帰結として、各自が「空きを確かめてから入る」を守っても、
-    **同時に入れば合計は超過する**。実測: 「残り 5GB まで可」と申告された資源へ、
-    3GB のつもりの 4 者が同時に入り、合計 12GB になった。全員が正しく振る舞っている。
-
-    本ツールはこれを防げない。``--peak`` は単位も尺度も資源ごとに違い（VRAM の GB、
-    CPU のコア数、API のリクエスト毎分）、足し算をするにはその資源を知る必要がある
-    （CLAUDE.md「Resource Agnosticism」）。**防げない代わりに、隠さない。**
-
-    読み直すのが「入れたあと」なのが要点である。入る前に読んでも、ほぼ同時に入った相手は
-    まだ載っていない。**申告し終えてから読めば、相手は必ず見える。** 見えれば降りられる。
-    """
-    primary = board.read(resource_id)
-    joins = board.list_joins(resource_id)
-    if primary is None and not joins:
-        return
-
-    _say("  現在この資源に入っている（自分を含む）:")
-    if primary is not None:
-        usage = primary.usage or {}
-        estimate = f"  見積 peak={usage.get('peak') or '-'} avg={usage.get('avg') or '-'}"
-        _say(f"    主宣言 {primary.session} / {primary.job}{estimate}")
-    for join in joins:
-        usage = join.usage or {}
-        estimate = f"  見積 peak={usage.get('peak') or '-'} avg={usage.get('avg') or '-'}"
-        _say(f"    相乗り {join.session} / {join.job}{estimate}")
-    _say("  本ツールは見積もりを足し算しない（単位も尺度も資源ごとに違う）。")
-    _say("  合計が収まるかは自分で確かめること。収まらないなら rb release --join で降りる。")
-
-
-def acquire_join(
-    board: Board, resource_id: str, args: argparse.Namespace, *, log: str
-) -> Acquisition:
-    """相乗りとして申告する。``rb run --join`` の取得側。
-
-    ``acquire`` と違い**取得の競合が無い**（相乗りは何人でも入れる）。したがって
-    ``EXIT_BUSY`` を返す経路も持たない。判断するのは「主宣言があるか」だけである。
-
-    ラッパーから相乗りできるようにしたのは、**相乗りの取り下げ忘れが主宣言より
-    危険だからである。** 相乗りの幽霊判定は ``since < 起動時刻`` しか無く、猶予も
-    PID も使わない。取り下げ忘れた相乗りは**再起動か ``--force`` まで残り続け**、
-    その資源を「使用中」に固定する。手で ``rb join`` してから手で ``rb release`` する
-    運用では、この取りこぼしが必ず起きる。
-
-    Returns
-    -------
-    Acquisition
-        ``declared`` は**このプロセスが申告を作ったか**を表す。既存の申告を
-        再利用した場合と掲示板に残せなかった場合は False にし、後始末で
-        **自分が作っていない申告を消さない**ようにする。
-    """
-    primary = board.read(resource_id)
-    if primary is None:
-        print(
-            "その資源に主宣言がありません。--join を外して主宣言として実行してください",
-            file=sys.stderr,
-        )
-        return Acquisition(None, EXIT_USAGE)
-
-    # claim と違い `--found busy` でも止めない。相乗りは使われていることが前提である。
-    #
-    # **PID を記録する。** ラッパーはジョブと同じ寿命を持つので、生存確認が意味を持つ
-    # （手動の `rb join` は記録しない。あちらを実行するのは CLI プロセスであり、
-    # すぐ終わるので生存確認が「死んでいる」を返すだけになる）。
-    #
-    # **記録するだけで、判定は増やさない。** 退去の根拠は 3 つだけである
-    # （DESIGN.md「Liveness Judgment」）。`pid_alive` は「単独の根拠にしてはならない」と
-    # 自分で宣言している材料なので、これを 4 つ目の根拠に格上げしない。
-    # ラッパーが強制終了された相乗りは `rb status` に PID が出るので、
-    # 読んだ側が `rb release --join` か `--force` を選べる。
-    entry = build_entry(
-        resource_id,
-        job=args.job,
-        display=args.display or "",
-        log=log,
-        pid=os.getpid(),
-        observed={"note": args.observed, "found": args.found},
-        eta=args.eta,
-        peak=args.peak or "",
-        avg=args.avg or "",
-        sharing=args.sharing or "",
-    )
-    result = board.add_join_detailed(entry, os.getcwd(), unique=True)
-
-    if result is JoinResult.EXISTS:
-        # 既にある申告はこのプロセスのものとは限らない。**実行は通すが取り下げない。**
-        # 消すと、同じ場所で走っている別のジョブの申告を消すことになる。
-        print(
-            "既に相乗りを申告済みです。その申告のまま実行します（終了時に取り下げません）",
-            file=sys.stderr,
-        )
-        return Acquisition(entry, EXIT_OK, declared=False)
-    if result is JoinResult.FAILED:
-        # 掲示板に書けないのは**インフラの故障**であって資源の競合ではない。
-        # 実行は通す（fail-open）が、残せていないことは隠さない。
-        print(
-            "警告: 相乗りを掲示板に残せていません。他セッションからは見えません",
-            file=sys.stderr,
-        )
-        return Acquisition(entry, EXIT_OK, declared=False)
-
-    _say(f"相乗りを申告しました: {naming.label(resource_id, entry.display)} / {entry.job}")
-    _say(f"  主宣言: {primary.session} / {primary.job}")
-    if primary.sharing:
-        _say(f"  保持者の相乗り方針: {primary.sharing}")
-    else:
-        _say("  保持者は相乗り可否を書いていません。合意が取れているか確認すること")
-    # **入れたあとに読み直す。** ほぼ同時に入った相手はここで初めて見える。
-    _print_occupants(board, resource_id)
-    return Acquisition(entry, EXIT_OK, declared=True)
 
 
 def _explain_failed_displacement(removal: RemovalResult) -> str:
@@ -664,12 +465,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
         )
         return EXIT_USAGE
 
-    if args.join and args.force:
-        # --force は「他者の主宣言を退けて取る」であり、--join は「退けずに入る」である。
-        # 併用を黙ってどちらかに倒すと、相乗りのつもりで他人の宣言を消しうる。
-        print("--join と --force は同時に指定できません", file=sys.stderr)
-        return EXIT_USAGE
-
     board = Board(args.home)
     resource_id = naming.normalize(args.res)
     observation = Observation(busy=FOUND_CHOICES.get(args.found), note=args.observed)
@@ -678,10 +473,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # 掃除すると、利用者のプロジェクト配下にある無関係な *.log を消す。
     runner.prune_own_logs(board.root)
 
-    if args.join:
-        # 相乗りとして入る。取得の競合が無いので `--force` は意味を持たない。
-        result = acquire_join(board, resource_id, args, log=str(log_path))
-    else:
+    if True:
         # ラッパーはジョブと同じ寿命を持つ。ここでだけ PID を記録する。
         result = acquire(
             board,
@@ -696,6 +488,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             display=args.display or "",
             log=str(log_path),
             force=args.force,
+            share=args.share,
             pid=os.getpid(),
         )
     entry = result.entry
@@ -715,15 +508,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # **記録できていないのに「宣言しました」と言わない。** 掲示板が書けなかった場合も
         # 実行は通す（fail-open）が、他セッションから見えない利用を成功した宣言として
         # 偽装してはならない。
-        if args.join:
-            # 相乗りの説明は acquire_join が結果に応じて既に出している。
-            # ここで `_warn_not_declared` を足すと、「既に申告済み」の場合に
-            # **掲示板に載っているのに載っていないと言う**ことになる。
-            pass
-        elif result.declared:
-            _say(f"宣言しました: {entry.display} / {entry.job}")
-        else:
-            _warn_not_declared()
         _say(f"ログ: {log_path}")
         exit_code = runner.execute(list(args.trailing), log_path, spawn=SPAWN)
         return exit_code
@@ -741,7 +525,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
             entry,
             declared=result.declared,
             exit_code=exit_code,
-            joined=args.join,
         )
 
 
@@ -752,72 +535,46 @@ def _release_after_run(
     *,
     declared: bool,
     exit_code: int | None = None,
-    joined: bool = False,
 ) -> None:
     """``rb run`` の後始末。**ここから例外を出さない。**
 
     ``finally`` の中で例外が出ると、子プロセスが 0 で終わっていても呼び出し側には
     ラッパーの故障（126）が返る。print 1 つで終了コードが変わってはならない。
 
+    **消すのは自分が出した 1 件だけ。** nonce で指すので、走行中に外部から消えて
+    いても、他セッションが同じ資源へ宣言していても、取り違えない。
+
     Parameters
     ----------
     exit_code : int, optional
         子プロセスの終了コード。**解放の理由に添えて監査ログへ残す。**
         ラッパー自身が落ちた場合は None（「分からない」であって「成功」ではない）。
-    joined : bool
-        相乗りとして入ったか。**主宣言と取り違えない。** 相乗りで走ったのに
-        主宣言を消しにいくと、他セッションの生きた宣言を消すことになる。
     """
     try:
         if not declared:
-            return  # そもそもこのプロセスは申告を作っていない。消すものが無い
+            return  # そもそもこのプロセスは宣言を作っていない。消すものが無い
 
         # 終了コードを理由に含める。**成否を解釈はしない**（0 が成功とは限らない資源もある）。
-        # 値をそのまま運び、意味づけは振り返る側に任せる。
         code = "不明" if exit_code is None else str(exit_code)
         reason = f"rb run の終了（exit={code}）"
 
-        if joined:
-            # **相乗りの取り下げ忘れは主宣言より危険である。** 幽霊判定が
-            # `since < 起動時刻` しか無いため、残ると再起動か --force まで消えない。
-            # **自分が作った申告だけを消す。** nonce を渡さないと祖先フォールバックが
-            # 他セッションの生きた申告を選びうる（cwd だけでは区別できない）。
-            removed_join = board.remove_own_join(
-                resource_id, os.getcwd(), reason=reason, expect_nonce=entry.nonce
-            )
-            if removed_join is not None:
-                print(f"相乗りを取り下げました: {naming.display_default(resource_id)}")
-            else:
-                # **「消さなかった」を「消せなかった」と混ぜない。** 走行中に外部から
-                # 消えている場合（--force、再起動掃除）に「掲示板に残っています」と
-                # 出すと嘘になり、しかもその助言（rb release --join）へ誘導してしまう。
-                _say(
-                    "相乗りを取り下げませんでした（既に掲示板に無いか、自分の申告ではありません）",
-                    err=True,
-                )
-            return
-
-        # **自分の宣言であることを確かめてから消す。** 実行中に他セッションが --force で
-        # 取り直していた場合、無条件に消すと生きた宣言を消してしまう。掲示板は空・資源は
-        # 掴まれたままという、最も検出しにくい不整合になる。
-        result = board.remove_if_owned(resource_id, reason=reason, nonce=entry.nonce)
-        if result is RemovalResult.REMOVED:
-            print(f"解放しました: {entry.display}")
-        elif result is RemovalResult.ABSENT:
-            print(f"宣言は既に掲示板にありません: {entry.display}", file=sys.stderr)
-        elif result is RemovalResult.NOT_OWNED:
-            print(
-                "解放をやめました: 宣言が自分のものではなくなっています"
-                "（実行中に他セッションが取り直した可能性）",
-                file=sys.stderr,
+        result = board.remove_own(resource_id, reason=reason, nonce=entry.nonce)
+        if result.removed:
+            _say(f"解放しました: {naming.label(resource_id, entry.display)}")
+        elif result.failed:
+            _say(
+                "警告: 宣言を取り下げられませんでした（掲示板に残っています）",
+                err=True,
             )
         else:
-            print(
-                f"解放に失敗しました: {entry.display}"
-                "（掲示板に宣言が残っています。rb release で外すこと）",
-                file=sys.stderr,
+            # **「消さなかった」を「消せなかった」と混ぜない。** 走行中に外部から
+            # 消えている場合（``--force``、再起動掃除）に「掲示板に残っています」と
+            # 出すと嘘になる。
+            _say(
+                "宣言を取り下げませんでした（既に掲示板に無いか、自分の宣言ではありません）",
+                err=True,
             )
-    except Exception:  # noqa: BLE001 - 後始末の失敗で終了コードを変えない
+    except Exception:  # noqa: BLE001 - 後始末の失敗でジョブの結果を変えない
         pass
 
 
@@ -870,11 +627,7 @@ def _cmd_wait(args: argparse.Namespace) -> int:
 
     entry = board.read(resource_id)
     if entry is None:
-        joins = board.list_joins(resource_id)
-        print(
-            f"待機します: {naming.display_default(resource_id)}"
-            f" <- 相乗り {len(joins)} 件（主宣言は無し）"
-        )
+        print(f"待機します: {naming.display_default(resource_id)}")
     else:
         print(
             f"待機します: {naming.label(resource_id, entry.display)}"
@@ -956,16 +709,13 @@ def _format_duration(seconds: float) -> str:
 
 
 def _pair_key(record: dict) -> tuple[str, str, str]:
-    """対応付けの鍵。**主宣言は資源ごと、相乗りは資源と作業ディレクトリごと。**
+    """対応付けの鍵。資源ごとに、宣言と解放を突き合わせる。
 
-    相乗りは同じ資源に何人でも入れるので、資源だけで対応させると
-    **別セッションの取り下げを自分の申告に結び付ける**。実所要が実際と無関係な値になる。
+    同じ資源に何件でも宣言が並ぶので、資源だけでは**別セッションの解放を自分の宣言に
+    結び付ける**。job も鍵に入れて、同じ資源の別の作業と混ざらないようにする。
     """
-    event = str(record.get("event", ""))
     resource = str(record.get("resource", ""))
-    if event in ("joined", "join_removed"):
-        return ("join", resource, str(record.get("cwd", "")))
-    return ("primary", resource, "")
+    return ("declaration", resource, str(record.get("job", "")))
 
 
 def _match_releases(claims: list[dict], removals: list[dict]) -> list[dict | None]:
@@ -1006,7 +756,7 @@ def _match_releases(claims: list[dict], removals: list[dict]) -> list[dict | Non
         key = _pair_key(claim)
         # 相乗りの一斉取り下げ（``rb release --force``）は cwd を持たない。自分の場所の
         # 取り下げが見つからなければ、そちらの箱も見る。
-        candidates: list[Key] = [key] if key[0] == "primary" else [key, ("join", key[1], "")]
+        candidates: list[Key] = [key]
         chosen: dict | None = None
         for candidate in candidates:
             items = pending.get(candidate, [])
@@ -1086,9 +836,9 @@ def _cmd_history(args: argparse.Namespace) -> int:
                 continue
             # **相乗りも振り返りの対象にする。** 落とすと、相乗りで走ったジョブだけ
             # 申告と実績を突き合わせられない。見積もりを上げたいのは同じである。
-            if record.get("event") in ("claimed", "joined"):
+            if record.get("event") == "claimed":
                 records.append(record)
-            elif record.get("event") in ("removed", "join_removed"):
+            elif record.get("event") == "removed":
                 removals.append(record)
         # 新しい日から順に見ているので、必要数が集まったらそれ以上は遡らない
         if len(records) >= limit:
@@ -1153,68 +903,6 @@ def _cmd_history(args: argparse.Namespace) -> int:
 
     print()
     print("同じ案件の前回の申告と実績を突き合わせ、次の申告の精度を上げること")
-    return EXIT_OK
-
-
-def _cmd_join(args: argparse.Namespace) -> int:
-    """相乗りを申告する。
-
-    **相乗りしてよいかは本ツールが決めない。** 保持者が ``--sharing`` に何を書いていようと、
-    可否は当事者の合意事項である。ここでやるのは「入ったことを見えるようにする」ことだけで、
-    黙って入られるより遥かによい。
-
-    保持者の宣言（相乗り可否・見積もり・ログ）を読んだうえで判断すること。
-    """
-    board = Board(args.home)
-    resource_id = naming.normalize(args.res)
-    primary = board.read(resource_id)
-
-    if primary is None:
-        print("その資源に宣言がありません。相乗りではなく rb claim / rb run を使ってください")
-        return EXIT_USAGE
-
-    # claim と違い、`--found busy` でも止めない。相乗りは「使われている」ことが前提だからである。
-
-    cwd = os.getcwd()
-    entry = build_entry(
-        resource_id,
-        job=args.job,
-        display=args.display or "",
-        log=args.log,
-        observed={"note": args.observed, "found": args.found},
-        eta=args.eta,
-        peak=args.peak or "",
-        avg=args.avg or "",
-        sharing=args.sharing or "",
-    )
-    # **「既にある」と「残せなかった」を畳まない。** 畳むと、mkdir・書き込み・ハードリンクの
-    # いずれが失敗しても「既に申告しています」と答えることになり、掲示板に 1 件も残って
-    # いないのに利用者を安心させる。他セッションから見えない利用が始まる。
-    result = board.add_join_detailed(entry, cwd)
-    if result is JoinResult.EXISTS:
-        print("既に相乗りを申告しています（同じ作業ディレクトリから二重には申告できません）")
-        return EXIT_OK
-    if result is JoinResult.FAILED:
-        # 掲示板に書けないのは**インフラの故障**であって資源の競合ではない。
-        # 作業は止めない（fail-open）が、成功とは言わない。
-        print(
-            "警告: 相乗りを掲示板に残せていません。他セッションからは見えません",
-            file=sys.stderr,
-        )
-        print("  掲示板が作れない・書けない可能性がある（監査ログを参照）", file=sys.stderr)
-        return EXIT_OK
-
-    # **掲示板へ書いた後なので `_say` を通す。** ここは `rb run --join` と違って
-    # try/finally が無く、print が落ちると申告だけが残って何も撤収されない。
-    # しかも `claim` の拒否メッセージがこの経路へ利用者を誘導している。
-    _say(f"相乗りを申告しました: {entry.display} / {entry.job}")
-    _say(f"  主宣言: {primary.session} / {primary.job}")
-    if primary.sharing:
-        _say(f"  保持者の相乗り方針: {primary.sharing}")
-    else:
-        _say("  保持者は相乗り可否を書いていません。合意が取れているか確認すること")
-    # **入れたあとに読み直す。** ほぼ同時に入った相手はここで初めて見える。
-    _print_occupants(board, resource_id)
     return EXIT_OK
 
 
@@ -1307,228 +995,79 @@ def _warn_if_unlocked(board: Board, resource_id: str, lock: LockState, *, event:
 
 
 def _cmd_release(args: argparse.Namespace) -> int:
-    """自分の宣言を取り下げる。主宣言が自分のものならそれを、無ければ相乗りを外す。"""
+    """宣言を取り下げる。
+
+    **選ばせるものが無い。** 役割を記録しないので「主宣言か相乗りか」という問いが
+    消えた。取り下げるのは**自分の宣言**であり、同じ資源へ並行して 2 件出していれば
+    2 件とも消える。他人のものまで消すのは ``--force`` だけである。
+    """
     board = Board(args.home)
     resource_id = naming.normalize(args.resource)
-    prefer = "primary" if args.primary else ("join" if args.join else None)
-
-    # --force は「主宣言も相乗りもまとめて消す」であり、--primary / --join は「片方を狙う」。
-    # 併用を黙って前者に倒すと、相乗りだけ外すつもりで走行中の主宣言まで消える。
-    if args.force and prefer is not None:
-        print(
-            "--force と --primary / --join は同時に指定できません"
-            "（--force は主宣言と相乗りをまとめて消します）",
-            file=sys.stderr,
-        )
-        return EXIT_USAGE
-
-    # 読んで、所有を確かめて、消すまでを排他区間にする（`update` と同じ理由）。
-    with board.locked(resource_id) as lock:
-        _warn_if_unlocked(board, resource_id, lock, event="release_unlocked")
-        if args.force:
-            return _release_forced(board, resource_id)
-        return _release_own(board, resource_id, prefer=prefer)
+    if args.force:
+        return _release_forced(board, resource_id)
+    return _release_own(board, resource_id)
 
 
 def _release_forced(board: Board, resource_id: str) -> int:
-    """``--force`` の解放。**相乗りも一緒に外す。**
+    """``--force``: その資源の宣言を**所有を問わず全部**消す。
 
-    主宣言だけ消せても、残った相乗りが資源を「使用中」に固定し続ける。
-    そうなると ``rb wait`` は二度と戻らず、フックは全セッションに出し続ける。
-    強制解放は最後の掃除手段なので、掃除しきれなければ意味がない。
-
-    **読めるかどうかを削除の条件にしない。** 以前は ``read`` が None なら消さずに
-    「見つかりませんでした」と答えていたため、JSON が壊れたエントリを消せなかった。
-    壊れたファイルは ``status`` に出ず、``wait`` は即座に解放と答え、``claim`` は
-    ``O_EXCL`` で永久に失敗する。**その資源について掲示板が恒久的に機能停止し、
-    人間がファイルを手で消すしか回復手段が無くなる**。強制解放は最後の手段なので、
-    読めないものこそ消せなければならない。
+    見ないことが ``--force`` の意味である。**何件消したかは必ず言う**（黙って
+    他人の宣言を消すと、消された側は理由の分からない消失として体験する）。
     """
-    primary = board.remove_detailed(resource_id, reason="release コマンド（強制）")
-    removed_joins = board.remove_joins(resource_id, reason="release コマンド（強制）")
-    joins_note = f"相乗り {removed_joins} 件" if removed_joins else ""
+    with board.locked(resource_id) as lock:
+        _warn_if_unlocked(board, resource_id, lock, event="force_release_unlocked")
+        before = board.list_for(resource_id)
+        removed = board.remove_all(resource_id, reason="release コマンド（強制）")
 
-    # **「消せなかった」を「無かった」と混ぜない。** 掲示板には残っている。
-    if primary is RemovalResult.FAILED:
-        print(
-            "解放に失敗しました（掲示板に主宣言が残っています。監査ログを参照）", file=sys.stderr
+    if not before:
+        _say(f"宣言はありませんでした: {naming.display_default(resource_id)}")
+        return EXIT_OK
+
+    _say(f"強制解放しました: {naming.display_default(resource_id)}（{removed} 件）")
+    for entry in before:
+        _say(f"  {entry.session} / {entry.job}（since {entry.since}）")
+    if removed < len(before):
+        _say(
+            f"警告: {len(before) - removed} 件を消せませんでした（他プロセスが読んでいる可能性）",
+            err=True,
         )
-        # 相乗りの掃除結果は主宣言の成否とは別の事実である。落とさずに報告する。
-        if joins_note:
-            print(f"  ただし{joins_note}は消しました", file=sys.stderr)
-        return EXIT_OK
-
-    if primary is RemovalResult.ABSENT and not removed_joins:
-        print("宣言は見つかりませんでした（既に解放済みです）")
-        return EXIT_OK
-
-    parts = []
-    if primary is RemovalResult.REMOVED:
-        parts.append("主宣言")
-    if joins_note:
-        parts.append(joins_note)
-    print(f"強制解放しました: {naming.display_default(resource_id)}（{' / '.join(parts)}）")
     return EXIT_OK
 
 
-def _release_own(board: Board, resource_id: str, *, prefer: str | None = None) -> int:
-    """自分の宣言だけを取り下げる。**曖昧なときは黙って選ばず、指定を求める。**
+def _release_own(board: Board, resource_id: str) -> int:
+    """自分の宣言を取り下げる。
 
-    ここは 5 周にわたって同じ振り子を往復した場所である。順序を変えるたびに、
-    直したのと対称な穴が空いた。
-
-    - **相乗りを祖先まで含めて先に見る**と、自分は相乗りしていないのに祖先から出された
-      他人の申告が ``owns`` を通り（このマシンは全プロジェクトが 1 つのルートの下にある）、
-      それを消して早期 return する。他人の申告だけが消え、自分の主宣言は残る
-    - **主宣言を先に見る**と、相乗り者の cwd が主宣言者と同じ（または配下）のとき
-      ``owns`` が通り、**他人の主宣言を消す**。ジョブが走っている最中に宣言だけが消える
-    - **完全一致の相乗りを最優先**にすると、今度は逆向きが残る。S が主宣言し、T が
-      同じ cwd から相乗りしている場面で、**S が ``rb release`` を打つと T の相乗りが
-      先に消え、S の主宣言が残る**
-
-    **cwd だけでは S と T を区別できない。** どちらを選んでも片方が壊れるので、
-    自動で選ぶのをやめる。両方が候補になったら止めて ``--primary`` / ``--join`` を
-    指定させる。片方しか無いときだけ従来どおり自動で選ぶ。
-
-    曖昧とみなすのは**この場所から出された相乗り**（パスの完全一致）が存在する場合だけに
-    限る。祖先フォールバックで拾う候補は「自分のものかもしれない」という推測であり、
-    そこまで曖昧に数えると、他人がハブのルートから出した相乗りがあるだけで
-    自分の主宣言すら解放できなくなる。
-
-    Parameters
-    ----------
-    prefer : {"primary", "join"}, optional
-        どちらを外すか。省略時は候補が 1 つのときだけ自動で選ぶ。
+    照合は :meth:`Board.owns` と同じ規則（nonce → session_id → cwd の祖先）。
+    **他人のものは消さない。** 消したものは 1 件ずつ表示する——祖先フォールバックで
+    誤って選んだとき、目視できなければ気づく手段が無い。
     """
     cwd = os.getcwd()
-    entry = board.read(resource_id)
-    mine_primary = entry is not None and board.owns(
-        entry, cwd=cwd, session_id=platform_info.session_id()
-    )
-    # 「この場所から出された相乗り」だけを曖昧さの材料にする（上の docstring 参照）。
-    # **ファイル名で判定しない。** 鍵にラッパーの nonce が入った時点で恒偽になり、
-    # 主宣言と相乗りが両方あるのに「相乗りは無い」と読んで**走行中の主宣言を黙って
-    # 解放する**経路になっていた。
-    has_exact_join = board.declared_here(resource_id, cwd)
+    result = board.remove_own(resource_id, reason="release コマンド", cwd=cwd)
+    if result.removed:
+        _say(f"解放しました: {naming.display_default(resource_id)}（{len(result.removed)} 件）")
+        for entry in result.removed:
+            _say(f"  {entry.session} / {entry.job}（since {entry.since}）")
 
-    if prefer is None and mine_primary and has_exact_join:
-        return _report_ambiguous_release(resource_id, entry)
-
-    if prefer == "primary":
-        if mine_primary and entry is not None:
-            return _release_own_primary(board, resource_id, entry)
-        return _refuse_primary_release(entry)
-
-    if prefer == "join":
-        join = board.remove_own_join(resource_id, cwd, reason="release コマンド（--join）")
-        if join is None:
-            print("自分の相乗りの申告は見つかりませんでした", file=sys.stderr)
-            return EXIT_OK
-        _report_join_release(resource_id, join, cwd)
+    if result.failed:
+        # **消せなかったことを「無かった」と混ぜない。** 残っているのに消えたと読まれる。
+        _say(
+            f"警告: {len(result.failed)} 件を消せませんでした（他プロセスが読んでいる可能性）",
+            err=True,
+        )
+    if result.removed or result.failed:
         return EXIT_OK
 
-    # 以降は候補が 1 つしか無い場合である。見る順序は
-    # **完全一致の相乗り → 主宣言 → 祖先の相乗り**。
-    if has_exact_join:
-        exact = board.remove_own_join(resource_id, cwd, reason="release コマンド")
-        if exact is not None:
-            _report_join_release(resource_id, exact, cwd)
-            return EXIT_OK
-
-    if mine_primary and entry is not None:
-        return _release_own_primary(board, resource_id, entry)
-
-    join = board.remove_own_join(resource_id, cwd, reason="release コマンド")
-    if join is not None:
-        _report_join_release(resource_id, join, cwd)
+    if not result.any_here:
+        _say(f"宣言はありませんでした: {naming.display_default(resource_id)}")
         return EXIT_OK
 
-    return _refuse_primary_release(entry)
-
-
-def _report_ambiguous_release(resource_id: str, entry: Entry | None) -> int:
-    """主宣言と相乗りの両方が候補になったことを伝えて、何も消さずに戻る。
-
-    **黙ってどちらかを選ばない。** 同じ作業ディレクトリから主宣言と相乗りが出ている場合、
-    掲示板の情報だけでは「どちらが呼び出し側のものか」を決められない。推測して外すと、
-    走っているジョブの宣言を消すか、他人の相乗りを消すかのどちらかになる。
-    """
-    print("主宣言と相乗りの両方が自分のものの候補です。どちらを外すか指定してください")
-    if entry is not None:
-        print(f"  主宣言: {entry.session} / {entry.job}（since {entry.since}）")
-    print("  相乗り: この作業ディレクトリから出した申告")
-    display = naming.display_default(resource_id)
-    print(f"  rb release {display} --primary   （主宣言を外す）")
-    print(f"  rb release {display} --join      （相乗りを取り下げる）")
-    return EXIT_USAGE
-
-
-def _report_join_release(resource_id: str, join: Entry, cwd: str) -> None:
-    """相乗りを外したことを伝える。祖先フォールバックなら申告元も出す。"""
-    print(f"相乗りを取り下げました: {naming.display_default(resource_id)}")
-    declared = str(join.holder.get("cwd") or "")
-    if declared and os.path.normcase(declared) != os.path.normcase(cwd):
-        # 完全一致ではなく祖先フォールバックで選んだ。**誤爆が目視できるように**
-        # 申告元を出す。出さなければ、他人の申告を消したことに気づく手段が無い。
-        print(f"  申告元: {declared}（自分の場所から出した申告ではありません）")
-
-
-def _refuse_primary_release(entry: Entry | None) -> int:
-    """外せる宣言が無かったことを伝える。
-
-    **他人の宣言は消さない。** 掲示板の唯一の強制点は先着排他であり、最も打ちやすい
-    コマンドでそれを無効化できてはならない。claim が ``--force`` を要求するのと対称にする。
-    """
-    if entry is None:
-        print("宣言は見つかりませんでした（既に解放済みです）")
-        return EXIT_OK
-
-    print("他セッションの宣言は解放できません（--force で強制解放できます）", file=sys.stderr)
-    print(f"  宣言者: {entry.session} / {entry.job}", file=sys.stderr)
-    print(f"  since : {entry.since}", file=sys.stderr)
+    # **他人の宣言を「無い」と言わない。** 誰がいるかを見せて、--force を案内する。
+    _say(f"自分の宣言はありません: {naming.display_default(resource_id)}", err=True)
+    for entry in result.foreign:
+        _say(f"  {entry.session} / {entry.job}（since {entry.since}）", err=True)
+    _say(f"  他セッションの宣言を消すなら rb release {resource_id} --force", err=True)
+    # **0 を返さない。** 消すつもりで打って何も消えていない。0 は「解放した」と読まれる。
     return EXIT_BUSY
-
-
-def _release_own_primary(board: Board, resource_id: str, entry: Entry) -> int:
-    """自分の主宣言を取り下げる。**読んだ宣言と一致するときだけ消す（CAS）。**
-
-    無条件の削除は、掲示板の書き換えの中でここだけが CAS に乗らないという穴になる。
-    解放はロックが取れなくても続行する（``_warn_if_unlocked``）ので、次が成立する。
-    他セッションが ``claim --force`` で取り直した直後にここへ来ると、``read`` が拾うのは
-    **相手の新しい宣言**であり、cwd が同じ（または相手の cwd が自分の祖先）なら
-    ``owns`` を通る。**他人の生きた宣言を消して掲示板だけが空になり、資源は掴まれたまま**
-    という最も検出しにくい不整合ができる。同一プロジェクトで 2 セッションが動くのは
-    日常なので、この条件は容易に成立する。
-
-    :meth:`Board.remove_if_owned` は使わない。呼び出し側（``_cmd_release``）が既に
-    ロックを保持しているため、内部の ``locked()`` が**自分のロック**に 2 秒ぶつかって
-    無駄な監査イベントを出すだけになる。
-    """
-    if entry.nonce:
-        result = board.remove_if_nonce(
-            resource_id, expect_nonce=entry.nonce, reason="release コマンド"
-        )
-    else:
-        # nonce を持たない古いエントリ。照合できる値が無いので従来どおり消す。
-        result = board.remove_detailed(resource_id, reason="release コマンド")
-
-    if result is RemovalResult.REMOVED:
-        print(f"解放しました: {naming.display_default(resource_id)}")
-        return EXIT_OK
-    if result is RemovalResult.ABSENT:
-        print("宣言は見つかりませんでした（既に解放済みです）")
-        return EXIT_OK
-    if result is RemovalResult.NOT_OWNED:
-        # **「消さなかった」を「消せなかった」と混ぜない。** ここは掲示板が正常に読めた
-        # 上で「他者の生きた宣言である」と判定できた場合なので、使用中として 1 を返す。
-        print(
-            "解放をやめました: 宣言が入れ替わりました（他セッションが取り直した可能性）",
-            file=sys.stderr,
-        )
-        return EXIT_BUSY
-    # 削除できなかった。**「無かった」と混ぜない**（掲示板には残っている）。
-    print("解放に失敗しました（掲示板に宣言が残っています。監査ログを参照）", file=sys.stderr)
-    return EXIT_OK
 
 
 def _add_declaration_options(parser: argparse.ArgumentParser, *, with_force: bool = True) -> None:
@@ -1569,6 +1108,13 @@ def _add_declaration_options(parser: argparse.ArgumentParser, *, with_force: boo
     )
     parser.add_argument("--log", default=None, help="進捗が読めるログのパス")
     parser.add_argument("--display", default=None, help="表示名")
+    # **承知で並ぶ意思表示。掲示板には役割として記録されない。**
+    # 記録しないので、どれが先かは since から導出できる。
+    parser.add_argument(
+        "--share",
+        action="store_true",
+        help="既に使われていることを承知で並ぶ（誰の宣言も消さない）",
+    )
     if with_force:
         parser.add_argument(
             "--force", action="store_true", help="他者の宣言を退けて強制的に取得する"
@@ -1609,19 +1155,14 @@ def build_parser() -> argparse.ArgumentParser:
         "release",
         help="宣言を解放する（自分のものだけ）",
         description=(
-            "自分の主宣言または相乗りを取り下げる。同じ作業ディレクトリから両方が"
-            "出ている場合、掲示板の情報だけではどちらが呼び出し側のものか決められないため、"
-            "**推測せずに指定を求める**。--primary / --join で狙って外すこと。"
+            "自分の宣言を取り下げる。同じ資源へ並行して 2 件出していれば 2 件とも消える。"
+            "他セッションの宣言まで消すのは --force だけである。"
         ),
     )
     release.add_argument("resource", help="資源 ID")
     release.add_argument(
         "--force", action="store_true", help="他セッションの宣言も強制的に解放する"
     )
-    # **どちらを外すかの明示。** 両方が候補になるとき、本ツールは選ばずに止める。
-    kind = release.add_mutually_exclusive_group()
-    kind.add_argument("--primary", action="store_true", help="主宣言のほうを外す")
-    kind.add_argument("--join", action="store_true", help="相乗りのほうを取り下げる")
     release.set_defaults(func=_cmd_release)
 
     run = sub.add_parser(
@@ -1634,27 +1175,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument("--res", required=True, help="資源 ID")
-    run.add_argument(
-        "--join",
-        action="store_true",
-        help="主宣言を取らず、相乗りとして入る（終了時に相乗りを取り下げる）",
-    )
     _add_declaration_options(run)
     run.set_defaults(func=_cmd_run)
-
-    join = sub.add_parser(
-        "join",
-        help="他者が宣言している資源に相乗りすることを申告する",
-        description=(
-            "既に宣言のある資源へ相乗りすることを掲示板に載せる。"
-            "**相乗りしてよいかは本ツールが決めない**。保持者の相乗り方針を読み、"
-            "合意のうえで使うこと。ここでやるのは「入ったことを見えるようにする」ことだけである。"
-        ),
-    )
-    join.add_argument("--res", required=True, help="資源 ID")
-    # 相乗りに --force は無い。取得の排他を破る操作ではないため、強制する対象が無い
-    _add_declaration_options(join, with_force=False)
-    join.set_defaults(func=_cmd_join)
 
     update = sub.add_parser(
         "update",

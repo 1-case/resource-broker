@@ -137,11 +137,11 @@ def test_status_json_exposes_verdict_and_holder(
     payload = json.loads(capsys.readouterr().out)
     row = payload["resources"][0]
 
-    assert row["free"] is False
+    assert row["occupied"] is True
     assert row["verdict"] == "held"
-    assert row["holder"]["job"] == "実機の教示"
-    assert row["log"] == "runs/probe.log"
-    assert row["since"]
+    assert row["declarations"][0]["holder"]["job"] == "実機の教示"
+    assert row["declarations"][0]["log"] == "runs/probe.log"
+    assert row["declarations"][0]["since"]
 
 
 def test_status_reports_free_for_unclaimed_resource(
@@ -151,7 +151,7 @@ def test_status_reports_free_for_unclaimed_resource(
     assert run(tmp_path, "status", "COM7", "--json") == 0
     row = json.loads(capsys.readouterr().out)["resources"][0]
 
-    assert row["free"] is True
+    assert row["occupied"] is False
     assert row["verdict"] == "free"
 
 
@@ -165,7 +165,7 @@ def test_claim_records_the_log_path(tmp_path: Path, capsys: pytest.CaptureFixtur
     run(tmp_path, "status", "COM3", "--json")
 
     row = json.loads(capsys.readouterr().out)["resources"][0]
-    assert row["log"] == "runs/rec.log"
+    assert row["declarations"][0]["log"] == "runs/rec.log"
 
 
 def test_claim_records_the_observation_verbatim(
@@ -192,7 +192,7 @@ def test_claim_records_the_observation_verbatim(
     capsys.readouterr()
     run(tmp_path, "status", "\\\\nas\\share", "--json")
 
-    observed = json.loads(capsys.readouterr().out)["resources"][0]["observed"]
+    observed = json.loads(capsys.readouterr().out)["resources"][0]["declarations"][0]["observed"]
     assert observed["note"] == "net use: 接続なし / 空き容量 2.1TB"
     assert observed["found"] == "free"
     assert observed["at"]  # 観測時刻は機械が刻む
@@ -213,31 +213,6 @@ def test_status_without_arguments_lists_only_declared_resources(
     resources = json.loads(capsys.readouterr().out)["resources"]
 
     assert [row["display"] for row in resources] == ["COM3"]
-
-
-def test_wait_does_not_report_release_when_only_joins_remain(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """相乗りだけが残った資源で「既に解放されています」と答えない。
-
-    入口の判定が主宣言しか見ていないと、**実際に使っている者がいるのに解放と報告する**。
-    本体（``wait_for_room``）は主宣言と相乗りの両方を数えているので、入口だけが古い基準だった。
-    """
-    from resource_broker.board import Board, build_entry
-    from resource_broker.naming import normalize
-
-    board = Board(tmp_path)
-    resource = normalize("GPU0")
-    place = str(tmp_path / "works" / "theirs")
-    assert board.add_join(build_entry(resource, job="相乗りのジョブ", cwd=place), place)
-    capsys.readouterr()
-
-    code = run(tmp_path, "wait", "GPU0", "--interval", "0", "--timeout", "0")
-    captured = capsys.readouterr()
-
-    assert code == 1  # まだ使用中である
-    assert "既に解放されています" not in captured.out
-    assert "待機します" in captured.out
 
 
 def test_wait_returns_when_nothing_holds_the_resource(

@@ -50,13 +50,13 @@ class FakeClock:
 
 def declare(board: Board, *, eta: str = "40m") -> None:
     """主宣言を置く。"""
-    assert board.try_claim(build_entry(RESOURCE, job="E059 eval", session="folnet", eta=eta))
+    assert board.declare(build_entry(RESOURCE, job="E059 eval", session="folnet", eta=eta))
 
 
 def join(board: Board, cwd: str) -> None:
     """相乗りを置く。"""
     entry = build_entry(RESOURCE, job="相乗りのジョブ", cwd=cwd, session="malm")
-    assert board.add_join(entry, cwd)
+    assert board.declare(entry)
 
 
 def audit_events(root: Path) -> list[dict[str, object]]:
@@ -102,7 +102,7 @@ def test_returns_when_the_primary_is_released(tmp_path: Path) -> None:
         calls["n"] += 1
         fake.sleep(seconds)
         if calls["n"] == 3:
-            board.remove(RESOURCE, reason="テストで解放")
+            board.remove_all(RESOURCE, reason="テストで解放")
 
     result = waiting.wait_for_room(
         board, RESOURCE, interval_s=5, timeout_s=1000, sleep=sleep, now=fake.now
@@ -127,7 +127,7 @@ def test_returns_when_a_joiner_leaves(tmp_path: Path) -> None:
         calls["n"] += 1
         fake.sleep(seconds)
         if calls["n"] == 2:
-            board.remove_join(RESOURCE, JOINER_CWD, reason="テストで離脱")
+            board.remove_own(RESOURCE, cwd=JOINER_CWD, reason="テストで離脱")
 
     result = waiting.wait_for_room(
         board, RESOURCE, interval_s=5, timeout_s=1000, sleep=sleep, now=fake.now
@@ -181,8 +181,8 @@ def test_holder_replacement_is_not_a_shrink(tmp_path: Path) -> None:
         calls["n"] += 1
         fake.sleep(seconds)
         if calls["n"] == 2:
-            board.remove(RESOURCE, reason="テストで交代")
-            assert board.try_claim(build_entry(RESOURCE, job="別のジョブ", session="malm"))
+            board.remove_all(RESOURCE, reason="テストで交代")
+            assert board.declare(build_entry(RESOURCE, job="別のジョブ", session="malm"))
 
     result = waiting.wait_for_room(
         board, RESOURCE, interval_s=5, timeout_s=40, sleep=sleep, now=fake.now
@@ -208,10 +208,10 @@ def test_shrink_after_a_replacement_still_wakes(tmp_path: Path) -> None:
         calls["n"] += 1
         fake.sleep(seconds)
         if calls["n"] == 1:
-            board.remove(RESOURCE, reason="テストで交代")
-            assert board.try_claim(build_entry(RESOURCE, job="別のジョブ", session="malm"))
+            board.remove_all(RESOURCE, reason="テストで交代")
+            assert board.declare(build_entry(RESOURCE, job="別のジョブ", session="malm"))
         if calls["n"] == 3:
-            board.remove_join(RESOURCE, JOINER_CWD, reason="テストで離脱")
+            board.remove_own(RESOURCE, cwd=JOINER_CWD, reason="テストで離脱")
 
     result = waiting.wait_for_room(
         board, RESOURCE, interval_s=5, timeout_s=1000, sleep=sleep, now=fake.now
@@ -237,7 +237,7 @@ def test_growth_then_shrink_still_wakes(tmp_path: Path) -> None:
         if calls["n"] == 1:
             join(board, JOINER_CWD)
         if calls["n"] == 3:
-            board.remove_join(RESOURCE, JOINER_CWD, reason="テストで離脱")
+            board.remove_own(RESOURCE, cwd=JOINER_CWD, reason="テストで離脱")
 
     result = waiting.wait_for_room(
         board, RESOURCE, interval_s=5, timeout_s=1000, sleep=sleep, now=fake.now
@@ -344,7 +344,7 @@ def hold_gpu(tmp_path: Path, *, minutes_ago: int = 0) -> None:
         entry.since = (
             datetime.fromisoformat(entry.since) - timedelta(minutes=minutes_ago)
         ).isoformat()
-    assert board.try_claim(entry)
+    assert board.declare(entry)
 
 
 def test_wait_tells_the_waiter_how_to_escape(

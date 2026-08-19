@@ -268,22 +268,3 @@ def test_the_board_is_never_read_with_glob() -> None:
                     offenders.append(f"{path.relative_to(ROOT)}:{number}")
 
     assert not offenders, "掲示板を glob で読んでいる: " + ", ".join(offenders)
-
-
-def test_design_describes_the_join_key_as_implemented() -> None:
-    """DESIGN の「相乗りの鍵」の記述が実装の要素をすべて挙げている。
-
-    鍵の構成は 2 周続けて変え、2 回とも DESIGN を直し忘れた。仕様書が正本だと
-    言っている以上、**中心的な仕様が実装に追い越されたまま**になるのは看板に関わる。
-    """
-    source = (ROOT / "src" / "resource_broker" / "board.py").read_text(encoding="utf-8")
-    start = source.index("def join_path(")
-    body = source[start : source.index("def add_join(", start)]
-
-    design = (ROOT / "docs" / "DESIGN.md").read_text(encoding="utf-8")
-    sentence = next((line for line in design.splitlines() if "相乗りのファイル名は" in line), "")
-    assert sentence, "DESIGN に相乗りの鍵の記述が無い"
-
-    for part in ("cwd", "session_id", "nonce"):
-        assert part in body, f"実装が {part} を使っていない（テストの前提が古い）"
-        assert part in sentence, f"DESIGN が鍵の要素 {part} を書いていない"

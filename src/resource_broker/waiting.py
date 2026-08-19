@@ -89,24 +89,19 @@ class WaitResult:
 
 
 def holder_keys(board: Board, resource_id: str) -> set[str]:
-    """その資源を宣言している者の集合を返す。主宣言と相乗りの両方。
+    """その資源を宣言している者の集合を返す。**宣言は全て対等に数える。**
 
     **中身は見ない。** 誰が何人いるかだけを数える。増減が分かれば資源が空く方向に
     動いたかは判断でき、使用量の数値を解釈する必要がない。
 
-    主宣言のキーには **nonce**（宣言ごとに一意）を使う。``since`` と ``session`` で
-    作ると、保持者が別セッションへ**交代しただけ**で「1 人消えた」に見える。
-    件数は変わっていないのに ``rb wait`` が戻り、待っている側は入れないまま起こされる。
-    nonce を持たない古いエントリだけ従来のキーで代替する。
+    キーには **nonce**（宣言ごとに一意）を使う。``since`` と ``session`` で作ると、
+    宣言者が別セッションへ**交代しただけ**で「1 人消えた」に見える。件数は変わって
+    いないのに ``rb wait`` が戻り、待っている側は入れないまま起こされる。
+    nonce を持たない古い宣言だけ従来のキーで代替する。
     """
     keys: set[str] = set()
-    primary = board.read(resource_id)
-    if primary is not None:
-        identity = primary.nonce or f"{primary.since}:{primary.session}"
-        keys.add(f"primary:{identity}")
-    for join in board.list_joins(resource_id):
-        holder = join.holder if isinstance(join.holder, dict) else {}
-        keys.add(f"join:{holder.get('cwd', '?')}")
+    for entry in board.list_for(resource_id):
+        keys.add(entry.nonce or f"{entry.since}:{entry.session}")
     return keys
 
 
