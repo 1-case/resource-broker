@@ -1640,3 +1640,76 @@ def test_a_known_nonce_never_falls_back_to_the_directory(tmp_path: Path) -> None
 
     assert board.owns(entry, nonce="", cwd=MINE) is True  # nonce を持たない操作は従来どおり
     assert board.owns(entry, nonce="自分の nonce", cwd=MINE) is False
+
+
+def test_release_stops_when_the_join_came_from_the_wrapper(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**ラッパー経由の相乗り**でも `rb release` は何も消さずに指定を求める。
+
+    曖昧さの判定をファイル名の一致で見ていたため、鍵にラッパーの nonce が入った瞬間に
+    **恒偽**になった。主宣言と相乗りが両方あるのに「相乗りは無い」と読み、**走行中の
+    主宣言のほうを解放する**。主宣言が消えると相乗りだけが残って `free` になり、
+    別セッションが同じ資源を取れる——掲示板が防ぐと宣言している二重取得である。
+
+    ユニットで `declared_here` だけを見ても足りない。**呼び出し側が使っているか**まで
+    確かめないと、判定を戻しても緑のままになる（実際そうだった）。
+    """
+    board = Board(tmp_path)
+    shared = str(tmp_path / "同じ場所")
+    os.makedirs(shared, exist_ok=True)
+    monkeypatch.setenv("RESOURCE_BROKER_SESSION_ID", "S")
+
+    assert board.try_claim(
+        build_entry(RESOURCE, job="S の本体", cwd=shared, session="S", session_id="S")
+    )
+    assert board.add_join(
+        build_entry(RESOURCE, job="S の 2 本目", cwd=shared, session="S", session_id="S"),
+        shared,
+        unique=True,
+    )
+    monkeypatch.chdir(shared)
+    capsys.readouterr()
+
+    code = run(tmp_path, "release", "GPU0")
+
+    assert code == 2, capsys.readouterr().out
+    assert board.read(RESOURCE) is not None, "主宣言が消えている"
+    assert len(board.list_joins(RESOURCE)) == 1, "相乗りが消えている"
+
+
+def test_a_wrapper_join_still_makes_release_ambiguous(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """主宣言と**ラッパー経由の相乗り**が同居していたら、`rb release` は何も消さない。
+
+    曖昧さの判定を「相乗りのファイル名がこの場所の鍵と一致するか」で見ていたため、
+    鍵にラッパーの nonce が入った瞬間に**恒偽**になった。主宣言と相乗りが両方あるのに
+    「相乗りは無い」と読み、**走行中の主宣言のほうを黙って解放する**。主宣言が消えると
+    相乗りだけが残って `free` になり、別セッションが同じ資源を取れる——掲示板が
+    防ぐと宣言している二重取得そのものである。
+    """
+    monkeypatch.setenv("RESOURCE_BROKER_SESSION_ID", "a")
+    board = Board(tmp_path)
+    primary = build_entry(RESOURCE, job="本体", cwd=MINE, session="a", session_id="a")
+    assert board.try_claim(primary)
+    joined = build_entry(RESOURCE, job="相乗り", cwd=MINE, session="a", session_id="a")
+    assert board.add_join(joined, MINE, unique=True)
+
+    assert board.declared_here(RESOURCE, MINE) is True
+
+
+def test_a_join_from_elsewhere_does_not_make_release_ambiguous(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**この場所から出していない**相乗りは曖昧さの材料 にしない。
+
+    祖先から出された申告まで数えると、配下の全セッションで `rb release` が
+    毎回「指定しろ」になる。
+    """
+    monkeypatch.setenv("RESOURCE_BROKER_SESSION_ID", "a")
+    board = Board(tmp_path)
+    joined = build_entry(RESOURCE, job="祖先の相乗り", cwd=THEIRS, session="b", session_id="b")
+    assert board.add_join(joined, THEIRS, unique=True)
+
+    assert board.declared_here(RESOURCE, MINE) is False

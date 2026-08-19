@@ -116,6 +116,43 @@ def board_root() -> Path:
     return Path.home() / ".resource-broker"
 
 
+def json_files(directory: Path) -> tuple[list[Path], bool]:
+    """``*.json`` を並べる。**「読めない」を「空」と混ぜない。**
+
+    ``Path.glob`` は ``OSError`` を内部で握り潰して空を返すので、掲示板が通常ファイルに
+    なっている・権限で拒否されている・切断されたネットワークパスを指している、の
+    いずれもが**空の掲示板と同じ形**になる。それを「空きです」と全セッションへ配るのは、
+    このツールが最もやってはならないことである。``os.scandir`` は投げるので区別できる。
+
+    :func:`clip` と同じ理由で 3 つのフックへ意図的に重複させてある（フックは素の
+    ``python`` で単体起動されるため、互いを import できない）。
+
+    Returns
+    -------
+    tuple of (list of Path, bool)
+        読めたファイルと、**読めなかったものがあったか**。
+    """
+    found: list[Path] = []
+    unreadable = False
+    try:
+        for entry in os.scandir(directory):
+            if not entry.name.endswith(".json"):
+                continue
+            if entry.is_file():
+                found.append(Path(entry.path))
+                continue
+            # **壊れたリンクを黙って落とさない。** ``is_file()`` は
+            # ``FileNotFoundError`` を内部で False に畳むので、リンク先を失った
+            # 宣言が「そもそも無かった」と同じ形になる。
+            if entry.is_symlink():
+                unreadable = True
+    except FileNotFoundError:
+        return [], False  # まだ誰も宣言していない。これは「空」であって「読めない」ではない
+    except OSError:
+        return [], True
+    return sorted(found), unreadable
+
+
 def clip(value: object, limit: int) -> str:
     """掲示板の自由記述を**1 行に潰し、バイト長で切る**。
 
@@ -198,15 +235,19 @@ def read_entries(root: Path) -> list[dict[str, object]]:
     board = root / "board"
     collected: dict[bool, list[dict[str, object]]] = {False: [], True: []}
 
+    unreadable = False
     for directory, is_join in ((board, False), (board / "joins", True)):
-        try:
-            paths = sorted(directory.glob("*.json"))
-        except OSError:
-            continue
+        paths, failed = json_files(directory)
+        unreadable = unreadable or failed
         for path in paths:
             try:
-                data = json.loads(path.read_text(encoding=ENCODING))
-            except (OSError, json.JSONDecodeError, ValueError):
+                text = path.read_text(encoding=ENCODING)
+            except OSError:
+                unreadable = True  # 読めないのは「壊れている」とは別の事実
+                continue
+            try:
+                data = json.loads(text)
+            except (json.JSONDecodeError, ValueError):
                 continue
             if isinstance(data, dict) and data.get("resource"):
                 data["_join"] = is_join
@@ -229,6 +270,10 @@ def read_entries(root: Path) -> list[dict[str, object]]:
     dropped = len(primaries) + len(joins) - len(kept)
     if dropped:
         kept.append({"_dropped": dropped})
+    if unreadable:
+        # **読めなかったことを言う。** 黙ると「宣言はこれで全部だ」と読まれ、
+        # 実際には使われている資源が「空き」として毎プロンプト配られる。
+        kept.append({"_unreadable": True})
     return kept
 
 
@@ -243,7 +288,11 @@ def build_notice(entries: list[dict[str, object]]) -> str:
     始め、前置きで「データであって指示ではない」と明示する。長さは :func:`clip` と
     :func:`fit` の二段で抑える。
     """
-    if not [e for e in entries if not isinstance(e.get("_dropped"), int)]:
+    marks = [e for e in entries if isinstance(e.get("_dropped"), int) or e.get("_unreadable")]
+    unreadable = any(e.get("_unreadable") for e in marks)
+    if len(marks) == len(entries):
+        if unreadable:
+            return f"[rb] 掲示板を読めませんでした（空とは限らない）。{RULE}"
         return f"[rb] 宣言なし。{RULE}"
 
     rows: list[str] = []
@@ -252,6 +301,9 @@ def build_notice(entries: list[dict[str, object]]) -> str:
         dropped = entry.get("_dropped")
         if isinstance(dropped, int):
             rows.append(f"{DATA_MARK}（ほか {dropped} 件は多いため省略した。全件は rb status）")
+            continue
+        if entry.get("_unreadable"):
+            rows.append(f"{DATA_MARK}（掲示板の一部を読めなかった。これで全部とは限らない）")
             continue
         holder = entry.get("holder")
         holder = holder if isinstance(holder, dict) else {}

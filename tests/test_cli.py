@@ -315,3 +315,43 @@ def test_wait_names_the_resource_it_is_waiting_for(
     out = capsys.readouterr().out
 
     assert "GPU0" in out
+
+
+def test_status_never_calls_an_unreadable_board_empty(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``rb status`` が読めない掲示板を「空です」と断定しない。
+
+    ``Path.glob`` は ``OSError`` を握り潰して空を返すため、掲示板が通常ファイルに
+    なっているだけで「誰も資源を宣言していません」と出ていた。**実際には使われている
+    資源を空きとして配る**——このツールが最もやってはならないことである。
+    """
+    (tmp_path / "board").write_text("これはディレクトリではない", encoding="utf-8")
+
+    assert main(["--home", str(tmp_path), "status"]) == 0
+
+    out = capsys.readouterr().out
+    assert "掲示板は空です" not in out, out
+    assert "空とは限りません" in out, out
+
+
+def test_status_json_flags_an_unreadable_board(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--json`` にも「読めなかった」を出す。機械が読む側にも同じ事実を渡す。"""
+    (tmp_path / "board").write_text("これはディレクトリではない", encoding="utf-8")
+
+    assert main(["--home", str(tmp_path), "status", "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["partial"] is True
+    assert payload["resources"] == []
+
+
+def test_status_on_an_empty_board_is_not_flagged_as_partial(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """本当に空なら「空です」と言う。**留保を付けすぎて意味を失わせない。**"""
+    assert main(["--home", str(tmp_path), "status", "--json"]) == 0
+
+    assert json.loads(capsys.readouterr().out)["partial"] is False

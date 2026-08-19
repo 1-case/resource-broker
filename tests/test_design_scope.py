@@ -240,3 +240,50 @@ def test_the_readmes_state_the_real_number_of_subprocess_calls() -> None:
         assert f"subprocess` は {count} か所" in text or f"in exactly {count} places" in text, (
             f"{name} が {count} 以外の件数を書いている"
         )
+
+
+# --- 掲示板は glob で読まない -------------------------------------------------------
+
+
+def test_the_board_is_never_read_with_glob() -> None:
+    """掲示板の走査に ``Path.glob`` を使わない。
+
+    ``glob`` は ``OSError`` を**内部で握り潰して空を返す**。掲示板が通常ファイルに
+    なっている・権限で拒否されている・切断されたネットワークパスを指している——
+    いずれもが「空の掲示板」と同じ形になり、**実際には使われている資源を全セッションへ
+    「空き」として配る**。
+
+    これは 2 周にわたって踏んだ。1 度目は気づかず、2 度目は 1 箇所だけ直して
+    「対処済み」に見える状態を作った（主経路の 3 箇所が残っていた）。**共有の走査を
+    1 つに寄せ、glob へ戻る道を塞ぐ。**
+
+    ログと監査は対象外である（読めなくても「使用中の資源が空きに見える」に
+    つながらない）。
+    """
+    offenders = []
+    for folder in ("src", "hooks"):
+        for path in (ROOT / folder).rglob("*.py"):
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if "glob(" in line and "*.json" in line and "*.jsonl" not in line:
+                    offenders.append(f"{path.relative_to(ROOT)}:{number}")
+
+    assert not offenders, "掲示板を glob で読んでいる: " + ", ".join(offenders)
+
+
+def test_design_describes_the_join_key_as_implemented() -> None:
+    """DESIGN の「相乗りの鍵」の記述が実装の要素をすべて挙げている。
+
+    鍵の構成は 2 周続けて変え、2 回とも DESIGN を直し忘れた。仕様書が正本だと
+    言っている以上、**中心的な仕様が実装に追い越されたまま**になるのは看板に関わる。
+    """
+    source = (ROOT / "src" / "resource_broker" / "board.py").read_text(encoding="utf-8")
+    start = source.index("def join_path(")
+    body = source[start : source.index("def add_join(", start)]
+
+    design = (ROOT / "docs" / "DESIGN.md").read_text(encoding="utf-8")
+    sentence = next((line for line in design.splitlines() if "相乗りのファイル名は" in line), "")
+    assert sentence, "DESIGN に相乗りの鍵の記述が無い"
+
+    for part in ("cwd", "session_id", "nonce"):
+        assert part in body, f"実装が {part} を使っていない（テストの前提が古い）"
+        assert part in sentence, f"DESIGN が鍵の要素 {part} を書いていない"

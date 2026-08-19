@@ -1051,3 +1051,52 @@ def test_surviving_descendants_are_reported(
     monkeypatch.setattr(runner, "_group_alive", lambda _pid: True)
     runner._warn_if_descendants_survive(process, None)
     assert "子孫" in capsys.readouterr().err, "生き残りを黙って見逃している"
+
+
+def test_a_failing_print_does_not_stop_the_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """宣言した後の出力が落ちても、ジョブは走る。
+
+    出す内容には資源 ID とジョブの自由記述が入る。Windows のコンソールは cp932 なので
+    ``UnicodeEncodeError`` になりうるし、``| head`` へパイプすれば ``BrokenPipeError``、
+    ディスクが一杯なら ``OSError`` になる。ここで例外が漏れると **126 を返し、ジョブは
+    1 度も起動しない**——「走らなかったジョブを成功と報告しない」の裏返しである。
+    """
+    ran: list[str] = []
+
+    def spawn(argv: list[str], log_path: Path, env: dict[str, str]) -> int:
+        ran.append(argv[0])
+        return 0
+
+    monkeypatch.setattr("resource_broker.cli.SPAWN", spawn)
+    real = builtins.print
+
+    def exploding(*args: object, **kwargs: object) -> None:
+        text = " ".join(str(a) for a in args)
+        if "宣言しました" in text or "ログ:" in text:
+            raise BrokenPipeError("パイプが閉じた")
+        real(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "print", exploding)
+
+    code = run(
+        tmp_path,
+        "run",
+        "--res",
+        "GPU0",
+        "--job",
+        "j",
+        "--observed",
+        "o",
+        "--eta",
+        "10m",
+        "--found",
+        "free",
+        "--",
+        "echo",
+        "hi",
+    )
+
+    assert ran == ["echo"], "出力が落ちてジョブが走っていない"
+    assert code == 0
