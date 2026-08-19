@@ -393,3 +393,18 @@ def test_batch_files_are_ascii_only(name: str) -> None:
         f"bin/{name} に非 ASCII バイトがある（先頭 {offenders[0][0]} バイト目）。"
         "cmd.exe が cp932 として読むため、コメントが壊れてコマンドとして実行される"
     )
+
+
+def test_the_platform_check_tolerates_a_trailing_carriage_return() -> None:
+    """``bin/rb`` の win32 判定を ``=`` の完全一致で書かない。
+
+    Windows の python は ``print()`` がテキスト層を通るので、パイプ相手でも
+    ``win32\r\n`` を書く。コマンド置換が剥がすのは末尾の ``\n`` だけなので、
+    完全一致にすると**恒偽**になり、cygpath 分岐がそれを必要とする場面でだけ死ぬ。
+    実際に 1 周この状態で通っていた（実行では再現しないので、本文で縛る）。
+    """
+    source = (BIN / "rb").read_text(encoding="utf-8")
+
+    assert 'case "$plat" in' in source, "前方一致で見ていない"
+    assert "win32*)" in source, "前方一致のパターンが無い"
+    assert '[ "$plat" = win32 ]' not in source, "完全一致に戻っている"
