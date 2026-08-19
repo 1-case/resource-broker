@@ -356,7 +356,13 @@ def test_a_log_that_cannot_be_opened_does_not_stop_the_job(tmp_path: Path) -> No
     blocked.mkdir()  # ディレクトリなので "ab" では開けない
 
     code = runner.default_spawn(
-        [sys.executable, "-c", "print('走った')"], blocked, dict(os.environ)
+        # **子の出力を ASCII にする。** 退避路は子の stdout を親へ素通しするので、
+        # 子は親のコンソールのコードページで書く。英語 Windows（cp1252）で日本語を
+        # 出すと子が UnicodeEncodeError で落ち、**退避路のテストが退避路と無関係な
+        # 理由で落ちる**（CI の windows-latest で発覚）。
+        [sys.executable, "-c", "print('ran')"],
+        blocked,
+        dict(os.environ),
     )
 
     assert code == 0

@@ -428,3 +428,30 @@ def test_a_declaration_that_lands_after_our_write_is_reported(
     err = capsys.readouterr().err
     assert "ほぼ同時" in err, err
     assert "後から来た相手" in err, err
+
+
+def test_our_output_is_utf8_regardless_of_the_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """コンソールのコードページに関係なく、自分の出力は UTF-8 で書く。
+
+    本ツールの出力は日本語である。**日本語 Windows 以外（cp1252 等）では print が
+    ``UnicodeEncodeError`` で落ちる**——argparse のエラー経路のように `_say` を通らない
+    出力もあるので、例外を握るだけでは足りない。
+
+    **ランチャ（`bin/rb.py`）に置いていたのでは足りなかった。** `uv tool install` で
+    入る `rb` はエントリポイントを直接呼ぶのでランチャを通らず、**配布経路によって
+    挙動が変わっていた**（CI の英語 Windows で発覚）。
+    """
+    seen: list[str] = []
+
+    class Console:
+        encoding = "cp1252"
+
+        def reconfigure(self, *, encoding: str, errors: str) -> None:
+            seen.append(encoding)
+
+    monkeypatch.setattr(sys, "stdout", Console())
+    monkeypatch.setattr(sys, "stderr", Console())
+
+    main(["status", "--home", "no-such-board"])
+
+    assert seen == ["utf-8", "utf-8"], seen

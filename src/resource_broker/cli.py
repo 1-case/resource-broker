@@ -1422,12 +1422,37 @@ def split_trailing(argv: Sequence[str]) -> tuple[list[str], list[str]]:
     return argv[:index], argv[index + 1 :]
 
 
+def _use_utf8_for_our_own_output() -> None:
+    """**自分の出力だけを UTF-8 にする。**
+
+    本ツールの出力は日本語である。Windows の Python はコンソールのコードページで
+    書くため、**日本語 Windows 以外（cp1252 等）では print が
+    ``UnicodeEncodeError`` で落ちる**。argparse のエラー経路のように `_say` を通らない
+    出力もあるので、例外を握るだけでは足りない。
+
+    **`bin/rb.py` にだけ置いていたのでは足りなかった。** `uv tool install` で入る
+    `rb` はエントリポイント（`resource_broker.cli:main`）を直接呼ぶので、ランチャを
+    通らない。**配布経路によって挙動が変わっていた**（CI の英語 Windows で発覚）。
+
+    **環境変数（`PYTHONUTF8`）で解決してはならない。** `rb run -- python train.py` の
+    子がそれを継承し、`open()` の既定エンコーディングが変わる。それまで動いていた
+    ジョブが `UnicodeDecodeError` で落ちうるし、「rb run した時だけ落ちる」ので原因に
+    たどり着けない。**利用者のジョブの挙動を変えることは目的ではない。**
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001 - 直せなくても実行は続ける
+            pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """エントリポイント。
 
     内部エラーは 0 を返して通す（fail-open）。本ツールの不具合で
     ユーザーの作業を止めないことを、コード上でも保証する。
     """
+    _use_utf8_for_our_own_output()
     head, trailing = split_trailing(sys.argv[1:] if argv is None else argv)
 
     parser = build_parser()
