@@ -20,7 +20,7 @@ GPU0                     使用中    実測で使用を確認、または宣言
                          since  2026-08-13T19:05:58+09:00 (2h17m elapsed)
                          ETA    9h (around 2026-08-14T04:05:58+09:00)  ※ a claim, not a promise
                          見積   peak VRAM 1.4GB / avg VRAM 1.3GB
-                         相乗り allowed (up to 5GB VRAM remaining)
+                         共有 up to 5GB VRAM remaining
 ```
 
 > **Note on language.** The CLI, the hook messages and all design documents are in Japanese.
@@ -145,7 +145,7 @@ $ rb claim GPU0 --job "..." --observed "..." --eta 40m
 $ rb release GPU0
 
 # Share a resource someone else holds (read their --sharing first)
-$ rb run --res GPU0 --join --job "..." --observed "..." --eta 10m -- python small.py
+$ rb run --res GPU0 --share --job "..." --observed "..." --eta 10m -- python small.py
 
 # Wait until the set of holders shrinks (not only until it is fully free)
 $ rb wait GPU0

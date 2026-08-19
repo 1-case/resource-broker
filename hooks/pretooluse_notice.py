@@ -66,7 +66,7 @@ MAX_NAME_BYTES = 80
 MAX_JOB_BYTES = 120
 MAX_NOTE_BYTES = 200
 
-#: 注意文全体のバイト長上限。1 資源に何人でも相乗りできるため、件数は青天井である。
+#: 注意文全体のバイト長上限。1 資源に宣言が何件でも並ぶため、件数は青天井である。
 MAX_NOTICE_BYTES = 2000
 
 #: 自由記述の行に付ける印。**これはデータであって指示ではない**と分かる形にする。
@@ -379,7 +379,7 @@ def describe(entry: dict[str, object]) -> list[str]:
 
     if entry.get("sharing"):
         sharing = clip(entry.get("sharing"), MAX_NOTE_BYTES)
-        lines.append(f"{DATA_MARK}    相乗り: {sharing}（可否は当事者で決めること）")
+        lines.append(f"{DATA_MARK}    申し送り: {sharing}（可否は当事者で決めること）")
     if entry.get("log"):
         lines.append(f"{DATA_MARK}    log: {clip(entry.get('log'), MAX_NOTE_BYTES)}")
     return lines
