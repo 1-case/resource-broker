@@ -976,7 +976,7 @@ class Board:
         """
         return self.entries_dir / "joins"
 
-    def join_path(self, resource_id: str, cwd: str, session_id: str = "") -> Path:
+    def join_path(self, resource_id: str, cwd: str, session_id: str = "", nonce: str = "") -> Path:
         """相乗り申告のパス。**セッションごとに 1 つ**（取れないときは作業ディレクトリごと）。
 
         **cwd だけを鍵にすると、同じ場所の 2 セッション目が掲示板から消える。** 同じ
@@ -992,18 +992,25 @@ class Board:
         parts = [resource_id, os.path.normcase(cwd)]
         if session_id:
             parts.append(session_id)
+        # **ラッパー経由の申告だけは一意にする。** 1 つのセッションが同じ場所から
+        # 背景ジョブを 2 本投げるのは普通の使い方で、鍵がセッションまでだと 2 本目は
+        # 申告を残せない。1 本目が終わって取り下げた瞬間、**まだ走っている 2 本目が
+        # 掲示板から消える**。手動の ``rb join`` は nonce を渡さないので、
+        # 「同じ場所から二重に申告できない」という意図した性質がそのまま残る。
+        if nonce:
+            parts.append(nonce)
         key = naming.safe_filename("|".join(parts))
         return self.joins_dir / f"{key}.json"
 
-    def add_join(self, entry: Entry, cwd: str) -> bool:
+    def add_join(self, entry: Entry, cwd: str, *, unique: bool = False) -> bool:
         """相乗りを申告する。**残せたときだけ** True。
 
         「既にある」と「残せなかった」を区別する必要があるときは
         :meth:`add_join_detailed` を使う。
         """
-        return self.add_join_detailed(entry, cwd) is JoinResult.ADDED
+        return self.add_join_detailed(entry, cwd, unique=unique) is JoinResult.ADDED
 
-    def add_join_detailed(self, entry: Entry, cwd: str) -> JoinResult:
+    def add_join_detailed(self, entry: Entry, cwd: str, *, unique: bool = False) -> JoinResult:
         """相乗りを申告し、結果を 3 値で返す。同じ作業ディレクトリから二重には申告できない。
 
         Returns
@@ -1019,7 +1026,12 @@ class Board:
         「入ったことを見えるようにする」ことだけである。黙って入られるより遥かによい。
         """
         holder = entry.holder if isinstance(entry.holder, dict) else {}
-        path = self.join_path(entry.resource, cwd, str(holder.get("session_id") or ""))
+        path = self.join_path(
+            entry.resource,
+            cwd,
+            str(holder.get("session_id") or ""),
+            entry.nonce if unique else "",
+        )
         try:
             self.joins_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -1042,6 +1054,9 @@ class Board:
             resource=entry.resource,
             job=entry.job,
             cwd=cwd,
+            # **PID も残す。** ラッパー経由の申告はこれが唯一の生存の手掛かりであり、
+            # 掲示板から消えた後に「どの申告が死んでいたか」を追える場所がここしかない。
+            pid=entry.pid,
             eta=entry.eta,
             usage=entry.usage,
             sharing=entry.sharing or None,

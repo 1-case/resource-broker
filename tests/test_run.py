@@ -13,6 +13,7 @@ from __future__ import annotations
 import builtins
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -893,7 +894,16 @@ def test_the_wrapper_only_removes_the_join_it_created(
 
     def run_and_vanish(argv: list[str], log_path: Path, env: dict[str, str]) -> int:
         # 走行中に自分の申告だけが外部から消える。
-        assert board.remove_join(normalize("GPU0"), mine, reason="外部から消えた")
+        # **ファイル名で指さない。** ラッパー経由の申告は nonce まで鍵に入るので、
+        # 場所から名前を組み立てても当たらない。中身で選ぶ（`--force` や再起動掃除が
+        # 実際にやっているのも「中身を見て消す」である）。
+        removed = [
+            path
+            for path in board.joins_dir.glob("*.json")
+            if json.loads(path.read_text(encoding="utf-8"))["holder"].get("cwd") == mine
+        ]
+        assert len(removed) == 1, removed
+        removed[0].unlink()
         return 0
 
     monkeypatch.setattr(os, "getcwd", lambda: mine)
@@ -953,3 +963,91 @@ def test_a_wrapper_join_records_its_pid(tmp_path: Path) -> None:
     assert code == 0
     declared = json.loads(snapshot.read_text(encoding="utf-8"))
     assert isinstance(declared["holder"].get("pid"), int), declared["holder"]
+
+
+# --- 中断シグナル ----------------------------------------------------------------
+
+
+def test_terminating_signals_become_an_exception() -> None:
+    """POSIX では ``SIGTERM`` が例外になる。**既定のままだと後始末を通らない。**
+
+    子は ``start_new_session=True`` で別のプロセスグループにあるため、シグナルは
+    ラッパーにしか届かない。既定のハンドラで死ぬと宣言だけが残り、しかもその
+    宣言の PID は死んでいる——**幽霊判定に最も拾われやすい形**で残る。
+    """
+    if not runner._terminating_signals():
+        pytest.skip("シグナルを扱えない環境（Windows）")
+
+    with pytest.raises(runner.Terminated):
+        with runner._terminating_signals_raise():
+            os.kill(os.getpid(), signal.SIGTERM)
+
+
+def test_the_previous_signal_handler_is_restored() -> None:
+    """区間を抜けたら元のハンドラへ戻す。**他人の設定を奪わない。**"""
+    if not runner._terminating_signals():
+        pytest.skip("シグナルを扱えない環境（Windows）")
+
+    before = signal.getsignal(signal.SIGTERM)
+    with runner._terminating_signals_raise():
+        assert signal.getsignal(signal.SIGTERM) is not before
+
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_signal_handling_is_a_no_op_where_it_cannot_be_installed() -> None:
+    """扱えない環境では**何もせずに通す**（fail-open）。"""
+    with runner._terminating_signals_raise():
+        pass
+
+
+# --- 止め切れたかを返す ------------------------------------------------------------
+
+
+def test_stop_reports_whether_everything_actually_stopped() -> None:
+    """``_stop`` は「止め切れたか」を返す。
+
+    捨てると、``SIGKILL`` でも死なない子孫（ドライバ待ちなど）が残ったまま
+    「止め終わった」として戻り、呼び出し側が宣言を消す。
+    """
+    process = FakeProcess()
+
+    assert (
+        runner._stop(
+            process,
+            kill_tree=lambda _pid, _force: True,
+            group_alive=lambda _pid: False,
+            timeout_s=0.05,
+        )
+        is True
+    )
+
+    assert (
+        runner._stop(
+            process,
+            kill_tree=lambda _pid, _force: True,
+            group_alive=lambda _pid: True,  # 何をしても静まらない
+            timeout_s=0.05,
+        )
+        is False
+    )
+
+
+def test_surviving_descendants_are_reported(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """子孫が残ったまま戻るときは黙らない。**待たない**が、言う。
+
+    直接の子が 0 で終わっても孫が資源を掴んだまま生きていることがある。
+    呼び出し側の ``finally`` は宣言を消すので、**掲示板は空・資源は掴まれたまま**
+    という最も検出しにくい不整合ができる。
+    """
+    process = FakeProcess()
+
+    monkeypatch.setattr(runner, "_group_alive", lambda _pid: False)
+    runner._warn_if_descendants_survive(process, None)
+    assert capsys.readouterr().err == "", "生存していないのに警告を出している"
+
+    monkeypatch.setattr(runner, "_group_alive", lambda _pid: True)
+    runner._warn_if_descendants_survive(process, None)
+    assert "子孫" in capsys.readouterr().err, "生き残りを黙って見逃している"

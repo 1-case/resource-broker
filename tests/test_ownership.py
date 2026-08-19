@@ -1123,6 +1123,28 @@ def test_two_sessions_in_one_directory_are_both_visible(tmp_path: Path) -> None:
     assert [join.job for join in board.list_joins(RESOURCE)] == ["レビュー"]
 
 
+def test_one_session_can_run_two_wrapped_jobs_side_by_side(tmp_path: Path) -> None:
+    """同じセッションが同じ場所から**並行して 2 本**相乗りしても、両方が残る。
+
+    背景ジョブを 2 本投げるのは普通の使い方である。鍵がセッションまでだと 2 本目は
+    申告を残せず、1 本目が終わって取り下げた瞬間に**まだ走っている 2 本目が掲示板から
+    消える**。相乗りは「見えるようにする」ためだけの仕組みで、見えなくなるのは
+    唯一許されない壊れ方である。
+    """
+    board = Board(tmp_path)
+    first = build_entry(RESOURCE, job="ジョブ A", cwd=MINE, session="a", session_id="a")
+    second = build_entry(RESOURCE, job="ジョブ B", cwd=MINE, session="a", session_id="a")
+
+    assert board.add_join(first, MINE, unique=True)
+    assert board.add_join(second, MINE, unique=True), "2 本目が申告を残せていない"
+
+    assert sorted(join.job for join in board.list_joins(RESOURCE)) == ["ジョブ A", "ジョブ B"]
+
+    board.remove_own_join(RESOURCE, MINE, reason="A が終わった", expect_nonce=first.nonce)
+
+    assert [join.job for join in board.list_joins(RESOURCE)] == ["ジョブ B"]
+
+
 def test_the_same_session_cannot_join_twice_from_one_directory(tmp_path: Path) -> None:
     """同じセッションが同じ場所から二重に申告することはできない（従来どおり）。
 

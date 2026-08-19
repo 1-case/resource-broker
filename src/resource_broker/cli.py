@@ -227,7 +227,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
         for index, join in enumerate(row["joins"], start=1):
             holder = join["holder"] or {}
-            print(f"{'':<24} 相乗り{index} {holder.get('session', '?')} / {join['job']}")
+            # **PID を出す。** 相乗りの自動回収は無い（退去の根拠を 3 つから増やさない）
+            # ので、死んだ申告を見分けて `rb release --join` を選ぶのは読む側の仕事に
+            # なる。記録してあるのに読めない場所に置いたままでは、記録した意味が無い。
+            pid = holder.get("pid")
+            marker = f" (pid {pid})" if isinstance(pid, int) and not isinstance(pid, bool) else ""
+            print(f"{'':<24} 相乗り{index} {holder.get('session', '?')}{marker} / {join['job']}")
             print(f"{'':<24}        since {join['since']}")
             join_eta = join["eta"] or {}
             if join_eta.get("stated"):
@@ -532,7 +537,7 @@ def acquire_join(
         avg=args.avg or "",
         sharing=args.sharing or "",
     )
-    result = board.add_join_detailed(entry, os.getcwd())
+    result = board.add_join_detailed(entry, os.getcwd(), unique=True)
 
     if result is JoinResult.EXISTS:
         # 既にある申告はこのプロセスのものとは限らない。**実行は通すが取り下げない。**
@@ -699,8 +704,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(f"ログ: {log_path}")
         exit_code = runner.execute(list(args.trailing), log_path, spawn=SPAWN)
         return exit_code
-    except KeyboardInterrupt:
-        print("中断されました", file=sys.stderr)
+    except (KeyboardInterrupt, runner.Terminated):
+        # **SIGTERM / SIGHUP もここへ落とす。** 既定のハンドラのままだと `finally` を
+        # 通らずに死に、宣言だけが残る。残った宣言は PID が死んでいるため、
+        # **幽霊判定に最も拾われやすい形**で残る（孤児のジョブはまだ走っている）。
+        _say("中断されました", err=True)
         exit_code = EXIT_INTERRUPTED
         return EXIT_INTERRUPTED
     finally:

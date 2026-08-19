@@ -14,13 +14,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import IO
 
@@ -149,6 +150,82 @@ def prune_old_logs(directory: Path, *, max_age_days: float = LOG_RETENTION_DAYS)
     return removed
 
 
+class Terminated(BaseException):
+    """``SIGTERM`` / ``SIGHUP`` を受けた。``BaseException`` なのは意図である。
+
+    ``Exception`` にすると `rb run` の catch-all に吸われ、「内部エラー」として
+    扱われてしまう。中断は失敗ではない。
+    """
+
+
+def _terminating_signals() -> list[int]:
+    """捕まえるシグナル。Windows では空。
+
+    **``SIGKILL`` は入らない**（捕まえられない。開示済みの残余である）。
+    """
+    if sys.platform == "win32":
+        return []
+    return [num for num in (getattr(signal, name, None) for name in ("SIGTERM", "SIGHUP")) if num]
+
+
+@contextlib.contextmanager
+def _terminating_signals_raise() -> "Iterator[None]":
+    """``SIGTERM`` / ``SIGHUP`` を例外に変える。
+
+    **これが無いと、ラッパーの死が最悪の形で残る。** 子は ``start_new_session=True``
+    で別のプロセスグループに置いてある（Ctrl+C を正しく扱うための判断である）ので、
+    端末が閉じても ``kill`` されても**シグナルはラッパーにしか届かない**。Python の
+    既定ハンドラはそのままプロセスを終わらせるため ``finally`` を通らず、宣言は
+    残ったまま、子は孤児になる。
+
+    残るのが安全側に見えるが、逆である。**残った宣言の PID はラッパーのもので、
+    もう死んでいる。** 猶予を過ぎた後に他セッションが 1 度 ``--found free`` を申告
+    すれば、幽霊判定の条件 2（猶予経過 + 実測空き + PID 死亡）が成立し、
+    **まだ走っている孤児ジョブの宣言が退去させられる**——二重取得そのものである。
+
+    例外に変えれば、既存の ``except BaseException`` が子をプロセスグループごと止め、
+    ``finally`` が宣言を解放する。**2 発目は既定へ戻す**（後始末の最中にもう一度
+    同じシグナルが来ても、後始末が壊れた状態で止まらないようにする）。
+
+    シグナルを扱えない場面（メインスレッド以外など）では**何もせずに通す**。
+    fail-open であり、扱えないことを理由に走らせないほうが悪い。
+    """
+    previous: list[tuple[int, object]] = []
+
+    def handler(signum: int, _frame: object) -> None:
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+        except (ValueError, OSError):
+            pass
+        raise Terminated(signum)
+
+    for num in _terminating_signals():
+        try:
+            previous.append((num, signal.signal(num, handler)))
+        except (ValueError, OSError):
+            continue
+    try:
+        yield
+    finally:
+        for num, old in previous:
+            try:
+                signal.signal(num, old)  # type: ignore[arg-type]
+            except (ValueError, OSError):
+                continue
+
+
+def _warn(text: str) -> None:
+    """stderr へ 1 行出す。**絶対に例外を出さない。**
+
+    ここで落ちると、fail-open のための退避路そのものが失敗の原因になる
+    （``rb run ... 2>&1 | head`` で stderr が閉じていれば ``BrokenPipeError``）。
+    """
+    try:
+        print(text, file=sys.stderr)
+    except Exception:  # noqa: BLE001 - 通知の失敗でジョブの結果を変えない
+        pass
+
+
 def _pump(source: object, sink: object, limit: int) -> None:
     """子の出力をログへ写す。上限を超えたら**読むのは続け、書くのをやめる**。
 
@@ -184,11 +261,17 @@ def _pump(source: object, sink: object, limit: int) -> None:
                     sink.write(notice.encode("utf-8", errors="replace"))  # type: ignore[attr-defined]
                     truncated = True
                 sink.flush()  # type: ignore[attr-defined]
-            except (OSError, ValueError):
+            except (OSError, ValueError) as exc:
                 # **書けなくなっても読むのはやめない。** ここで抜けると ``finally`` が
                 # 読み口を閉じ、子は次の書き込みで ``EPIPE``（POSIX では ``SIGPIPE``）を
                 # 受けて死ぬ。**ディスクが一杯なだけでジョブが落ちる。** 上限に達した
                 # ときと同じ「読み捨てモード」へ落として、EOF まで排出し続ける。
+                #
+                # **黙って切らない。** 上限のときはログに 1 行残すのに、書けなくなった
+                # ときだけ何も言わないと、ログはぶつ切りになり読む側は「ここでジョブが
+                # 止まった」と読む（CLAUDE.md「Silence Is Not Success」）。ログには
+                # もう書けないので、言える場所は stderr しかない。
+                _warn(f"警告: ログに書けなくなりました（{exc}）。ジョブは継続します")
                 truncated = True
     except (OSError, ValueError):
         pass  # 読み口が壊れた。ここまで写した分で諦める
@@ -226,9 +309,12 @@ def default_spawn(argv: list[str], log_path: Path, env: Mapping[str, str]) -> in
         # ここで諦めると「ログ置き場が書けないからジョブが走らない」ことになる。
         # 本ツールがユーザーの作業を止めてよい場面は無い（CLAUDE.md「Fail-Open」）。
         # 子の出力は捕まえずに親へ素通しする。**黙って捨てるほうが悪い。**
-        print(
-            f"警告: ログを開けませんでした（{log_path}）。出力は捕まえずにそのまま流します",
-            file=sys.stderr,
+        # **この print で落ちない。** ``rb run ... 2>&1 | head`` のように stderr が
+        # 閉じていると ``BrokenPipeError`` になり、呼び出し側の catch-all が 126 を返す
+        # ——「ログ置き場が書けないだけでジョブが走らない」に逆戻りする。
+        _warn(
+            f"警告: ログを開けませんでした（{log_path}）。出力は捕まえずにそのまま流します。"
+            "掲示板に載せた log のパスは生成されません"
         )
         return _spawn_without_log(argv, env)
 
@@ -253,7 +339,8 @@ def default_spawn(argv: list[str], log_path: Path, env: Mapping[str, str]) -> in
         )
         pump.start()
         try:
-            code = process.wait()
+            with _terminating_signals_raise():
+                code = process.wait()
             _warn_if_descendants_survive(process, stream)
             return code
         except BaseException:
@@ -283,7 +370,8 @@ def _spawn_without_log(argv: list[str], env: Mapping[str, str]) -> int:
     extra: dict[str, object] = {} if sys.platform == "win32" else {"start_new_session": True}
     process = subprocess.Popen(argv, env=dict(env), **extra)  # type: ignore[arg-type]
     try:
-        code = process.wait()
+        with _terminating_signals_raise():
+            code = process.wait()
         _warn_if_descendants_survive(process, None)
         return code
     except BaseException:
@@ -303,6 +391,10 @@ def _warn_if_descendants_survive(process: subprocess.Popen[bytes], sink: IO[byte
     **待たない。** 常駐する子孫を待てば ``rb run`` が返らなくなり、それはこのツールが
     ユーザーの作業を止めることになる。できるのは黙らないことである
     （CLAUDE.md「Silence Is Not Success」）。
+
+    **これは POSIX でしか発火しない。** Windows にはプロセスグループの同じ概念が無く、
+    :func:`_group_alive` は常に None を返す。そちらでは ``taskkill /T`` が木ごと落とす
+    ので停止そのものは足りているが、**「止め切れなかった」の可視化は無い**。
     """
     if _group_alive(process.pid) is not True:
         return
@@ -310,10 +402,7 @@ def _warn_if_descendants_survive(process: subprocess.Popen[bytes], sink: IO[byte
         f"=== {clock.now_iso()} 警告: 子プロセスの子孫が残ったまま rb run が終了する。"
         "宣言は解放されるので、掲示板は空・資源は掴まれたままになりうる\n"
     )
-    try:
-        print(text.strip(), file=sys.stderr)
-    except Exception:  # noqa: BLE001 - 通知の失敗でジョブの結果を変えない
-        pass
+    _warn(text.strip())
     if sink is None:
         return
     try:
