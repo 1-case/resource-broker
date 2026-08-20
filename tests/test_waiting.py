@@ -524,3 +524,37 @@ def test_a_reboot_ghost_does_not_keep_wait_running(
     )
 
     assert waiting.holder_keys(board, RESOURCE) == set(), "確定的な幽霊を数えている"
+
+
+def test_a_release_and_a_shrink_both_exit_zero_through_the_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLI 越しに RELEASED と SHRANK がどちらも 0 で戻る。
+
+    **本体（``wait_for_room``）を見るテストでは、この保証は取れない。** 終了コードへの
+    対応付けは ``_cmd_wait`` の分岐にあり、片方の ``return`` を書き換えても本体側の
+    テストは全部通ってしまう。
+
+    「全部消えた」も「1 つ減った」も待機としては成功で、呼び出し側への合図は同じ
+    **「もう一度自分で調べろ」**である。上限到達（``EXIT_BUSY``）や内部エラー
+    （``EXIT_WAIT_BROKEN``）と畳まない——対処が違う。
+    """
+    from resource_broker import cli
+
+    hold_gpu(tmp_path)
+
+    def finished(reason: str):  # type: ignore[no-untyped-def]
+        def stub(*_args: object, **_kwargs: object) -> waiting.WaitResult:
+            return waiting.WaitResult(reason=reason, polls=1, waited_s=0.0, last=None, holders=1)
+
+        return stub
+
+    monkeypatch.setattr(waiting, "wait_for_room", finished(waiting.RELEASED))
+    released = main(["--home", str(tmp_path), "wait", "GPU0"])
+
+    monkeypatch.setattr(waiting, "wait_for_room", finished(waiting.SHRANK))
+    shrank = main(["--home", str(tmp_path), "wait", "GPU0"])
+
+    assert released == cli.EXIT_OK
+    assert shrank == cli.EXIT_OK, "宣言が減っただけの復帰を成功として扱っていない"
+    assert cli.EXIT_OK not in (cli.EXIT_BUSY, cli.EXIT_WAIT_BROKEN)
