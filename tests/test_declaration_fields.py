@@ -511,6 +511,91 @@ def test_history_does_not_let_a_mismatched_nonce_steal_the_fallback_slot(
     assert a_record["released_at"] is None, "nonce の無い A が B の解放を横取りした"
 
 
+# --- フォールバックは「少なくとも片側が nonce を欠く」組だけを対象にする（issue #18 指摘 6） -
+
+
+def test_history_does_not_pair_two_records_that_both_carry_different_nonces(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**両側が nonce を持ちながら値が違えば、それは「不確実」ではなく別個体だと確定している。**
+
+    nonce は宣言ごとに一意なので、値の違う 2 つの記録が同じ宣言を指すことは
+    あり得ない。以前のフォールバック（資源 + job + 時刻の近さ）は、この 2 つを
+    区別せず「不確実な対応」として結び付けてしまっていた——無関係な 2 つの
+    記録を誤って対応付ける（issue #18 指摘 6）。
+    """
+    board = Board(tmp_path)
+    base = clock.now()
+    monkeypatch.setattr(clock, "now", lambda: base)
+    # A: 別の（記録されていない）解放を待っている宣言。nonce を持つ。
+    board.audit(
+        "claimed", resource=normalize("GPU0"), job="別個体", nonce="d" * 32, eta={"stated": "40m"}
+    )
+    monkeypatch.setattr(clock, "now", lambda: base + timedelta(minutes=2))
+    # X: A とは無関係な、別の宣言（ここでは記録されていない）の解放。nonce を持つが
+    # A の nonce とは異なる。資源・job・時刻は「近い」ので、フォールバックが
+    # 時刻だけで対応付けると誤って A に結び付いてしまう。
+    board.audit(
+        "removed",
+        resource=normalize("GPU0"),
+        job="別個体",
+        nonce="f" * 32,
+        reason="release コマンド",
+    )
+    capsys.readouterr()
+
+    assert run(tmp_path, "history", "GPU0", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    (record,) = payload["claims"]
+    assert record["nonce"] == "d" * 32
+    # **対応付けてはならない。** 両側が nonce を持ち、値が違う以上、別個体だと
+    # 確定している——「不確実」として結び付けるのは、以前の欠陥そのものである。
+    assert record["released_at"] is None, "別個体の解放を誤って対応付けた"
+    assert record["pairing_uncertain"] is False, "対応付けていないので不確実さを論じる対象が無い"
+
+
+def test_history_deduplicates_removals_that_share_a_nonce_in_the_fallback_pool(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**nonce 付きの ``removed`` はフォールバックの候補としても nonce 単位で重複排除する。**
+
+    監査ログの追記は原子的でないため、同じ解放イベントが重複して書かれることが
+    ある（再送・部分書き込みの再試行）。重複排除しないと、同じ nonce の解放が
+    2 件とも資源 + job のフォールバック候補に残り、**2 つの別々の（nonce を
+    持たない）宣言それぞれに「対応した」ことにされてしまう**——実際には
+    1 件の解放しか起きていないのに、2 件とも解放済みだと嘘をつくことになる。
+    """
+    board = Board(tmp_path)
+    base = clock.now()
+    monkeypatch.setattr(clock, "now", lambda: base)
+    # A・B: どちらも nonce を持たない旧形式の宣言。同じ資源・同じ job。
+    board.audit("claimed", resource=normalize("GPU0"), job="重複解放", eta={"stated": "40m"})
+    monkeypatch.setattr(clock, "now", lambda: base + timedelta(minutes=1))
+    board.audit("claimed", resource=normalize("GPU0"), job="重複解放", eta={"stated": "40m"})
+    monkeypatch.setattr(clock, "now", lambda: base + timedelta(minutes=2))
+    # 同じ nonce を持つ解放が重複して記録される（監査ログの再送を模す）。
+    # 実際に消えた宣言は 1 件だけである。
+    board.audit(
+        "removed", resource=normalize("GPU0"), job="重複解放", nonce="h" * 32, reason="release"
+    )
+    monkeypatch.setattr(clock, "now", lambda: base + timedelta(minutes=3))
+    board.audit(
+        "removed", resource=normalize("GPU0"), job="重複解放", nonce="h" * 32, reason="release"
+    )
+    capsys.readouterr()
+
+    assert run(tmp_path, "history", "GPU0", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    released_count = sum(1 for c in payload["claims"] if c["released_at"] is not None)
+    # **重複排除していれば、対応が付くのは高々 1 件。** 排除しなければ 2 件とも
+    # 「解放済み」になり、実際には 1 回しか起きていない解放が 2 回起きたことになる。
+    assert released_count <= 1, (
+        "重複した removed が別々の宣言に対応付いた（重複排除が効いていない）"
+    )
+
+
 # --- はじいたときに次の一手を示す -------------------------------------------------
 
 

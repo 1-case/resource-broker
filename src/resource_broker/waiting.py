@@ -50,16 +50,23 @@ SHRANK = "shrank"
 """宣言の数が減った（誰かが解放した）。まだ他の宣言は残っている。"""
 
 TIMEOUT = "timeout"
-"""上限まで待った。**少なくとも 1 回は掲示板を完全に読めている**——だから
-「正常に読めた上でまだ使用中」と言い切れる。"""
+"""上限まで待った。**上限に達した、まさにその時点のポーリングで掲示板を完全に
+読めている**——だから「正常に読めた上でまだ使用中」と言い切れる。"""
 
 BROKEN = "broken"
-"""掲示板が**一度も完全に読めないまま**上限に達した。
+"""上限に達した、**その時点のポーリングで掲示板を完全に読めなかった**。
 
-``TIMEOUT`` と畳んではならない。``TIMEOUT`` は「確認した上でまだ使用中」だが、
-こちらは確認そのものが 1 度も取れていない——「使用中」と「読めない」を混同すると、
-読めない掲示板を待ち続けた末に、確認していない使用中を報告することになる
-（issue #17 指摘 4）。"""
+``TIMEOUT`` と畳んではならない。``TIMEOUT`` は「（いま）確認した上でまだ使用中」
+だが、こちらは（いま）確認そのものが取れていない——「使用中」と「読めない」を
+混同すると、読めない掲示板を待ち続けた末に、確認していない使用中を報告する
+ことになる（issue #17 指摘 4）。
+
+**「過去に一度でも読めたか」は判定に使わない。** 待機の序盤だけ読めて、
+以後ずっと読めなくても上限に達したときの状態が未確認なら ``BROKEN`` を返す
+——最初の 1 回だけ読めたことを盾に「確認済みでまだ使用中」と答え続けるのは、
+確認できていない使用中を確認済みと偽ることになる（issue #18 指摘 7）。過去に
+確認できていた事実は捨てない——``wait_unconfirmed`` の監査ログに
+``previously_confirmed`` として残す。"""
 
 
 @dataclass(frozen=True)
@@ -184,14 +191,18 @@ def wait_for_room(
     正しいが、「通す」の中身が「解放済みという積極的な成功表現を返す」になって
     いたのが誤りだった。読めない・部分的にしか読めない場合は**このポーリングを
     無かったことにして次へ回す**（起こさない。件数が減った証拠を持たないため）。
-    **一度も完全に読めないまま上限に達したときだけ** ``BROKEN`` で区別する
-    （issue #17 指摘 4）。fail-open は「待ち続ける」側であって「解放したと嘘を
+    **上限に達した、その時点のポーリングが読めていなければ** ``BROKEN`` で
+    区別する（issue #17 指摘 4）。序盤に一度読めていたことは判定に使わない
+    ——上限到達の直前でずっと読めなくなっていれば、それは未確認である
+    （issue #18 指摘 7）。fail-open は「待ち続ける」側であって「解放したと嘘を
     つく」側ではない。
     """
     started = now()
     polls = 0
     baseline: set[str] | None = None
-    confirmed = False  # 一度でも掲示板を完全に読めたか
+    ever_confirmed = False  # **表示・監査用。** 過去に一度でも完全に読めたか。
+    # 「上限到達時の判定」には使わない——直近が読めていなければ、過去に読めた
+    # 事実は「いま使用中だと確認できている」ことの根拠にならない（issue #18 指摘 7）。
 
     while True:
         keys, complete = holder_keys_detailed(board, resource_id)
@@ -209,11 +220,18 @@ def wait_for_room(
                 resource=resource_id,
                 polls=polls,
                 elapsed_s=round(elapsed, 3),
+                previously_confirmed=ever_confirmed,
             )
             if elapsed >= timeout_s:
-                reason = TIMEOUT if confirmed else BROKEN
+                # **「一度でも読めたか」ではなく「いま読めているか」で判定する。**
+                # `confirmed` を一度立ったら戻らないフラグのままにすると、最初の
+                # 1 回だけ読めてそれ以降ずっと読めなくても `TIMEOUT`（＝確認済みで
+                # まだ使用中）と答えてしまう——上限到達の直前の窓で掲示板が壊れて
+                # いれば、それは「未確認」であって「確認済みで使用中」ではない
+                # （issue #18 指摘 7。過去に確認できていた事実は
+                # `previously_confirmed` として監査ログにだけ残す）。
                 return WaitResult(
-                    reason=reason,
+                    reason=BROKEN,
                     polls=polls,
                     waited_s=elapsed,
                     last=first_declaration(board, resource_id),
@@ -222,7 +240,7 @@ def wait_for_room(
             sleep(min(interval_s, max(0.0, timeout_s - elapsed)))
             continue
 
-        confirmed = True
+        ever_confirmed = True
         if baseline is None:
             baseline = set(keys)
 

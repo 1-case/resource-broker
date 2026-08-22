@@ -42,7 +42,16 @@ DESIGN = ROOT / "docs" / "DESIGN.md"
 #: 足し、History の対応付けの鍵を 2 段階（nonce 優先・job フォールバック）へ
 #: 更新したためである。いずれも「今後も真であり続ける仕様」であって経緯では
 #: ない。
-MAX_LINES = 640
+#:
+#: 680 へ上げたのは、issue #18（型で強制する削除）の修正で、削除の公開入口が
+#: ``ConfirmedEntry`` を要求する設計を Conditional Writes に 1 段落足し、
+#: `OwnRemoval` / `ForcedRemoval` の `unconfirmed` を Releasing の表へ、
+#: `--clean` の完全性判定を Corrupt Entries へ、幽霊退去の完全性ゲートを
+#: Ghost Detection へ、`rb run` 後始末の再列挙しない仕様を Wrapper Spec へ、
+#: `wait` の「その時点のポーリング」判定を Waiting へ、監査対応付けの
+#: nonce 不一致除外を History へ、それぞれ 1 段落ずつ足したためである。
+#: いずれも「今後も真であり続ける仕様」であって経緯ではない。
+MAX_LINES = 680
 
 #: 公開しない文書。**公開物からここへリンクすると参照切れになる。**
 PRIVATE_DOCS = ("EXPERIMENTS.md", "STATUS.md", "tools/speak.py", "tools/speak_dict.json")

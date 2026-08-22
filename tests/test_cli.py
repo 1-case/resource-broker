@@ -388,16 +388,16 @@ def test_a_declaration_that_lands_before_our_write_is_caught(
     """
     import resource_broker.cli as cli_module
 
-    real = cli_module.assess
+    real = cli_module.assess_detailed
     other = build_entry(normalize("GPU0"), job="ほぼ同時の相手", session="other")
 
     def racing(board, resource_id, observation=None):  # type: ignore[no-untyped-def]
-        result = real(board, resource_id, observation)
-        if not result:
+        judged, listing = real(board, resource_id, observation)
+        if not judged:
             board.declare(other)  # 読み終えた直後に他セッションが入る
-        return result
+        return judged, listing
 
-    monkeypatch.setattr(cli_module, "assess", racing)
+    monkeypatch.setattr(cli_module, "assess_detailed", racing)
 
     assert claim(tmp_path, "GPU0", "私のジョブ") == 1, "読み直していない"
 

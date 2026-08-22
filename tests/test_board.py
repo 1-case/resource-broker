@@ -14,7 +14,9 @@ import pytest
 from resource_broker.board import (
     SCHEMA,
     Board,
+    BoardListing,
     Entry,
+    PartialListingError,
     RemovalResult,
     build_entry,
 )
@@ -25,6 +27,18 @@ def _first(board: Board, resource_id: str) -> Entry | None:
     """その資源の**最初の宣言**（無ければ None）。順序は ``since``。"""
     found = board.list_for(resource_id)
     return found[0] if found else None
+
+
+def _wipe(board: Board, resource_id: str, *, reason: str = "テスト") -> int:
+    """テストの後始末用: その資源の宣言を全部消す（``--force`` 相当）。消せた件数を返す。
+
+    ``Board.remove_all`` は廃止した——資源名だけで何件消えるか決まる公開入口は
+    持たない（型で強制する設計）。テストは列挙してから
+    :meth:`Board.remove_selected` へ渡す形に合わせる。
+    """
+    selections = board.pairs_for_detailed(resource_id).confirmed()
+    result = board.remove_selected(resource_id, selections, reason=reason)
+    return len(result.removed)
 
 
 def test_declaring_never_refuses(board: Board) -> None:
@@ -46,7 +60,7 @@ def test_declaring_never_refuses(board: Board) -> None:
 def test_claim_after_release_succeeds(board: Board) -> None:
     """解放した後は再び宣言できる。"""
     board.declare(build_entry("pc-a::GPU0", job="1 本目"))
-    board.remove_all("pc-a::GPU0", reason="テスト")
+    _wipe(board, "pc-a::GPU0")
 
     assert board.declare(build_entry("pc-a::GPU0", job="2 本目")) is True
 
@@ -104,14 +118,14 @@ def test_list_all_skips_unreadable_entries(board: Board) -> None:
 
 
 def test_remove_reports_absence(board: Board) -> None:
-    """存在しない宣言の削除は False を返す（例外にしない）。"""
-    assert board.remove_all("pc-a::GPU0", reason="テスト") == 0
+    """存在しない宣言の削除は 0 件を返す（例外にしない）。"""
+    assert _wipe(board, "pc-a::GPU0") == 0
 
 
 def test_audit_records_claim_and_removal(board: Board) -> None:
     """宣言と削除が監査ログに残る（沈黙は成功ではない）。"""
     board.declare(build_entry("pc-a::GPU0", job="学習"))
-    board.remove_all("pc-a::GPU0", reason="テストのため")
+    _wipe(board, "pc-a::GPU0", reason="テストのため")
 
     lines = [
         json.loads(line)
@@ -421,13 +435,64 @@ def test_a_declaration_in_the_legacy_layout_can_be_removed(tmp_path: Path) -> No
     )
 
     assert (
-        board.remove_if_nonce("pc-a::GPU0", expect_nonce=with_nonce.nonce, reason="テスト")
+        board._remove_if_nonce("pc-a::GPU0", expect_nonce=with_nonce.nonce, reason="テスト")
         is RemovalResult.REMOVED
     )
 
     path, entry = board.pairs_for("pc-a::GPU0")[0]
-    assert board.remove_matching(path, entry, reason="テスト") is RemovalResult.REMOVED
+    assert board._remove_matching(path, entry, reason="テスト") is RemovalResult.REMOVED
     assert board.list_for("pc-a::GPU0") == []
+
+
+def test_remove_matching_returns_absent_when_truly_nothing_remains(tmp_path: Path) -> None:
+    """旧形式（nonce 無し）でも、本当に無ければ ``ABSENT``。"""
+    board = Board(tmp_path)
+    entry = build_entry("pc-a::GPU0", job="唯一の宣言", session="old")
+    entry.holder.pop("nonce", None)
+    path = board.entries_dir
+    path.mkdir(parents=True)
+    target = path / "old.json"
+    target.write_text(json.dumps(entry.to_dict(), ensure_ascii=False), encoding="utf-8")
+
+    assert board._remove_matching(target, entry, reason="テスト") is RemovalResult.REMOVED
+    # 既に消えている。掲示板全体も他に何も無いので、確認できて「無い」と言える。
+    assert board._remove_matching(target, entry, reason="テスト") is RemovalResult.ABSENT
+
+
+def test_remove_matching_does_not_report_absent_when_it_cannot_confirm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**旧形式でも**、「無い」と「確認できない」を分ける（issue #18 指摘 3）。
+
+    以前は ``remove_if_nonce``（新形式）の ``known`` 経路だけがこの区別を持ち、
+    ``remove_matching``（旧形式）は捕獲が ``ABSENT`` に終わった瞬間、掲示板の
+    他の部分が読めるかを一切確かめずに「無い」と断定していた。旧形式の宣言が
+    残っているセッション（ローリング更新の途中）では、この非対称そのものが
+    欠陥である。
+    """
+    board = Board(tmp_path)
+    entry = build_entry("pc-a::GPU0", job="唯一の宣言", session="old")
+    entry.holder.pop("nonce", None)
+    board.entries_dir.mkdir(parents=True)
+    target = board.entries_dir / "old.json"
+    target.write_text(json.dumps(entry.to_dict(), ensure_ascii=False), encoding="utf-8")
+    assert board._remove_matching(target, entry, reason="事前に消す") is RemovalResult.REMOVED
+
+    # 別の宣言をもう 1 件置く。これが読めなくなる。
+    board.declare(build_entry("pc-a::GPU0", job="読めなくなる宣言"))
+
+    real_read_text = Path.read_text
+
+    def boom(self: Path, *args: object, **kwargs: object) -> str:
+        raise PermissionError("共有違反")
+
+    monkeypatch.setattr(Path, "read_text", boom)
+    try:
+        result = board._remove_matching(target, entry, reason="テスト")
+    finally:
+        monkeypatch.setattr(Path, "read_text", real_read_text)
+
+    assert result is RemovalResult.UNCONFIRMED, f"確認できないのに {result} と断定した"
 
 
 def test_an_empty_nonce_is_never_a_cas_key(tmp_path: Path) -> None:
@@ -445,7 +510,7 @@ def test_an_empty_nonce_is_never_a_cas_key(tmp_path: Path) -> None:
             json.dumps(entry.to_dict(), ensure_ascii=False), encoding="utf-8"
         )
 
-    assert board.remove_if_nonce("pc-a::GPU0", expect_nonce="", reason="テスト") is (
+    assert board._remove_if_nonce("pc-a::GPU0", expect_nonce="", reason="テスト") is (
         RemovalResult.NOT_OWNED
     )
     assert len(board.list_for("pc-a::GPU0")) == 2, "空の nonce で宣言が消えた"
@@ -587,6 +652,115 @@ def test_pairs_for_detailed_is_complete_when_nothing_is_broken(board: Board) -> 
     assert [e.job for _, e in listing.pairs] == ["正常"]
 
 
+# --- 型による強制: 完全性を確認していない状態から削除できない（issue #18） --------
+#
+# ここが今回の設計の核心である。低水準の CAS（`_remove_if_nonce` / `_remove_matching`）
+# は private にし、個別の宣言を消す唯一の公開入口 `remove_confirmed` は
+# `ConfirmedEntry` を要求する。`ConfirmedEntry` を作れるのは
+# `BoardListing.confirmed()`（完全性を確認した列挙からのみ、`complete=False` なら
+# 例外）と `Board.confirm_own_declaration()`（自分が書いた宣言）の 2 か所だけである。
+# 「完全性の確認を忘れる」という 3 回繰り返した欠陥の形が、そもそも書けなくなって
+# いることを固定する。
+
+
+def test_listing_confirmed_refuses_to_hand_out_selections_when_incomplete() -> None:
+    """**不完全な列挙からは、削除できる選択を 1 件も作れない。**
+
+    ``BoardListing.confirmed()`` は ``complete=False`` なら
+    ``PartialListingError`` を送出する。これが「完全性を確認し忘れたまま
+    削除へ進む」という経路そのものを塞ぐ——``ConfirmedEntry`` を得る手段が
+    他に無いので、確認を飛ばしたコードは実行時に必ず落ちる。
+    """
+    entry = build_entry("pc-a::GPU0", job="読めなかった側に隠れているかもしれない宣言")
+    incomplete = BoardListing(pairs=[(Path("dummy.json"), entry)], complete=False)
+
+    with pytest.raises(PartialListingError):
+        incomplete.confirmed()
+
+
+def test_listing_confirmed_succeeds_when_complete(board: Board) -> None:
+    """対照: 完全な列挙からは、パスと同じ並び・同じ長さで選択が作れる。"""
+    board.declare(build_entry("pc-a::GPU0", job="正常"))
+    listing = board.pairs_for_detailed("pc-a::GPU0")
+
+    selections = listing.confirmed()
+
+    assert [s.entry.job for s in selections] == ["正常"]
+    assert [s.path for s in selections] == [path for path, _ in listing.pairs]
+
+
+def test_remove_confirmed_refuses_anything_that_is_not_a_confirmed_entry(
+    board: Board,
+) -> None:
+    """**公開の削除入口は ``ConfirmedEntry`` でなければ呼べない。**
+
+    生の ``(Path, Entry)`` タプルや、それらしく見える別の型を渡しても、
+    ``TypeError`` で拒否する。渡すものが手元に無ければ削除できない
+    ——「完全性を確認したつもり」で実は確認していない状態を、型で締め出す。
+    """
+    entry = build_entry("pc-a::GPU0", job="対象")
+    board.declare(entry)
+    path = board.pairs_for("pc-a::GPU0")[0][0]
+
+    with pytest.raises(TypeError):
+        board.remove_confirmed((path, entry), reason="テスト")  # type: ignore[arg-type]
+
+    # 拒否しただけで、何も消えていないことも確かめる。
+    assert board.list_for("pc-a::GPU0") != []
+
+
+def test_remove_confirmed_accepts_a_confirmed_entry_from_the_listing(board: Board) -> None:
+    """対照: ``BoardListing.confirmed()`` で得た選択はそのまま渡して消せる。"""
+    board.declare(build_entry("pc-a::GPU0", job="対象"))
+    (selection,) = board.pairs_for_detailed("pc-a::GPU0").confirmed()
+
+    assert board.remove_confirmed(selection, reason="テスト") is RemovalResult.REMOVED
+    assert board.list_for("pc-a::GPU0") == []
+
+
+def test_confirm_own_declaration_needs_no_complete_listing(board: Board) -> None:
+    """``confirm_own_declaration`` は列挙を経由しない——自分が書いた実体を直接指せる。
+
+    ``rb run`` の後始末はこれを使う。列挙を経由しないので、掲示板の他の部分が
+    壊れていても（このテストではそもそも他に何も無いが）影響を受けない。
+    """
+    entry = build_entry("pc-a::GPU0", job="自分が書いた宣言")
+    assert board.declare(entry)
+
+    selection = board.confirm_own_declaration(entry)
+
+    assert board.remove_confirmed(selection, reason="テスト") is RemovalResult.REMOVED
+
+
+def test_remove_own_cannot_be_called_without_declared() -> None:
+    """``remove_own`` は ``declared``（完全性を確認済みの選択）が必須である。
+
+    以前は ``None`` 許容の任意引数で、渡さないと内部で ``pairs_for``
+    （完全性を捨てる再列挙）が走っていた——``rb run`` の自動解放がまさに
+    これを渡し忘れていた（issue #18 指摘 2）。必須にすることで「渡し忘れる」
+    という事態そのものが ``TypeError`` になる。
+    """
+    with pytest.raises(TypeError):
+        Board(Path("dummy")).remove_own(  # type: ignore[call-arg]
+            "pc-a::GPU0", reason="テスト", nonce="なんでも"
+        )
+
+
+def test_remove_selected_requires_a_list_of_confirmed_entries(board: Board) -> None:
+    """``remove_selected``（``--force`` の実体）も、確認済みの選択の並びを要求する。
+
+    渡した並び**以外**は対象にならない——資源名だけで何件消えるか決まる
+    公開入口はここには無い。並びの中身が ``ConfirmedEntry`` でなければ、
+    その 1 件で ``TypeError`` になる（``remove_confirmed`` が内部で検査する）。
+    """
+    entry = build_entry("pc-a::GPU0", job="対象")
+    board.declare(entry)
+    path = board.pairs_for("pc-a::GPU0")[0][0]
+
+    with pytest.raises(TypeError):
+        board.remove_selected("pc-a::GPU0", [(path, entry)], reason="テスト")  # type: ignore[list-item]
+
+
 # --- known を渡した CAS: ABSENT と「確認できない」を分ける（issue #17 指摘 2・3） ---
 
 
@@ -596,7 +770,7 @@ def test_remove_if_nonce_with_known_removes_the_exact_entity(board: Board) -> No
     board.declare(entry)
     path, found = board.pairs_for("pc-a::GPU0")[0]
 
-    result = board.remove_if_nonce(
+    result = board._remove_if_nonce(
         "pc-a::GPU0", expect_nonce=entry.nonce, reason="テスト", known=(path, found)
     )
 
@@ -617,13 +791,13 @@ def test_remove_if_nonce_with_known_distinguishes_absent_from_swapped(
     board.declare(build_entry("pc-a::GPU0", job="消える方"))
     gone_path, gone_entry = board.pairs_for("pc-a::GPU0")[0]
     assert (
-        board.remove_if_nonce("pc-a::GPU0", expect_nonce=gone_entry.nonce, reason="事前に消す")
+        board._remove_if_nonce("pc-a::GPU0", expect_nonce=gone_entry.nonce, reason="事前に消す")
         is RemovalResult.REMOVED
     )
     # 消えた直後に、別の宣言が現れる（他セッションが取り直した想定）。
     board.declare(build_entry("pc-a::GPU0", job="入れ替わった方"))
 
-    result = board.remove_if_nonce(
+    result = board._remove_if_nonce(
         "pc-a::GPU0", expect_nonce=gone_entry.nonce, reason="テスト", known=(gone_path, gone_entry)
     )
 
@@ -638,11 +812,11 @@ def test_remove_if_nonce_with_known_returns_absent_when_truly_nothing_remains(
     board.declare(build_entry("pc-a::GPU0", job="唯一の宣言"))
     path, entry = board.pairs_for("pc-a::GPU0")[0]
     assert (
-        board.remove_if_nonce("pc-a::GPU0", expect_nonce=entry.nonce, reason="事前に消す")
+        board._remove_if_nonce("pc-a::GPU0", expect_nonce=entry.nonce, reason="事前に消す")
         is RemovalResult.REMOVED
     )
 
-    result = board.remove_if_nonce(
+    result = board._remove_if_nonce(
         "pc-a::GPU0", expect_nonce=entry.nonce, reason="テスト", known=(path, entry)
     )
 
@@ -657,13 +831,14 @@ def test_remove_if_nonce_known_absent_recheck_that_cannot_read_is_not_reported_a
     ``known`` の実体が消えていたので確かめ直そうとしたら、その確かめ直し自体が
     読めなかった——このとき「本当に無い」と「確認できない」を混同すると、実は
     生きている別の宣言を見落として「解放した」と嘘をつくことになる（issue #17
-    指摘 2 の「削除直前の読取失敗」）。専用の結果値は増やさず ``FAILED`` に倒す
-    （呼び出し側は既に「消えたと言わない」経路を持つ）。
+    指摘 2 の「削除直前の読取失敗」）。``UNCONFIRMED`` という独立の値に倒す
+    ——``FAILED``（掲示板は読めた上で I/O が失敗した）と畳むと、CLI の終了
+    コードが「使用中で消せなかった」に化ける（issue #18 指摘 4）。
     """
     board.declare(build_entry("pc-a::GPU0", job="唯一の宣言"))
     path, entry = board.pairs_for("pc-a::GPU0")[0]
     assert (
-        board.remove_if_nonce("pc-a::GPU0", expect_nonce=entry.nonce, reason="事前に消す")
+        board._remove_if_nonce("pc-a::GPU0", expect_nonce=entry.nonce, reason="事前に消す")
         is RemovalResult.REMOVED
     )
     # 別の宣言をもう 1 件置く。これが読めなくなる。
@@ -676,10 +851,10 @@ def test_remove_if_nonce_known_absent_recheck_that_cannot_read_is_not_reported_a
 
     monkeypatch.setattr(Path, "read_text", boom)
     try:
-        result = board.remove_if_nonce(
+        result = board._remove_if_nonce(
             "pc-a::GPU0", expect_nonce=entry.nonce, reason="テスト", known=(path, entry)
         )
     finally:
         monkeypatch.setattr(Path, "read_text", real_read_text)
 
-    assert result is RemovalResult.FAILED, f"確認できないのに {result} と断定した"
+    assert result is RemovalResult.UNCONFIRMED, f"確認できないのに {result} と断定した"

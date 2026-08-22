@@ -243,6 +243,95 @@ def test_release_own_refuses_on_an_unrelated_corrupt_file(tmp_path: Path) -> Non
     assert len(Board(tmp_path).list_for(RESOURCE)) == 1
 
 
+# --- UNCONFIRMED は EXIT_BUSY に畳まない（issue #18 指摘 4） ---------------------
+
+
+def test_release_own_returns_exit_broken_when_the_deletion_cannot_be_confirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """**選択後、削除の直前に掲示板が読めなくなったら** ``EXIT_BUSY`` ではなく ``EXIT_BROKEN``。
+
+    ``remove_confirmed`` が返す ``UNCONFIRMED``（＝消せたか再確認できなかった）を、
+    以前は ``FAILED``（掲示板は読めた上で消せなかった）と畳んでいたため、
+    CLI は一律 ``EXIT_BUSY`` を返していた——「使用中で消せなかった」と
+    「確認そのものが取れていない」は終了コードの意味が違う（issue #18 指摘 4）。
+
+    捕獲（``os.rename``）を ``FileNotFoundError`` にして ``ABSENT`` を作り、
+    その直後の再確認（``pairs_for_detailed``）も読めなくすることで、
+    「選択した時点では完全に読めていたが、削除の窓で読めなくなった」を再現する。
+    """
+    assert claim(tmp_path, "GPU0", "消せるはずの宣言") == EXIT_OK
+
+    import os as os_module
+
+    def rename_always_absent(*_args: object, **_kwargs: object) -> None:
+        raise FileNotFoundError("既に無い（捕獲時に強制する）")
+
+    def read_text_always_broken(self: Path, *args: object, **kwargs: object) -> str:
+        raise PermissionError("共有違反（注入）")
+
+    original_remove_confirmed = Board.remove_confirmed
+    state = {"done": False}
+
+    def interleaved_remove_confirmed(self: Board, selection: object, *, reason: str):  # type: ignore[no-untyped-def]
+        if not state["done"]:
+            state["done"] = True
+            monkeypatch.setattr(os_module, "rename", rename_always_absent)
+            monkeypatch.setattr(Path, "read_text", read_text_always_broken)
+        return original_remove_confirmed(self, selection, reason=reason)
+
+    monkeypatch.setattr(Board, "remove_confirmed", interleaved_remove_confirmed)
+    capsys.readouterr()
+
+    code = run(tmp_path, "release", "GPU0")
+
+    assert code == EXIT_BROKEN, f"確認できていないのに {code} を返した"
+    assert code != EXIT_BUSY, "確認できないことを「使用中」に畳んでいる"
+    assert "確認できませんでした" in capsys.readouterr().err
+
+
+def test_release_by_nonce_force_returns_exit_broken_when_the_deletion_cannot_be_confirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--nonce --force`` でも同じ——``UNCONFIRMED`` は ``EXIT_BROKEN``。
+
+    ``--force`` の単発削除は ``remove_confirmed`` を直接呼ぶ経路であり、
+    ``remove_own`` を経由する経路とは別に終了コードの配線を確認する必要がある
+    （issue #18 指摘 4 は「全経路が同じ表を通っているか」を問うている）。
+    """
+    assert claim(tmp_path, "GPU0", "消せるはずの宣言") == EXIT_OK
+    board = Board(tmp_path)
+    prefix = board.list_for(RESOURCE)[0].nonce[:8]
+
+    import os as os_module
+
+    def rename_always_absent(*_args: object, **_kwargs: object) -> None:
+        raise FileNotFoundError("既に無い（捕獲時に強制する）")
+
+    def read_text_always_broken(self: Path, *args: object, **kwargs: object) -> str:
+        raise PermissionError("共有違反（注入）")
+
+    # **一致・所有判定が済んだあと（削除の直前）にだけ壊す。** ここより前で
+    # `Path.read_text` を壊すと、`_release_by_nonce` 冒頭の
+    # `board.list_all_detailed()` そのものが不完全になり、この関数が本来
+    # 検査したい「削除直前の窓」ではなく別の（既存の）分岐を通ってしまう。
+    original_remove_confirmed = Board.remove_confirmed
+
+    def interleaved_remove_confirmed(self: Board, selection: object, *, reason: str):  # type: ignore[no-untyped-def]
+        monkeypatch.setattr(os_module, "rename", rename_always_absent)
+        monkeypatch.setattr(Path, "read_text", read_text_always_broken)
+        return original_remove_confirmed(self, selection, reason=reason)
+
+    monkeypatch.setattr(Board, "remove_confirmed", interleaved_remove_confirmed)
+    capsys.readouterr()
+
+    code = run(tmp_path, "release", "--nonce", prefix, "--force")
+
+    assert code == EXIT_BROKEN, f"確認できていないのに {code} を返した"
+    assert code != EXIT_BUSY
+    assert "確認できませんでした" in capsys.readouterr().err
+
+
 def test_release_all_refuses_when_the_whole_board_is_unreadable(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -677,8 +766,8 @@ def test_release_by_nonce_does_not_remove_a_declaration_reclaimed_mid_flight(
 ) -> None:
     """``--nonce`` でも、選択後に対象が消えて別の宣言に入れ替わっていれば消さない。
 
-    ``_release_by_nonce`` は選択で得た ``(Path, Entry)`` を ``known`` として
-    ``remove_if_nonce`` へ渡す。渡した実体そのものが既に無くても、**別の宣言が
+    ``_release_by_nonce`` は選択で得た実体を :class:`ConfirmedEntry` にして
+    ``remove_confirmed`` へ渡す。渡した実体そのものが既に無くても、**別の宣言が
     そこに現れていれば「無い」ではなく「入れ替わった」**と答えなければならない
     ——でなければ、消していない他人の生きた宣言を「解放した」と偽ることになる
     （issue #17 指摘 2・3）。
@@ -687,25 +776,18 @@ def test_release_by_nonce_does_not_remove_a_declaration_reclaimed_mid_flight(
     board = Board(tmp_path)
     prefix = board.list_for(RESOURCE)[0].nonce[:8]
 
-    original = Board.remove_if_nonce
+    original = Board.remove_confirmed
     state = {"nested": False}
 
-    def interleave(
-        self: Board,
-        resource_id: str,
-        *,
-        expect_nonce: str,
-        reason: str,
-        known: tuple | None = None,
-    ) -> RemovalResult:
+    def interleave(self: Board, selection: object, *, reason: str) -> RemovalResult:
         if not state["nested"]:
             state["nested"] = True
             # 選択が終わった直後、削除の直前に T が force で取り直す。
             assert run(tmp_path, "release", "GPU0", "--force") == EXIT_OK
             assert claim(tmp_path, "GPU0", "後から入れ替わった方") == EXIT_OK
-        return original(self, resource_id, expect_nonce=expect_nonce, reason=reason, known=known)
+        return original(self, selection, reason=reason)
 
-    monkeypatch.setattr(Board, "remove_if_nonce", interleave)
+    monkeypatch.setattr(Board, "remove_confirmed", interleave)
     capsys.readouterr()
 
     code = run(tmp_path, "release", "--nonce", prefix)
@@ -767,6 +849,66 @@ def test_release_force_still_removes_everything_regardless_of_ownership(
     assert board.list_for(RESOURCE) == []
 
 
+def test_release_force_does_not_sweep_a_declaration_that_appears_after_selecting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--force`` も選択に使った実体だけを消す。選択後に現れた宣言は巻き込まない。
+
+    以前は表示用に ``pairs_for_detailed`` で列挙したあと、削除は
+    ``Board.remove_all`` が内部で ``pairs_for`` により**別に列挙し直して**いた
+    ——選択と削除が別々の読み取りに基づくため、表示した対象と実際に消した
+    対象が食い違いうる（issue #15 指摘 12・issue #18 末尾）。いまは
+    :meth:`BoardListing.confirmed` で得た同じ並びをそのまま
+    :meth:`Board.remove_selected` へ渡すので、選択後に現れた宣言（``--force``
+    でも一度も見ていない個体）は対象に入らない。
+    """
+    assert claim(tmp_path, "GPU0", "選択される方") == EXIT_OK
+
+    original = Board.pairs_for_detailed
+    injected = {"done": False}
+
+    def _with_race(self: Board, resource_id: str):  # type: ignore[no-untyped-def]
+        result = original(self, resource_id)
+        if not injected["done"] and resource_id == RESOURCE:
+            injected["done"] = True
+            assert claim(tmp_path, "GPU0", "選択後に現れた方", "--share") == EXIT_OK
+        return result
+
+    monkeypatch.setattr(Board, "pairs_for_detailed", _with_race)
+
+    assert run(tmp_path, "release", "GPU0", "--force") == EXIT_OK
+
+    remaining = Board(tmp_path).list_for(RESOURCE)
+    assert [e.job for e in remaining] == ["選択後に現れた方"]
+
+
+def test_board_has_no_resource_name_only_wipe_method() -> None:
+    """**資源名だけで何件消えるか決まる公開入口は無い。**
+
+    ``Board.remove_all(resource_id)`` のような「名前で一掃する」メソッドは
+    廃した——削除の公開入口（:meth:`Board.remove_confirmed` /
+    :meth:`Board.remove_own` / :meth:`Board.remove_selected`）は、いずれも
+    掲示板を読んだ結果として列挙された個体（``ConfirmedEntry`` の並び）を
+    引数として要求する。この構造そのものを、公開 API の型シグネチャから
+    直接確かめる——「この関数は名前だけで何件消えるか決まるか」を問い、
+    Yes になる公開メソッドが 1 つも無いことを列挙して固定する。
+    """
+    import inspect
+
+    assert not hasattr(Board, "remove_all"), "資源名だけで全消しする入口が復活している"
+
+    destructive = ("remove_confirmed", "remove_own", "remove_selected")
+    for name in destructive:
+        method = getattr(Board, name)
+        params = inspect.signature(method).parameters
+        # **「選択の並び」を表す引数を必ず持つ。** 名前は経路ごとに違うが、
+        # いずれも「掲示板を読んだ結果」を渡さなければ呼べない形になっている
+        # ことを、シグネチャの存在で確かめる。
+        assert {"selection", "declared", "selections"} & set(params), (
+            f"{name} が選択の並びを引数として要求していない: {list(params)}"
+        )
+
+
 def test_release_force_refuses_when_the_whole_board_is_unreadable(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -797,20 +939,30 @@ def test_release_force_returns_exit_broken_when_some_removals_fail(
     assert claim(tmp_path, "GPU0", "1 本目") == EXIT_OK
     assert claim(tmp_path, "GPU0", "2 本目", "--share") == EXIT_OK
 
-    from resource_broker import board as board_module
+    import os as os_module
 
-    original = board_module._unlink_with_retry
+    from resource_broker.board import UNLINK_ATTEMPTS
+
+    # **`os.rename`（CAS の「捕まえる」段）を失敗させる。** 削除を実際に塞ぐのは
+    # ここであって、捕まえたあとの tombstone の後始末（`_unlink_with_retry`）では
+    # ない——tombstone だけが消せなくても、掲示板からは既に見えなくなっている
+    # ので「消せた」扱いになる（DESIGN.md「Known Residuals」）。
+    original = os_module.rename
     calls = {"n": 0}
 
-    def flaky(path):  # type: ignore[no-untyped-def]
-        # **最初の 1 回だけ失敗させる。** 2 件のうち 1 件だけが消えない状況
-        # （共有違反）を作る。以降（2 件目の削除・ロックの解放）は素通しする。
+    def flaky(*args: object, **kwargs: object) -> None:
+        # **最初の 1 件だけ、やり直しの回数を使い切らせて失敗させる。** 1 回の
+        # 失敗は `_rename_with_retry` が自分で吸収してしまうため、2 件のうち
+        # 1 件だけが消えない状況（恒常的な共有違反）を作るには、その 1 件の
+        # 再試行を全部潰す必要がある。以降（2 件目の削除・ロックの解放）は
+        # 素通しする。
         calls["n"] += 1
-        if calls["n"] == 1:
-            return board_module.RemovalResult.FAILED, "共有違反（注入）"
-        return original(path)
+        if calls["n"] <= UNLINK_ATTEMPTS:
+            raise PermissionError("共有違反（注入）")
+        return original(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(board_module, "_unlink_with_retry", flaky)
+    monkeypatch.setattr(os_module, "rename", flaky)
+    monkeypatch.setattr("resource_broker.board.UNLINK_DELAY_S", 0.0)
 
     code = run(tmp_path, "release", "GPU0", "--force")
 
@@ -829,11 +981,12 @@ def test_run_auto_release_does_not_go_through_cmd_release(
     """``rb run`` の後始末は ``_cmd_release`` を経由しない（設計どおり）。
 
     ``_cmd_release`` に nonce 対応の分岐を足しても、ラッパーの後始末
-    （``_release_after_run`` → ``board.remove_own(..., nonce=entry.nonce)``）には
-    一切影響しないはずである。``_cmd_release`` をスパイに差し替え、**呼ばれた回数**
-    で経路の独立性を直接確かめる（``_release_after_run`` は後始末の失敗でジョブの
-    結果を変えないよう例外を全て握りつぶすので、「呼ばれたら例外を出す」実装では
-    握りつぶされて検出力を持たない）。
+    （``_release_after_run`` → ``board.confirm_own_declaration`` +
+    ``board.remove_confirmed``）には一切影響しないはずである。``_cmd_release``
+    をスパイに差し替え、**呼ばれた回数**で経路の独立性を直接確かめる
+    （``_release_after_run`` は後始末の失敗でジョブの結果を変えないよう例外を
+    全て握りつぶすので、「呼ばれたら例外を出す」実装では握りつぶされて検出力を
+    持たない）。
     """
     calls: list[object] = []
     original_cmd_release = cli._cmd_release
@@ -864,6 +1017,45 @@ def test_run_auto_release_does_not_go_through_cmd_release(
     assert exit_code == 0
     assert calls == []  # `_cmd_release` を一度も経由していない
     assert Board(tmp_path).list_for(RESOURCE) == []
+
+
+def test_run_auto_release_does_not_re_enumerate_the_board(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``rb run`` の後始末は、この資源を**列挙し直さない**（issue #18 指摘 2）。
+
+    以前は ``board.remove_own(resource_id, nonce=entry.nonce)`` を呼んでおり、
+    ``declared`` を渡さないため内部で ``pairs_for``（資源全体の再列挙）が走って
+    いた——自分で作った ``entry`` と ``nonce`` を既に持っているのに、である。
+    ``_release_after_run`` を直接呼び、``Board.pairs_for`` /
+    ``Board.pairs_for_detailed`` が**1 度も呼ばれないこと**を確かめる
+    （``rb run`` 全体を CLI 経由で回すと、取得段階の ``acquire`` 自体が
+    ``pairs_for_detailed`` を呼ぶため、後始末だけを切り出して検査する）。
+    """
+    board = Board(tmp_path)
+    entry = build_entry(RESOURCE, job="再列挙しないことの確認", pid=12345)
+    assert board.declare(entry)
+
+    calls: list[str] = []
+    original_pairs_for = Board.pairs_for
+    original_pairs_for_detailed = Board.pairs_for_detailed
+
+    def spy_pairs_for(self: Board, resource_id: str) -> list:  # type: ignore[type-arg]
+        calls.append("pairs_for")
+        return original_pairs_for(self, resource_id)
+
+    def spy_pairs_for_detailed(self: Board, resource_id: str) -> object:
+        calls.append("pairs_for_detailed")
+        return original_pairs_for_detailed(self, resource_id)
+
+    monkeypatch.setattr(Board, "pairs_for", spy_pairs_for)
+    monkeypatch.setattr(Board, "pairs_for_detailed", spy_pairs_for_detailed)
+
+    cli._release_after_run(board, RESOURCE, entry, declared=True, exit_code=0)
+
+    # **検証の呼び出し自体が `pairs_for` を使うので、先に判定する。**
+    assert calls == [], f"後始末が資源を再列挙した: {calls}"
+    assert list((tmp_path / "board").glob("*.json")) == []
 
 
 # --- rb status に nonce 先頭 8 桁が出ること ---------------------------------------
@@ -948,9 +1140,15 @@ def test_release_exit_codes_match_the_command_by_outcome_table() -> None:
         assert code == EXIT_BROKEN, f"{args} が読めない掲示板を {code} で通した"
         assert code not in (EXIT_OK, EXIT_BUSY, EXIT_USAGE)
 
-    # **`--clean` だけは対象外。** 読めない・壊れたファイルを消すための経路なので、
-    # 完全性で門前払いしてはならない。
+    # **`--clean` も、走査そのものができなければ ``EXIT_BROKEN``。**
+    # 「壊れたファイルを消すための経路だから完全性を問わない」のではない
+    # ——**走査すらできなかった場合に「読めないファイルはありませんでした」
+    # ＋ ``EXIT_OK`` と積極的な成功表現を返していたのが欠陥そのものである**
+    # （issue #18 指摘 5。旧版のこのテストはこの誤った挙動を仕様として
+    # 固定していた——Codex いわく「盲点ではなく、問題のある意味をテストが
+    # 固定している」）。個別の壊れたファイルを掃除する経路自体は変わらず
+    # 対象内（別テストで確認する）。
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         whole_board_unreadable(tmp_path)
-        assert run(tmp_path, "release", "--clean") == EXIT_OK
+        assert run(tmp_path, "release", "--clean") == EXIT_BROKEN

@@ -27,8 +27,12 @@ from pathlib import Path
 from . import clock, liveness, naming, platform_info, runner, waiting
 from .board import (
     Board,
+    BoardListing,
+    ConfirmedEntry,
     Entry,
+    ForcedRemoval,
     LockState,
+    OwnRemoval,
     RemovalResult,
     UpdateResult,
     build_entry,
@@ -67,6 +71,59 @@ EXIT_BROKEN = 3
 #: 新規のコードは ``EXIT_BROKEN`` を使うこと——この名前は互換のためだけに残す。
 EXIT_WAIT_BROKEN = EXIT_BROKEN
 
+#: ``RemovalResult`` → 終了コードの対応。**この辞書だけを直す。**
+#:
+#: 各所で ``if result is RemovalResult.FAILED: return EXIT_BUSY`` と書けるように
+#: しない——3 回のレビューで毎回「ここだけ書き忘れた」「ここだけ ``EXIT_BUSY`` へ
+#: 畳んだ」が出た（issue #18 指摘 4）。削除結果を終了コードへ写す箇所は、
+#: 単発の削除（``release --nonce --force``）でも複数件の集計
+#: （:func:`_exit_for_own_removal` / :func:`_exit_for_forced_removal`）でも、
+#: 必ずこの表を経由させる。**この表そのものをテストで固定する。**
+_REMOVAL_EXIT: dict[RemovalResult, int] = {
+    RemovalResult.REMOVED: EXIT_OK,
+    RemovalResult.ABSENT: EXIT_OK,
+    RemovalResult.NOT_OWNED: EXIT_BUSY,
+    RemovalResult.FAILED: EXIT_BUSY,
+    RemovalResult.UNCONFIRMED: EXIT_BROKEN,
+}
+
+
+def _exit_for_removal(result: RemovalResult) -> int:
+    """単発の :class:`RemovalResult` を終了コードへ写す。"""
+    return _REMOVAL_EXIT[result]
+
+
+def _exit_for_own_removal(result: OwnRemoval) -> int:
+    """:class:`OwnRemoval`（自分の宣言だけを対象にした削除）を終了コードへ写す。
+
+    優先順位は「確認できなかった」＞「入れ替わった／消せなかった」＞「消せた」
+    ＞「そもそも対象が無かった」＞「他人のものしか無かった」——1 件でも異常が
+    あれば、たとえ他の 1 件が消せていても素直な成功としては返さない
+    （呼び出し側が次の手順へ黙って進まないようにするため）。
+    """
+    if result.unconfirmed:
+        return EXIT_BROKEN
+    if result.swapped or result.failed:
+        return EXIT_BUSY
+    if result.removed:
+        return EXIT_OK
+    if not result.any_here:
+        return EXIT_OK
+    return EXIT_BUSY  # foreign のみ
+
+
+def _exit_for_forced_removal(result: ForcedRemoval) -> int:
+    """:class:`ForcedRemoval`（``--force``）を終了コードへ写す。
+
+    優先順位は :func:`_exit_for_own_removal` と同じ考え方——1 件でも
+    「確認できなかった」「入れ替わった」「消せなかった」があれば、
+    他が消せていても素直な成功（``EXIT_OK``）としては返さない。
+    """
+    if result.unconfirmed or result.swapped or result.failed:
+        return EXIT_BROKEN
+    return EXIT_OK
+
+
 #: ``--found`` の受け付ける値と、それが表す実測の結論。
 FOUND_CHOICES: dict[str, bool | None] = {"busy": True, "free": False, "unknown": None}
 
@@ -74,15 +131,16 @@ FOUND_CHOICES: dict[str, bool | None] = {"busy": True, "free": False, "unknown":
 SPAWN: runner.Spawn = runner.default_spawn
 
 
-def assess(
+def assess_detailed(
     board: Board, resource_id: str, observation: Observation | None = None
-) -> list[tuple[Verdict, Entry]]:
-    """その資源の宣言を**1 件ずつ**判定する。古い順に返す。
+) -> tuple[list[tuple[Verdict, Path, Entry]], BoardListing]:
+    """その資源の宣言を**1 件ずつ**判定する。**完全性つき**（:class:`BoardListing`）。
 
-    **どれが先に取ったかで扱いを変えない。** 宣言は対等であり、生きているか幽霊かは
-    それぞれの ``since`` / ``boot`` / PID で決まる。役割を持たせていた頃は、
-    片方（主宣言）が消えるともう片方（相乗り）の意味が変わってしまい、走っている
-    作業がいるのに「空き」と答える経路になっていた。
+    破壊的な判断（``claim`` の幽霊退去・``--force``）はこちらを使うこと。
+    ``pairs_for``（完全性を捨てる）ではなく :meth:`Board.pairs_for_detailed`
+    から作るため、掲示板の一部が読めなかったかを呼び出し側が確かめられる
+    ——読めなかった側に生きた宣言が隠れているかもしれないのに、それを見失った
+    まま「幽霊しかいない」「空いている」と誤認する経路を閉じる（issue #18 指摘 1）。
 
     Parameters
     ----------
@@ -91,11 +149,20 @@ def assess(
         **本関数は資源を調べない**。資源の種別で分岐する箇所はここに存在しない。
         実測は資源の状態であって宣言ごとの状態ではないので、**全ての宣言に同じ値を
         渡す**（「使用中」は誰か 1 人でも生きていれば真、という向きで効く）。
+
+    Returns
+    -------
+    tuple of (list of (Verdict, Path, Entry), BoardListing)
+        古い順の判定結果と、元になった列挙。``listing.complete`` が ``False``
+        のときは判定そのものが不完全な集合に基づいている。``listing.confirmed()``
+        は判定と同じ並び・同じ長さで対応するので、ゲーストを退けるときは
+        ``zip`` して個体を選べる。
     """
+    listing = board.pairs_for_detailed(resource_id)
     now = clock.now()
     boot = platform_info.boot_time()
-    judged: list[tuple[Verdict, Entry]] = []
-    for entry in board.list_for(resource_id):
+    judged: list[tuple[Verdict, Path, Entry]] = []
+    for path, entry in listing.pairs:
         verdict = liveness.judge(
             has_entry=True,
             since=entry.since_dt,
@@ -104,19 +171,40 @@ def assess(
             pid_alive=platform_info.pid_alive(entry.pid),
             now=now,
         )
-        judged.append((verdict, entry))
-    return judged
+        judged.append((verdict, path, entry))
+    return judged, listing
+
+
+def assess(
+    board: Board, resource_id: str, observation: Observation | None = None
+) -> list[tuple[Verdict, Entry]]:
+    """その資源の宣言を**1 件ずつ**判定する。古い順に返す。**完全性は捨てる**（表示用）。
+
+    **どれが先に取ったかで扱いを変えない。** 宣言は対等であり、生きているか幽霊かは
+    それぞれの ``since`` / ``boot`` / PID で決まる。役割を持たせていた頃は、
+    片方（主宣言）が消えるともう片方（相乗り）の意味が変わってしまい、走っている
+    作業がいるのに「空き」と答える経路になっていた。
+
+    破壊的な判断には :func:`assess_detailed` を使うこと。
+    """
+    judged, _ = assess_detailed(board, resource_id, observation)
+    return [(verdict, entry) for verdict, _, entry in judged]
+
+
+def live_declarations_detailed(
+    board: Board, resource_id: str, observation: Observation | None = None
+) -> tuple[list[Entry], BoardListing]:
+    """幽霊と判定されなかった宣言だけを古い順に返す。**完全性つき**。"""
+    judged, listing = assess_detailed(board, resource_id, observation)
+    return [e for verdict, _, e in judged if not liveness.is_free(verdict)], listing
 
 
 def live_declarations(
     board: Board, resource_id: str, observation: Observation | None = None
 ) -> list[Entry]:
-    """幽霊と判定されなかった宣言だけを古い順に返す。"""
-    return [
-        e
-        for verdict, e in assess(board, resource_id, observation)
-        if not liveness.is_free(verdict)
-    ]
+    """幽霊と判定されなかった宣言だけを古い順に返す。**完全性は捨てる**（表示用）。"""
+    entries, _ = live_declarations_detailed(board, resource_id, observation)
+    return entries
 
 
 def _known_resources(board: Board) -> list[str]:
@@ -361,34 +449,70 @@ def acquire(
             )
             board.audit("claim_unlocked", resource=resource_id, lock=str(lock))
 
-        judged = assess(board, resource_id, observation)
-        ghosts = [e for verdict, e in judged if liveness.is_free(verdict)]
-        living = [e for verdict, e in judged if not liveness.is_free(verdict)]
+        judged, listing = assess_detailed(board, resource_id, observation)
 
-        # **幽霊は退ける。** 根拠は 3 つのいずれかで、判定は 1 件ずつ独立している。
-        for ghost in ghosts:
-            reason = "強制取得" if force else "幽霊と判定した"
-            removal = board.remove_if_nonce(resource_id, expect_nonce=ghost.nonce, reason=reason)
-            if removal not in (RemovalResult.REMOVED, RemovalResult.ABSENT):
-                # **消せなかったことを「使用中」に化けさせない。** 掲示板のファイルを
-                # 消せなかっただけで、資源の保持者を確認したわけではない。平坦化で
-                # 幽霊のファイルは何も塞がなくなった（名前が nonce なので新しい宣言は
-                # 作れる）ので、退去に失敗しても取得を通してよい。fail-open は
-                # 「本ツール側の故障で作業を止めない」ことである。
-                notices.append(_explain_failed_displacement(removal))
+        if not listing.complete:
+            # **完全でないときは退去を一切行わない。** 読めなかった側に、いま
+            # 「幽霊」と判定した宣言の生きた入れ替わり先や、追加の生きた宣言が
+            # 隠れているかもしれない——不完全な候補集合から他人の宣言を消すのが
+            # issue #18 指摘 1 の欠陥そのものである。``claim`` 本体の fail-open は
+            # 変えない（資源アクセスは止めない）が、**退去だけは止める**。
+            notices.append(
+                "[rb] 掲示板の一部を読めませんでした。**退去は行わず**続行します"
+                "（生きた宣言を見逃している可能性があります）"
+            )
+            board.audit(
+                "claim_unconfirmed",
+                resource=resource_id,
+                reason="掲示板の一部が読めない",
+                force=force,
+            )
+            living = [e for verdict, _, e in judged if not liveness.is_free(verdict)]
+        else:
+            # **幽霊は退ける。** 根拠は 3 つのいずれかで、判定は 1 件ずつ独立している。
+            # 選択に使った実体（``listing.confirmed()``）をそのまま渡すので、
+            # 削除の直前で完全性の情報を捨て直さない（issue #17 指摘 2 と対）。
+            selections = listing.confirmed()
+            for (verdict, _path, entry), selection in zip(judged, selections, strict=True):
+                if not liveness.is_free(verdict):
+                    continue
+                reason = "強制取得" if force else "幽霊と判定した"
+                removal = board.remove_confirmed(selection, reason=reason)
+                if removal not in (RemovalResult.REMOVED, RemovalResult.ABSENT):
+                    # **消せなかったことを「使用中」に化けさせない。** 掲示板のファイルを
+                    # 消せなかっただけで、資源の保持者を確認したわけではない。平坦化で
+                    # 幽霊のファイルは何も塞がなくなった（名前が nonce なので新しい宣言は
+                    # 作れる）ので、退去に失敗しても取得を通してよい。fail-open は
+                    # 「本ツール側の故障で作業を止めない」ことである。
+                    notices.append(_explain_failed_displacement(removal))
 
-        # **退去のあとに読み直す。** 幽霊を消している間に他セッションが入っていることが
-        # ある（実際、同じ幽霊を見た 2 人のうち一方が先に取り直す）。古い読み取りで
-        # 判断すると、**生きた宣言があるのに気づかずに通す**。
-        living = live_declarations(board, resource_id, observation)
+            # **退去のあとに読み直す。** 幽霊を消している間に他セッションが入っていることが
+            # ある（実際、同じ幽霊を見た 2 人のうち一方が先に取り直す）。古い読み取りで
+            # 判断すると、**生きた宣言があるのに気づかずに通す**。この再読み取りも
+            # 完全とは限らないので、詳細版で確かめる。
+            living, living_listing = live_declarations_detailed(board, resource_id, observation)
 
-        if force:
-            for entry in list(living):
-                if (
-                    board.remove_if_nonce(resource_id, expect_nonce=entry.nonce, reason="強制取得")
-                    is RemovalResult.REMOVED
-                ):
-                    living.remove(entry)
+            if not living_listing.complete:
+                notices.append(
+                    "[rb] 掲示板の一部を読めませんでした。**追加の退去は行わず**続行します"
+                )
+                board.audit(
+                    "claim_unconfirmed",
+                    resource=resource_id,
+                    reason="退去後の再読み取りで一部が読めない",
+                    force=force,
+                )
+            elif force:
+                living_selections = {
+                    selection.entry.nonce: selection for selection in living_listing.confirmed()
+                }
+                for entry in list(living):
+                    selection = living_selections.get(entry.nonce)
+                    if selection is None:
+                        continue  # 理論上起きない（living は living_listing.pairs の部分集合）
+                    removal = board.remove_confirmed(selection, reason="強制取得")
+                    if removal is RemovalResult.REMOVED:
+                        living.remove(entry)
 
         # **生きた宣言があれば断る。** これは「投稿させない」のではなく「止まれ、他に
         # 人がいる。見てから、意図してそうだと言え」である。``--share`` 一つで通るので
@@ -523,6 +647,11 @@ def _explain_failed_displacement(removal: RemovalResult) -> str:
     """
     if removal is RemovalResult.FAILED:
         return "退けようとした宣言を消せませんでした（掲示板に残っています。監査ログを参照）"
+    if removal is RemovalResult.UNCONFIRMED:
+        return (
+            "退けようとした宣言の消去を確認できませんでした"
+            "（掲示板の一部が読めません。監査ログを参照）"
+        )
     return "退けようとした宣言が入れ替わりました（他セッションが先に取り直した可能性）"
 
 
@@ -667,8 +796,13 @@ def _release_after_run(
     ``finally`` の中で例外が出ると、子プロセスが 0 で終わっていても呼び出し側には
     ラッパーの故障（126）が返る。print 1 つで終了コードが変わってはならない。
 
-    **消すのは自分が出した 1 件だけ。** nonce で指すので、走行中に外部から消えて
-    いても、他セッションが同じ資源へ宣言していても、取り違えない。
+    **消すのは自分が出した 1 件だけ。** ``entry`` は呼び出し側が :func:`acquire`
+    で自分自身が書いた宣言そのものであり、**列挙を一切経由しない**——
+    :meth:`Board.confirm_own_declaration` でそのまま削除できる選択にする。
+    以前は :meth:`Board.remove_own` へ ``nonce`` だけを渡していたため、内部で
+    ``pairs_for`` によるこの資源全体の再列挙が起きていた。自分が直接書いた
+    実体の居場所は最初から分かっているので、その再列挙そのものが不要である
+    （issue #18 指摘 2）。
 
     Parameters
     ----------
@@ -684,12 +818,19 @@ def _release_after_run(
         code = "不明" if exit_code is None else str(exit_code)
         reason = f"rb run の終了（exit={code}）"
 
-        result = board.remove_own(resource_id, reason=reason, nonce=entry.nonce)
-        if result.removed:
+        selection = board.confirm_own_declaration(entry)
+        result = board.remove_confirmed(selection, reason=reason)
+        if result is RemovalResult.REMOVED:
             _say(f"解放しました: {naming.label(resource_id, entry.display)}")
-        elif result.swapped:
+        elif result is RemovalResult.NOT_OWNED:
             _say("宣言が入れ替わりました（解放していません）", err=True)
-        elif result.failed:
+        elif result is RemovalResult.UNCONFIRMED:
+            _say(
+                "警告: 宣言を取り下げられたか確認できませんでした"
+                "（削除直後に掲示板の一部が読めなくなりました）",
+                err=True,
+            )
+        elif result is RemovalResult.FAILED:
             _say(
                 "警告: 宣言を取り下げられませんでした（掲示板に残っています）",
                 err=True,
@@ -699,7 +840,7 @@ def _release_after_run(
             # 消えている場合（``--force``、再起動掃除）に「掲示板に残っています」と
             # 出すと嘘になる。
             _say(
-                "宣言を取り下げませんでした（既に掲示板に無いか、自分の宣言ではありません）",
+                "宣言を取り下げませんでした（既に掲示板にありません）",
                 err=True,
             )
     except Exception:  # noqa: BLE001 - 後始末の失敗でジョブの結果を変えない
@@ -893,6 +1034,14 @@ def _match_releases(claims: list[dict], removals: list[dict]) -> list[tuple[dict
     全て step 2（時刻順のフォールバック）を経由させる**ことで、鍵の種類の違いに
     関わらず対応が取れるようにする。
 
+    **step 2 は「少なくとも片側が nonce を欠く」組にしか対応付けない。** 両側が
+    nonce を持ちながら step 1 で一致しなかった組は、**「不確実」ではなく
+    「別個体だと確定している」**——nonce は宣言ごとに一意なので、値が違う
+    2 つの記録が同じ宣言を指すことはあり得ない。ここを time+job の近さだけで
+    対応付けると、無関係な 2 つの記録を「不確実な対応」として結びつけてしまう
+    （issue #18 指摘 6）。**nonce 付きの ``removed`` は nonce 単位で重複排除する**
+    ——監査ログの重複行が、対応しないはずの claim に誤って割り当てられるのを防ぐ。
+
     掲示板は資源ごとに主宣言 1 件なので、ある宣言を閉じるのは「同じ資源で、
     その宣言より後に来た最初の解放」である。対応が付かないものは None になる
     （まだ実行中か、解放がログの窓の外にある）。**None を「まだ実行中」と
@@ -937,7 +1086,21 @@ def _match_releases(claims: list[dict], removals: list[dict]) -> list[tuple[dict
             remaining_claim_indices.append(index)
 
     # --- step 2: 残りを資源 + job ＋ 時刻順でフォールバック対応付けする -------------
-    remaining_removals = [r for r in removals if id(r) not in used_by_id]
+    # **nonce 付き removed は nonce 単位で重複排除する。** 同じ nonce の記録が
+    # 複数残っていると（監査ログの重複・再送）、両方が step 2 の候補に入り、
+    # 別々の claim にそれぞれ「対応した」ことにされてしまう。
+    remaining_removals: list[dict] = []
+    seen_removal_nonces: set[str] = set()
+    for record in removals:
+        if id(record) in used_by_id:
+            continue
+        key = _nonce_key(record)
+        if key is not None:
+            if key in seen_removal_nonces:
+                continue
+            seen_removal_nonces.add(key)
+        remaining_removals.append(record)
+
     Key = tuple[str, str]
     pending: dict[Key, list[tuple[datetime, dict]]] = {}
     for record in remaining_removals:
@@ -948,21 +1111,32 @@ def _match_releases(claims: list[dict], removals: list[dict]) -> list[tuple[dict
     for items in pending.values():
         items.sort(key=lambda item: item[0])
 
-    # 鍵ごとに「どこまで使ったか」を持ち、同じ解放を 2 つの宣言に割り当てない。
-    used: dict[Key, int] = {}
+    # 鍵ごとに「どこを使ったか」を集合で持つ。**片側が nonce を持ちながら
+    # 消費せずに飛ばした候補**（別個体だと確定しているので対応させない）を、
+    # 別の claim（nonce を持たない側）がまだ使える必要があるため、
+    # 「ここまで使った」という単純な位置ポインタでは表現できない。
+    used_positions: dict[Key, set[int]] = {}
     for index in remaining_claim_indices:
         claim = claims[index]
         started = _parse_at(claim.get("at"))
+        claim_has_nonce = _nonce_key(claim) is not None
         key = _job_key(claim)
         items = pending.get(key, [])
-        pos = used.get(key, 0)
-        while pos < len(items) and started is not None and items[pos][0] < started:
-            pos += 1
-        used[key] = pos
-        if pos < len(items):
-            matched[index] = items[pos][1]
+        taken = used_positions.setdefault(key, set())
+        for pos, (when, record) in enumerate(items):
+            if pos in taken:
+                continue
+            if started is not None and when < started:
+                continue
+            if claim_has_nonce and _nonce_key(record) is not None:
+                # **両側に nonce があり、ここまでで一致しなかった。**
+                # 「不確実」ではなく別個体だと確定している——対応付けない
+                # （消費もしない。他の claim がこの候補を必要とするかもしれない）。
+                continue
+            matched[index] = record
             uncertain[index] = True
-            used[key] = pos + 1
+            taken.add(pos)
+            break
 
     return list(zip(matched, uncertain, strict=True))
 
@@ -1131,15 +1305,42 @@ def _update_locked(board: Board, resource_id: str, args: argparse.Namespace) -> 
     後から `--share` で並んだ側は自分の宣言を一生更新できず、`--force` を付けると
     **他人の宣言に自分の申告を書き込む**ことになる（掲示板は各自の申告の集まりであり、
     人の申告を勝手に直せると誰の言葉なのか分からなくなる）。
+
+    **「宣言が無い」と「確認できない」を混同しない。** 以前は ``list_for``
+    （読めなかったものを黙って飛ばす）で数えていたため、不正な UTF-8 など
+    掲示板の一部が読めない場合でも「0 件」と断定し ``EXIT_USAGE``（利用者の
+    入力ミス）を返していた。``update`` は fail-open なコマンドなので、
+    読めなかった側に自分の宣言が隠れているかもしれないなら、それは入力ミス
+    ではなく「確認できなかった」であり、作業は止めずに ``EXIT_OK`` で通す
+    （issue #18 指摘 8。今回の UTF-8 修正が作った退行）。
     """
     cwd = os.getcwd()
     session_id = platform_info.session_id()
-    declarations = board.list_for(resource_id)
+    listing = board.pairs_for_detailed(resource_id)
+    declarations = listing.entries
     mine = [e for e in declarations if board.owns(e, cwd=cwd, session_id=session_id)]
 
     if not declarations:
+        if not listing.complete:
+            print(
+                "掲示板の一部を読めず、宣言の有無を確認できませんでした（更新は行っていません）",
+                file=sys.stderr,
+            )
+            board.audit(
+                "update_unconfirmed", resource=resource_id, reason="掲示板の一部が読めない"
+            )
+            return EXIT_OK
         print("宣言が見つかりませんでした", file=sys.stderr)
         return EXIT_USAGE
+
+    if not listing.complete:
+        # **候補は見つかったが、これで全部とは限らない。** fail-open なので
+        # 止めはしないが、見えていない自分の宣言が別にあるかもしれないことは
+        # 伝える。
+        _say(
+            "注意: 掲示板の一部を読めませんでした（他に自分の宣言があるかもしれません）",
+            err=True,
+        )
 
     if mine:
         entry = mine[0]
@@ -1231,13 +1432,30 @@ def _cmd_release(args: argparse.Namespace) -> int:
     """
     board = Board(args.home)
     if args.clean:
-        removed = board.remove_unreadable(reason="release --clean")
-        if removed:
-            _say(f"読めないファイルを {len(removed)} 件消しました")
-            for path in removed:
+        # **走査が不完全なら成功と言わない。** 以前は「消せた件数」しか見ていな
+        # かったため、掲示板ディレクトリ自体が読めなかった（権限・切断された
+        # ネットワークパス等）場合でも「読めないファイルはありませんでした」と
+        # 積極的な成功表現を返し、常に ``EXIT_OK`` だった（issue #18 指摘 5。
+        # 新規テストがこの誤った意味を仕様として固定していた）。
+        result = board.remove_unreadable(reason="release --clean")
+        if result.removed:
+            _say(f"読めないファイルを {len(result.removed)} 件消しました")
+            for path in result.removed:
                 _say(f"  {path}")
-        else:
+        elif result.complete:
             _say("読めないファイルはありませんでした")
+        else:
+            _say(
+                "掲示板を完全に走査できませんでした（他に読めないファイルがあるかもしれません）",
+                err=True,
+            )
+        if result.failed:
+            _say(
+                f"警告: {len(result.failed)} 件を消せませんでした（他プロセスが読んでいる可能性）",
+                err=True,
+            )
+        if not result.complete or result.failed:
+            return EXIT_BROKEN
         return EXIT_OK
 
     if args.nonce is not None:
@@ -1395,32 +1613,38 @@ def _release_by_nonce(
             )
             return EXIT_USAGE
 
+    # **選択に使った実体を、そのまま削除できる型にする。** ここまでで完全性は
+    # 確認済み（listing.complete）なので :meth:`BoardListing.confirmed` は
+    # 例外を出さない。
+    selection = ConfirmedEntry(path=path, entry=entry)
+
     if force:
-        # **所有チェックという概念自体が要らない場面。** `remove_own` の nonce 経路は
-        # 内部で「nonce が一致すれば所有とみなす」ため、既に所有確認を終えている
-        # 非強制路とは違い、ここでは素の CAS（`remove_if_nonce`）を直接使う。
-        # **`known` に選択で得た実体をそのまま渡す。** ここで再列挙すると、選択時に
-        # 確認した完全性を削除の直前で捨て直すことになる（issue #17 指摘 2・3）。
-        removal = board.remove_if_nonce(
-            entry.resource,
-            expect_nonce=entry.nonce,
-            reason="release --nonce --force コマンド",
-            known=(path, entry),
-        )
+        # **所有チェックという概念自体が要らない場面。** 既に所有確認を終えている
+        # 非強制路とは違い、ここでは公開の削除入口（`remove_confirmed`）を
+        # 選択した実体に対して直接使う——再列挙しないので、選択時に確認した
+        # 完全性を削除の直前で捨て直さない（issue #17 指摘 2・3）。
+        removal = board.remove_confirmed(selection, reason="release --nonce --force コマンド")
         if removal is RemovalResult.REMOVED:
             _say(
                 f"強制解放しました: {naming.display_default(entry.resource)}"
                 f"（nonce {entry.nonce[:8]}, {entry.session} / {entry.job}）"
             )
-            return EXIT_OK
+            return _exit_for_removal(removal)
         if removal is RemovalResult.ABSENT:
             _say(f"宣言は既にありませんでした: nonce {entry.nonce[:8]}")
-            return EXIT_OK
+            return _exit_for_removal(removal)
         if removal is RemovalResult.NOT_OWNED:
             _say("宣言が入れ替わりました（解放していません）", err=True)
-            return EXIT_BUSY
+            return _exit_for_removal(removal)
+        if removal is RemovalResult.UNCONFIRMED:
+            _say(
+                "警告: 宣言を取り下げられたか確認できませんでした"
+                "（削除直後に掲示板の一部が読めなくなりました）",
+                err=True,
+            )
+            return _exit_for_removal(removal)
         _say("警告: 宣言を取り下げられませんでした（掲示板に残っています）", err=True)
-        return EXIT_BUSY
+        return _exit_for_removal(removal)
 
     # **所有は既に確認済み。** ここへ来る entry は必ず自分のものなので、
     # `remove_own` の nonce 経路（cwd・session_id を問わず 1 本だけを狙う）を
@@ -1430,9 +1654,9 @@ def _release_by_nonce(
     # 将来ここへ来ても、掲示板に残っているのに「無い」と嘘を言わないための保険である。
     #
     # **`declared` に、完全性を確認した ``listing`` から絞った分をそのまま渡す。**
-    # 渡さないと `remove_own` が内部で `pairs_for` を呼び直し、ここまでで確認した
-    # 完全性を削除の直前で捨て直す（issue #17 指摘 2・3）。
-    declared_for_resource = [(p, e) for p, e in listing.pairs if e.resource == entry.resource]
+    # 渡さないと `remove_own` が内部で再列挙し、ここまでで確認した完全性を
+    # 削除の直前で捨て直す（issue #17 指摘 2・3）。
+    declared_for_resource = [s for s in listing.confirmed() if s.entry.resource == entry.resource]
     result = board.remove_own(
         entry.resource,
         reason="release --nonce コマンド",
@@ -1442,16 +1666,23 @@ def _release_by_nonce(
     )
     if result.removed:
         _say(f"解放しました: {naming.display_default(entry.resource)}（nonce {entry.nonce[:8]}）")
-        return EXIT_OK
+        return _exit_for_own_removal(result)
+    if result.unconfirmed:
+        _say(
+            "警告: 宣言を取り下げられたか確認できませんでした"
+            "（削除直後に掲示板の一部が読めなくなりました）",
+            err=True,
+        )
+        return _exit_for_own_removal(result)
     if result.swapped:
         _say("宣言が入れ替わりました（解放していません）", err=True)
-        return EXIT_BUSY
+        return _exit_for_own_removal(result)
     if result.failed:
         _say("警告: 宣言を取り下げられませんでした（掲示板に残っています）", err=True)
-        return EXIT_BUSY
+        return _exit_for_own_removal(result)
     # **ここへは通常来ない。** 所有は既に確認済みなので `remove_own` は原則
-    # removed/swapped/failed のいずれかで返る。絞り込みからここまでの間に
-    # 他セッションが同じ宣言を消していた場合だけ素通りする。「無かった」を
+    # removed/unconfirmed/swapped/failed のいずれかで返る。絞り込みからここまでの
+    # 間に他セッションが同じ宣言を消していた場合だけ素通りする。「無かった」を
     # 「消せなかった」と混ぜない。
     _say(
         f"宣言を取り下げませんでした（既に掲示板に無い可能性）: nonce {entry.nonce[:8]}",
@@ -1472,41 +1703,63 @@ def _release_forced(board: Board, resource_id: str) -> int:
     無かったことにする」ではない。読めない宣言が残ったまま「強制解放しました」と
     言ってはならない（issue #17 指摘 2）。
 
-    **消せなかったものがあれば ``EXIT_BROKEN``。** 共有違反などの I/O 失敗で
-    一部が消せなかった場合も、以前は ``EXIT_OK`` を返していた——警告は出すが
-    終了コードは「成功」のままで、``release --force && 次の手順`` は消えていない
-    宣言を無視して進む。**終了コードで嘘をつかない**（cli.py 冒頭）。
+    **表示と削除を同じ列挙から作る。** 以前は表示用に ``pairs_for_detailed`` で
+    列挙したあと、削除は ``Board.remove_all`` が内部で ``pairs_for`` により
+    **別に列挙し直して**いたため、表示した対象と実際に消した対象が食い違いうる
+    経路が残っていた（issue #15 指摘 12・issue #18 末尾）。ここでは
+    :meth:`BoardListing.confirmed` で得た**同じ並び**をそのまま
+    :meth:`Board.remove_selected` へ渡す——資源名だけで何件消えるか決まる
+    公開入口はもう存在しない。
+
+    **消せなかった・確認できなかった・入れ替わっていたものがあれば
+    ``EXIT_BROKEN``。** 共有違反などの I/O 失敗で一部が消せなかった場合も、
+    以前は ``EXIT_OK`` を返していた——警告は出すが終了コードは「成功」のままで、
+    ``release --force && 次の手順`` は消えていない宣言を無視して進む。
+    **終了コードで嘘をつかない**（cli.py 冒頭）。
     """
-    with board.locked(resource_id) as lock:
-        _warn_if_unlocked(board, resource_id, lock, event="force_release_unlocked")
-        listing = board.pairs_for_detailed(resource_id)
-        if not listing.complete:
-            _say(
-                "掲示板の一部を読めませんでした。強制解放は未確認です"
-                "（読めなかった側にこの資源の宣言が隠れているかもしれません）",
-                err=True,
-            )
-            board.audit(
-                "force_release_unconfirmed", resource=resource_id, reason="掲示板の一部が読めない"
-            )
-            return EXIT_BROKEN
-        before = listing.entries
-        removed = board.remove_all(resource_id, reason="release コマンド（強制）")
+    listing = board.pairs_for_detailed(resource_id)
+    if not listing.complete:
+        _say(
+            "掲示板の一部を読めませんでした。強制解放は未確認です"
+            "（読めなかった側にこの資源の宣言が隠れているかもしれません）",
+            err=True,
+        )
+        board.audit(
+            "force_release_unconfirmed", resource=resource_id, reason="掲示板の一部が読めない"
+        )
+        return EXIT_BROKEN
+    before = listing.entries
+    # **ロックは `remove_selected` 自身が取る。** ここで外側から重ねて取ると、
+    # 同一プロセス内の入れ子ロックになり `LOCK_WAIT_S` を無駄に待つ
+    # （`remove_own` と同じ「列挙は外・削除は内」の形にそろえる）。
+    result = board.remove_selected(
+        resource_id, listing.confirmed(), reason="release コマンド（強制）"
+    )
 
     if not before:
         _say(f"宣言はありませんでした: {naming.display_default(resource_id)}")
         return EXIT_OK
 
-    _say(f"強制解放しました: {naming.display_default(resource_id)}（{removed} 件）")
-    for entry in before:
+    _say(f"強制解放しました: {naming.display_default(resource_id)}（{len(result.removed)} 件）")
+    for entry in result.removed:
         _say(f"  {entry.session} / {entry.job}（since {entry.since}）")
-    if removed < len(before):
+    if result.failed:
         _say(
-            f"警告: {len(before) - removed} 件を消せませんでした（他プロセスが読んでいる可能性）",
+            f"警告: {len(result.failed)} 件を消せませんでした（他プロセスが読んでいる可能性）",
             err=True,
         )
-        return EXIT_BROKEN
-    return EXIT_OK
+    if result.unconfirmed:
+        _say(
+            f"警告: {len(result.unconfirmed)} 件は消せたか確認できませんでした"
+            "（削除直後に掲示板の一部が読めなくなりました）",
+            err=True,
+        )
+    if result.swapped:
+        _say(
+            f"警告: {len(result.swapped)} 件は他セッションが取り直していたため消していません",
+            err=True,
+        )
+    return _exit_for_forced_removal(result)
 
 
 def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> int:
@@ -1528,7 +1781,7 @@ def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> i
     取得（``declare``）はロックが取れなくても続行する（fail-open。DESIGN.md
     「Per-Resource Lock」）ため、ロックで囲っても「ロックを尊重しない書き手」が
     割り込む窓は閉じない。窓を閉じる手段は対象を**個体（nonce）で固定する**ことだけ
-    であり、CAS（:meth:`Board.remove_if_nonce`）は「読んだ宣言以外を消さない」を
+    であり、CAS（:meth:`Board.remove_confirmed`）は「読んだ宣言以外を消さない」を
     ロックの有無に関係なく保証する。だから 1 件のときはその nonce を渡し、
     0 件のときは削除処理そのものへ進まない（同じ理由——その間に現れた宣言を
     「数えた 1 件」と取り違えて消しうる）。
@@ -1559,14 +1812,14 @@ def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> i
             all=take_all,
         )
         return EXIT_BROKEN
-    declared = listing.pairs
+    declared = listing.confirmed()
 
     nonce: str | None = None
     if not take_all:
         mine = [
-            (path, entry)
-            for path, entry in declared
-            if board.owns(entry, cwd=cwd, session_id=session_id)
+            selection
+            for selection in declared
+            if board.owns(selection.entry, cwd=cwd, session_id=session_id)
         ]
         if len(mine) > 1:
             # **消す前に止める。** 曖昧なまま 1 件選ぶと、黙って間違った方を消すのが
@@ -1575,7 +1828,8 @@ def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> i
                 f"自分の宣言が {len(mine)} 件あります。曖昧なので何も消しません",
                 err=True,
             )
-            for _, entry in mine:
+            for selection in mine:
+                entry = selection.entry
                 _say(f"  nonce {entry.nonce[:8]}  {entry.job}（since {entry.since}）", err=True)
             _say("  1 本だけ消すには rb release --nonce <nonce の先頭 8 桁>", err=True)
             _say(
@@ -1590,7 +1844,7 @@ def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> i
             # 時点にはまだ存在しなかったもの——まで拾って消してしまう。この関数の
             # 役目は「いま数えた自分の宣言を消す」ことであって、「これから現れるかも
             # しれない宣言まで待ち構えて消す」ことではない。
-            foreign = [entry for _, entry in declared]
+            foreign = [selection.entry for selection in declared]
             if not foreign:
                 _say(f"宣言はありませんでした: {naming.display_default(resource_id)}")
                 return EXIT_OK
@@ -1602,7 +1856,7 @@ def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> i
         # **1 件だけなら nonce を固定して渡す。** 数えたあとに 2 件目が現れても、
         # `remove_own` は渡した nonce と一致する宣言だけを対象にする（CAS）ので、
         # 新しく現れた宣言には触れない——ここが「消す前に止める」の実体である。
-        nonce = mine[0][1].nonce
+        nonce = mine[0].entry.nonce
 
     # **選択に使った `declared` をそのまま渡す。** `remove_own` が内部で再列挙すると、
     # ここまでで確認した完全性を削除の直前で捨て直すことになる（issue #17 指摘 2・3）。
@@ -1614,13 +1868,21 @@ def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> i
         for entry in result.removed:
             _say(f"  {entry.session} / {entry.job}（since {entry.since}）")
 
+    if result.unconfirmed:
+        # **消せたか確認できなかった。** 「入れ替わった」「消せなかった」とも違う
+        # ——削除直後の再確認で掲示板の一部が読めなかった（issue #18 指摘 4）。
+        _say(
+            f"警告: {len(result.unconfirmed)} 件は消せたか確認できませんでした"
+            "（削除直後に掲示板の一部が読めなくなりました）",
+            err=True,
+        )
+
     if result.swapped:
         # **他セッションが取り直していた。** 新しい宣言は消していない（CAS が守った）。
         # 0 を返すと「解放した」と読まれるので返さない。
         _say("宣言が入れ替わりました（解放していません）", err=True)
         for entry in board.list_for(resource_id):
             _say(f"  現在: {entry.session} / {entry.job}（since {entry.since}）", err=True)
-        return EXIT_BUSY
 
     if result.failed:
         # **消せなかったことを「無かった」と混ぜない。** 残っているのに消えたと読まれる。
@@ -1628,21 +1890,20 @@ def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> i
             f"警告: {len(result.failed)} 件を消せませんでした（他プロセスが読んでいる可能性）",
             err=True,
         )
-        return EXIT_BUSY
-    if result.removed:
-        return EXIT_OK
 
-    if not result.any_here:
-        _say(f"宣言はありませんでした: {naming.display_default(resource_id)}")
-        return EXIT_OK
+    only_foreign = not (result.removed or result.unconfirmed or result.swapped or result.failed)
+    if result.foreign and only_foreign:
+        # **他人の宣言を「無い」と言わない。** 誰がいるかを見せて、--force を案内する。
+        _say(f"自分の宣言はありません: {naming.display_default(resource_id)}", err=True)
+        for entry in result.foreign:
+            _say(f"  {entry.session} / {entry.job}（since {entry.since}）", err=True)
+        _say(f"  他セッションの宣言を消すなら rb release {resource_id} --force", err=True)
 
-    # **他人の宣言を「無い」と言わない。** 誰がいるかを見せて、--force を案内する。
-    _say(f"自分の宣言はありません: {naming.display_default(resource_id)}", err=True)
-    for entry in result.foreign:
-        _say(f"  {entry.session} / {entry.job}（since {entry.since}）", err=True)
-    _say(f"  他セッションの宣言を消すなら rb release {resource_id} --force", err=True)
-    # **0 を返さない。** 消すつもりで打って何も消えていない。0 は「解放した」と読まれる。
-    return EXIT_BUSY
+    if result.any_here:
+        return _exit_for_own_removal(result)
+
+    _say(f"宣言はありませんでした: {naming.display_default(resource_id)}")
+    return EXIT_OK
 
 
 def _add_declaration_options(parser: argparse.ArgumentParser, *, with_force: bool = True) -> None:

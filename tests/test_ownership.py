@@ -19,7 +19,15 @@ from pathlib import Path
 import pytest
 
 from resource_broker import clock
-from resource_broker.board import Board, Entry, LockState, RemovalResult, UpdateResult, build_entry
+from resource_broker.board import (
+    Board,
+    ConfirmedEntry,
+    Entry,
+    LockState,
+    RemovalResult,
+    UpdateResult,
+    build_entry,
+)
 from resource_broker.cli import main
 from resource_broker.naming import normalize
 
@@ -39,6 +47,18 @@ def _path_of(board: Board, resource_id: str) -> Path:
     found = board.pairs_for(resource_id)
     assert len(found) == 1, found
     return found[0][0]
+
+
+def _wipe(board: Board, resource_id: str, *, reason: str = "テスト") -> int:
+    """テストの後始末用: その資源の宣言を全部消す（``--force`` 相当）。消せた件数を返す。
+
+    ``Board.remove_all`` は廃止した——資源名だけで何件消えるか決まる公開入口は
+    持たない（型で強制する設計）。テストは列挙してから
+    :meth:`Board.remove_selected` へ渡す形に合わせる。
+    """
+    selections = board.pairs_for_detailed(resource_id).confirmed()
+    result = board.remove_selected(resource_id, selections, reason=reason)
+    return len(result.removed)
 
 
 RESOURCE = normalize("GPU0")
@@ -147,6 +167,50 @@ def test_update_refuses_another_sessions_declaration(tmp_path: Path) -> None:
     assert run(tmp_path, "update", "GPU0", "--eta", "5m") == 1
 
 
+def test_update_is_fail_open_when_an_unrelated_file_is_unreadable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """**この資源に宣言が無くても、掲示板の一部が読めないなら入力ミスと断定しない**
+    （issue #18 指摘 8。今回の不正 UTF-8 対応が作った退行）。
+
+    以前は ``list_for``（読めなかったものを黙って飛ばす）で数えていたため、
+    対象の資源に宣言が無いことと「掲示板の一部が不正 UTF-8 で読めない」ことを
+    区別できず、常に ``宣言が見つかりませんでした`` ＋ ``EXIT_USAGE``（利用者の
+    入力ミス）を返していた。``update`` は fail-open なコマンドなので、確認できて
+    いないなら ``EXIT_OK`` で通す（更新はしない）。
+    """
+    board = Board(tmp_path)
+    board.entries_dir.mkdir(parents=True, exist_ok=True)
+    # GPU0 とは無関係な不正 UTF-8 ファイル。中身が読めない以上、これが GPU0 の
+    # 宣言ではないとは証明できない。
+    (board.entries_dir / "不正utf8.json").write_bytes(b"\xff\xfe\x00broken")
+    capsys.readouterr()
+
+    code = run(tmp_path, "update", "GPU0", "--eta", "5m")
+
+    assert code == 0, "fail-open が壊れている（EXIT_USAGE を返している）"
+    assert "確認できませんでした" in capsys.readouterr().err
+
+
+def test_declarations_detailed_flags_a_directory_named_like_a_declaration(
+    tmp_path: Path,
+) -> None:
+    """``*.json`` という名前のディレクトリは、黙って読み飛ばさず ``complete=False`` にする
+    （issue #18 指摘 9）。
+
+    以前は ``is_file()`` も ``is_symlink()`` も偽になるこの場合を素通りしていた
+    ——``glob`` が握り潰していたのと同じ穴を ``scandir`` で開け直していたことになる。
+    """
+    board = Board(tmp_path)
+    board.declare(build_entry(RESOURCE, job="正常"))
+    (board.entries_dir / "これはディレクトリ.json").mkdir()
+
+    listing = board.declarations_detailed()
+
+    assert listing.complete is False
+    assert [e.job for _, e in listing.pairs] == ["正常"]
+
+
 def test_update_rewrites_my_own_declaration(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -176,7 +240,7 @@ def test_update_does_not_clobber_a_newer_declaration(tmp_path: Path) -> None:
     assert entry is not None
 
     # 解放と再取得が起きた状況を作る
-    board.remove_all(RESOURCE, reason="テスト")
+    _wipe(board, RESOURCE)
     plant(board, THEIRS)
 
     assert (
@@ -274,20 +338,28 @@ def test_a_subdirectory_still_owns_its_declaration(
 
 
 def test_remove_if_owned_refuses_a_reclaimed_declaration(tmp_path: Path) -> None:
-    """実行中に他セッションが取り直したら、``rb run`` の後始末は消さない。
+    """``remove_own`` の nonce 指定は、入れ替わった宣言を消さない。
 
     nonce の照合が効いていることを直接確かめる。ここが素通しすると、
-    掲示板は空・資源は掴まれたままという最も検出しにくい不整合ができる。
+    掲示板は空・資源は掴まれたままという最も検出しにくい不整合ができる
+    （``rb run`` の後始末は現在 ``confirm_own_declaration`` +
+    ``remove_confirmed`` を直接使うが、``remove_own`` 自身のこの性質は
+    ``rb release --nonce`` の非強制路が引き続き使う）。
     """
     board = Board(tmp_path)
     mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
     assert board.declare(mine)
 
     # 他セッションが --force で取り直した状況を作る
-    board.remove_all(RESOURCE, reason="テスト")
+    _wipe(board, RESOURCE)
     plant(board, THEIRS)
 
-    result = board.remove_own(RESOURCE, reason="rb run の終了", nonce=mine.nonce)
+    result = board.remove_own(
+        RESOURCE,
+        reason="テスト",
+        nonce=mine.nonce,
+        declared=board.pairs_for_detailed(RESOURCE).confirmed(),
+    )
 
     assert result.foreign and not result.removed
     current = _first(board, RESOURCE)
@@ -298,16 +370,21 @@ def test_remove_if_owned_refuses_a_reclaimed_declaration(tmp_path: Path) -> None
 def test_remove_if_owned_reports_absence_and_success_separately(tmp_path: Path) -> None:
     """「無い」と「消した」を畳まない。
 
-    全部 False に畳むと、``rb run`` が「宣言が自分のものではなくなっています」という
-    **事実と違う説明**を出す。
+    全部 False に畳むと、呼び出し側が「宣言が自分のものではなくなっています」
+    という**事実と違う説明**を出す。
     """
     board = Board(tmp_path)
 
-    assert not board.remove_own(RESOURCE, reason="テスト", nonce="なんでも").any_here
+    assert not board.remove_own(RESOURCE, reason="テスト", nonce="なんでも", declared=[]).any_here
 
     mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
     assert board.declare(mine)
-    assert board.remove_own(RESOURCE, reason="テスト", nonce=mine.nonce).removed
+    assert board.remove_own(
+        RESOURCE,
+        reason="テスト",
+        nonce=mine.nonce,
+        declared=board.pairs_for_detailed(RESOURCE).confirmed(),
+    ).removed
 
 
 def test_remove_reports_failure_apart_from_absence(
@@ -316,7 +393,11 @@ def test_remove_reports_failure_apart_from_absence(
     """共有違反で消せなかったことを「無かった」と混ぜない。
 
     Windows ではフックが全セッションの全プロンプトで掲示板を読むため、
-    ``unlink`` が ``PermissionError`` を返すことが実際にある。
+    ``os.rename``（CAS の「捕まえる」段）が ``PermissionError`` を返すことが
+    実際にある。**削除を塞ぐのは捕まえる段であって、捕まえたあとの tombstone
+    の後始末ではない**——tombstone だけが消せなくても、掲示板からは既に
+    見えなくなっているので「消せた」として扱ってよい（DESIGN.md「Known
+    Residuals」の tombstone 回収経路）。
     """
     board = Board(tmp_path)
     mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
@@ -325,13 +406,14 @@ def test_remove_reports_failure_apart_from_absence(
     def refuse(*_args: object, **_kwargs: object) -> None:
         raise PermissionError("共有違反")
 
-    monkeypatch.setattr(Path, "unlink", refuse)
+    monkeypatch.setattr(os, "rename", refuse)
     monkeypatch.setattr("resource_broker.board.UNLINK_DELAY_S", 0.0)
 
-    assert board.remove_all(RESOURCE, reason="テスト") == 0
+    assert _wipe(board, RESOURCE) == 0
+    assert _first(board, RESOURCE) is not None  # 捕まえられていないので残っている
 
 
-def test_unlink_is_retried_before_giving_up(
+def test_rename_is_retried_before_giving_up(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """共有違反は数回やり直す。1 回で諦めると宣言が残る。"""
@@ -339,19 +421,19 @@ def test_unlink_is_retried_before_giving_up(
     mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
     assert board.declare(mine)
 
-    original = Path.unlink
+    original = os.rename
     attempts = {"n": 0}
 
-    def flaky(self: Path, *args: object, **kwargs: object) -> None:
+    def flaky(*args: object, **kwargs: object) -> None:
         attempts["n"] += 1
         if attempts["n"] < 3:
             raise PermissionError("共有違反")
-        original(self, *args, **kwargs)  # type: ignore[arg-type]
+        original(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(Path, "unlink", flaky)
+    monkeypatch.setattr(os, "rename", flaky)
     monkeypatch.setattr("resource_broker.board.UNLINK_DELAY_S", 0.0)
 
-    assert board.remove_all(RESOURCE, reason="テスト") == 1
+    assert _wipe(board, RESOURCE) == 1
     assert attempts["n"] == 3
 
 
@@ -598,12 +680,10 @@ def test_two_sessions_seeing_one_ghost_do_not_both_acquire(
 
     monkeypatch.setattr(Board, "locked", unavailable)
 
-    original = Board.remove_if_nonce
+    original = Board.remove_confirmed
     state = {"nested": False}
 
-    def interleave(
-        self: Board, resource_id: str, *, expect_nonce: str, reason: str
-    ) -> RemovalResult:
+    def interleave(self: Board, selection: ConfirmedEntry, *, reason: str) -> RemovalResult:
         if not state["nested"]:
             state["nested"] = True
             # B が最初から最後まで走り切る（幽霊を退けて宣言する）
@@ -621,9 +701,9 @@ def test_two_sessions_seeing_one_ghost_do_not_both_acquire(
                 )
                 == 0
             )
-        return original(self, resource_id, expect_nonce=expect_nonce, reason=reason)
+        return original(self, selection, reason=reason)
 
-    monkeypatch.setattr(Board, "remove_if_nonce", interleave)
+    monkeypatch.setattr(Board, "remove_confirmed", interleave)
 
     assert claim(tmp_path) == 1  # A は諦める
     current = _first(board, RESOURCE)
@@ -636,10 +716,10 @@ def test_conditional_removal_refuses_a_replaced_declaration(tmp_path: Path) -> N
     board = Board(tmp_path)
     mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
     assert board.declare(mine)
-    board.remove_all(RESOURCE, reason="テスト")
+    _wipe(board, RESOURCE)
     plant(board, THEIRS)
 
-    result = board.remove_if_nonce(RESOURCE, expect_nonce=mine.nonce, reason="テスト")
+    result = board._remove_if_nonce(RESOURCE, expect_nonce=mine.nonce, reason="テスト")
 
     assert result is RemovalResult.NOT_OWNED
     current = _first(board, RESOURCE)
@@ -653,11 +733,11 @@ def test_conditional_removal_removes_a_matching_declaration(tmp_path: Path) -> N
     mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
     assert board.declare(mine)
 
-    assert board.remove_if_nonce(RESOURCE, expect_nonce=mine.nonce, reason="テスト") is (
+    assert board._remove_if_nonce(RESOURCE, expect_nonce=mine.nonce, reason="テスト") is (
         RemovalResult.REMOVED
     )
     assert _first(board, RESOURCE) is None
-    assert board.remove_if_nonce(RESOURCE, expect_nonce=mine.nonce, reason="テスト") is (
+    assert board._remove_if_nonce(RESOURCE, expect_nonce=mine.nonce, reason="テスト") is (
         RemovalResult.ABSENT
     )
 
@@ -677,7 +757,7 @@ def test_conditional_removal_restores_what_it_captured(
     # 先読みだけが自分の宣言を返す状況（読んだ直後に入れ替わった）を作る
     monkeypatch.setattr(Board, "list_for", lambda self, resource_id: [mine])
 
-    assert board.remove_if_nonce(RESOURCE, expect_nonce=mine.nonce, reason="テスト") is (
+    assert board._remove_if_nonce(RESOURCE, expect_nonce=mine.nonce, reason="テスト") is (
         RemovalResult.NOT_OWNED
     )
 
@@ -708,17 +788,10 @@ def test_release_does_not_remove_a_declaration_reclaimed_mid_flight(
 
     monkeypatch.setattr(Board, "locked", unavailable)
 
-    original = Board.remove_if_nonce
+    original = Board.remove_confirmed
     state = {"nested": False}
 
-    def interleave(
-        self: Board,
-        resource_id: str,
-        *,
-        expect_nonce: str,
-        reason: str,
-        known: tuple[Path, Entry] | None = None,
-    ) -> RemovalResult:
+    def interleave(self: Board, selection: ConfirmedEntry, *, reason: str) -> RemovalResult:
         if not state["nested"]:
             state["nested"] = True
             # S が読んだ後・消す前に、T が割り込んで取り直す
@@ -737,9 +810,9 @@ def test_release_does_not_remove_a_declaration_reclaimed_mid_flight(
                 )
                 == 0
             )
-        return original(self, resource_id, expect_nonce=expect_nonce, reason=reason, known=known)
+        return original(self, selection, reason=reason)
 
-    monkeypatch.setattr(Board, "remove_if_nonce", interleave)
+    monkeypatch.setattr(Board, "remove_confirmed", interleave)
     capsys.readouterr()
 
     assert run(tmp_path, "release", "GPU0") == 1
@@ -848,6 +921,69 @@ def test_a_corrupt_file_blocks_destructive_release_and_is_cleaned_by_clean(
 
     # 掃除した後は、もう拒否する理由が無い。
     assert run(tmp_path, "release", "GPU0", "--force") == 0, "掃除した後もまだ拒否している"
+
+
+def test_claim_does_not_evict_a_ghost_when_the_board_is_partially_unreadable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**掲示板の一部が読めないときは、幽霊を退けない**（issue #18 指摘 1・最優先）。
+
+    以前は ``assess`` / ``live_declarations`` が ``list_for``（完全性を捨てる）を
+    使っていたため、無関係な壊れたファイルが 1 件あるだけでも「読めた分だけで
+    判断」して幽霊を退け、取得を通していた——読めなかった側に本当は生きている
+    宣言が隠れているかもしれないのに、それを見失ったまま他人の宣言を消して
+    取得成功にする経路である。**claim 本体の fail-open は変えない**（作業は
+    止めない）が、**退去だけは止める**——不完全な候補集合から他人の宣言を
+    消してはならない。
+    """
+    board = Board(tmp_path)
+    ghost(board, monkeypatch)  # 確定的な幽霊（再起動をまたいだ宣言）
+    corrupt(board)  # 無関係な壊れたファイル
+    capsys.readouterr()
+
+    code = claim(tmp_path)
+    captured = capsys.readouterr()
+
+    assert code == 0, "fail-open が壊れている（claim 本体は止めないはず）"
+    # **幽霊が残っている。** 退去を試みていれば消えているはずである。
+    remaining = [e for e in board.list_all() if e.job == "落ちたセッション"]
+    assert len(remaining) == 1, "掲示板が不完全なのに幽霊を退けている"
+    assert "退去は行わず" in captured.err
+
+    events = {
+        json.loads(line)["event"]
+        for path in board.audit_dir.glob("*.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+    }
+    assert "claim_unconfirmed" in events
+
+
+def test_claim_force_does_not_evict_a_living_declaration_when_the_board_is_partially_unreadable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``claim --force`` も、掲示板が不完全なら**生きた宣言を退けない**。
+
+    ``--force`` の意味は「所有・実測を問わず退ける」ことであって、「不完全な
+    候補集合からでも退ける」ことではない。読めなかった側に、いま退けようと
+    している宣言以外の状況が隠れているかもしれない。**force でも宣言自体は
+    通す**（force は「止めない」を強めるものであって弱めるものではない）。
+    """
+    board = Board(tmp_path)
+    plant(board, THEIRS)  # 生きた他人の宣言
+    corrupt(board)
+    capsys.readouterr()
+
+    code = claim(tmp_path, "--force")
+    captured = capsys.readouterr()
+
+    assert code == 0
+    # **他人の生きた宣言が残っている。** force でも不完全な集合からは退けない。
+    foreign = [e for e in board.list_all() if e.session == "theirs"]
+    assert len(foreign) == 1, "掲示板が不完全なのに --force が退けている"
+    # **自分の宣言はそれでも作られる。** force は宣言そのものは止めない。
+    mine = [e for e in board.list_all() if e.holder.get("session_id") == "mine"]
+    assert len(mine) == 1, "--force なのに宣言できていない"
+    assert "退去は行わず" in captured.err
 
 
 def test_claim_names_the_corrupt_entry_instead_of_failing_silently(
