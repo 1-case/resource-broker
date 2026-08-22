@@ -260,7 +260,15 @@ def _cmd_status(args: argparse.Namespace) -> int:
             # 見分けられないと、記録している意味が無い。
             pid = holder.get("pid")
             marker = f" (pid {pid})" if isinstance(pid, int) and not isinstance(pid, bool) else ""
-            print(f"{'':<24} 宣言{index}  {holder.get('session', '?')}{marker} / {job}{ghost}")
+            # **release --nonce に渡す値をここに出す。** 掲示板を読んだ人が
+            # `rb release --nonce <先頭 8 桁>` の 1 手で済むようにするためで、
+            # 前方一致で一意に決まらなければ拒否されるので最小桁数の規則は要らない。
+            nonce = holder.get("nonce")
+            nonce_marker = f" nonce {nonce[:8]}" if isinstance(nonce, str) and nonce else ""
+            print(
+                f"{'':<24} 宣言{index}  {holder.get('session', '?')}{marker}"
+                f"{nonce_marker} / {job}{ghost}"
+            )
 
             held = declaration["held_for_seconds"]
             elapsed = f"（{_format_duration(held)} 経過）" if held is not None else ""
@@ -1124,8 +1132,15 @@ def _cmd_release(args: argparse.Namespace) -> int:
     """宣言を取り下げる。
 
     **選ばせるものが無い。** 役割を記録しないので「主宣言か相乗りか」という問いが
-    消えた。取り下げるのは**自分の宣言**であり、同じ資源へ並行して 2 件出していれば
-    2 件とも消える。他人のものまで消すのは ``--force`` だけである。
+    消えた。取り下げるのは**自分の宣言**であり、自分の宣言が 2 件以上あるときは
+    どれを消すか決められないので、既定では**何も消さずに** ``EXIT_USAGE`` で拒否する
+    （曖昧なまま 1 件選ぶと、黙って間違った方を消しうる。DESIGN.md「採らなかった案」）。
+    1 件なら従来どおり消える。
+    まとめて消すには ``--all``、資源 ID を省いて 1 本だけ狙って消すには ``--nonce``。
+    他人のものまで消すのは ``--force`` だけである——これは ``--nonce`` でも変わらない。
+    ``rb status`` が nonce を全セッションへ見せる以上、``--nonce`` 単独は既定で
+    **自分が所有する宣言だけ**に絞り込み、他人の宣言は ``--nonce --force`` でしか
+    消せない。
     """
     board = Board(args.home)
     if args.clean:
@@ -1138,24 +1153,192 @@ def _cmd_release(args: argparse.Namespace) -> int:
             _say("読めないファイルはありませんでした")
         return EXIT_OK
 
-    if not args.resource:
-        # **引数の不備を「内部エラー」にしない。** `normalize(None)` は例外になり、
-        # 総括の catch-all が exit 0 と `cli_internal_error` を残す——利用者の打ち間違いが
-        # 本ツールの故障として監査ログに積まれる。
-        print("資源 ID を指定するか、--clean を付けてください", file=sys.stderr)
-        return EXIT_USAGE
+    if args.nonce is not None:
+        # **`--nonce ""` も同じ経路へ落とす。** 真偽値としての `args.nonce` で分岐すると
+        # 空文字列がここを素通りし、資源 ID も指定せずに `_cmd_release` を抜けてしまう
+        # （`not args.resource` の分岐にも入らない）。空の是非は `_release_by_nonce` 側で
+        # 判定する。`resource` 位置引数が同時に渡されていれば、絞り込んだ宣言の資源と
+        # 食い違わないかもそちらで確かめる（黙って無視しない）。
+        return _release_by_nonce(board, args.nonce, force=args.force, resource=args.resource)
 
     if not args.resource:
         # **引数の不備を「内部エラー」にしない。** `normalize(None)` は例外になり、
         # 総括の catch-all が exit 0 と `cli_internal_error` を残す——利用者の打ち間違いが
         # 本ツールの故障として監査ログに積まれる。
-        print("資源 ID を指定するか、--clean を付けてください", file=sys.stderr)
+        print("資源 ID を指定するか、--clean か --nonce を付けてください", file=sys.stderr)
         return EXIT_USAGE
 
     resource_id = naming.normalize(args.resource)
     if args.force:
         return _release_forced(board, resource_id)
-    return _release_own(board, resource_id)
+    return _release_own(board, resource_id, take_all=args.all)
+
+
+def _release_by_nonce(
+    board: Board, prefix: str, *, force: bool = False, resource: str | None = None
+) -> int:
+    """``--nonce``: 資源 ID を指定せず、nonce の前方一致で 1 本だけを消す。
+
+    **所有は既定で尊重する。** ``Board.owns`` の nonce 規則（一致すれば確実に自分の
+    ものと見なす）は「nonce を知っているのはラッパーが自分で作った宣言だけ」という
+    前提に乗っていた。だが ``rb status`` は今や nonce の先頭 8 桁を**全セッション**へ
+    見せるので、その前提はもう成立しない。したがって前方一致した候補は、ここでいったん
+    **自分が本当に所有するものだけ**（cwd / session_id）に絞ってから使う——nonce の
+    一致そのものを所有の証明として使い回さない。他人の宣言にしか当たらなければ、
+    「見つからない」とは区別して拒否し、``--force`` を案内する（対処が違う）。
+
+    ``force=True`` のときだけ所有を問わない。個体指定で他人の宣言を消せる唯一の道が
+    これになるので、``_release_forced`` と同じく**何を消したか必ず言う**（黙って
+    他人の宣言を消すと、消された側は理由の分からない消失として体験する）。
+
+    ``resource`` が渡されていて、絞り込んだ 1 件の資源と食い違えば、**黙って通さず**
+    両方を示して拒否する。利用者は「その資源を消す」と信じて打っている。
+
+    **空文字列（や空白だけ）は前方一致の対象にしない。** ``"".startswith("")`` は
+    真になるので、弾かずに通すと ``entry.nonce.startswith("")`` が**全件に一致**し、
+    曖昧判定を素通りして最初に見つかった宣言を暗黙に選んでしまう——issue #8
+    「採らなかった案」が明示的に退けた「曖昧なときに暗黙で 1 件選ぶ」の再来である。
+    「見つからない」（0 件一致）とは別の理由として拒否する。桁数の下限は設けない。
+    1 桁でも一意に決まれば指定として成立する——短いことは問題ではなく、**空である
+    ことだけ**が「何も指定していない」に当たる。
+    """
+    prefix = prefix.strip()
+    if not prefix:
+        # **「見つからない」と混ぜない。** 前者は打ち直しを誘うが、これは入力そのものが
+        # 不正であり対処が違う——何を指定すればよいかが打ち直しでは分からない。
+        _say("nonce が空です。前方一致させる値を指定してください", err=True)
+        board.audit("release_nonce_rejected", reason="nonce が空である")
+        return EXIT_USAGE
+
+    matches = [entry for entry in board.list_all() if entry.nonce.startswith(prefix)]
+
+    if not matches:
+        _say(f"nonce '{prefix}' に一致する宣言が見つかりませんでした", err=True)
+        board.audit("release_nonce_rejected", reason="一致する宣言が無い", prefix=prefix)
+        return EXIT_USAGE
+
+    if force:
+        # **所有を問わない。** 絞り込みは前方一致だけで行う。
+        candidates = matches
+    else:
+        cwd = os.getcwd()
+        session_id = platform_info.session_id()
+        mine = [entry for entry in matches if board.owns(entry, cwd=cwd, session_id=session_id)]
+        if not mine:
+            # **「無い」と「あなたのものではない」を混ぜない。** 前者は打ち直し、
+            # 後者は --force を使うかどうかの判断が要る。対処が違う。
+            _say(
+                f"nonce '{prefix}' は自分の宣言ではありません"
+                f"（{len(matches)} 件、他セッションのもの）",
+                err=True,
+            )
+            for entry in matches:
+                _say(
+                    f"  nonce {entry.nonce[:8]}  {naming.display_default(entry.resource)}"
+                    f"  {entry.session} / {entry.job}（since {entry.since}）",
+                    err=True,
+                )
+            _say(f"  他セッションの宣言を消すなら rb release --nonce {prefix} --force", err=True)
+            board.audit(
+                "release_nonce_rejected",
+                reason="自分の宣言ではない",
+                prefix=prefix,
+                count=len(matches),
+            )
+            return EXIT_USAGE
+        candidates = mine
+
+    if len(candidates) > 1:
+        _say(
+            f"nonce '{prefix}' が {len(candidates)} 件に一致します。"
+            "もっと長い桁数を指定してください",
+            err=True,
+        )
+        for entry in candidates:
+            _say(
+                f"  nonce {entry.nonce[:8]}  {naming.display_default(entry.resource)}"
+                f"  {entry.session} / {entry.job}（since {entry.since}）",
+                err=True,
+            )
+        board.audit(
+            "release_nonce_rejected", reason="前方一致が曖昧", prefix=prefix, count=len(candidates)
+        )
+        return EXIT_USAGE
+
+    entry = candidates[0]
+
+    if resource is not None:
+        wanted = naming.normalize(resource)
+        if wanted != entry.resource:
+            # **黙って通さない。** 「この資源を消す」と信じて打った利用者に、
+            # 無関係な資源の宣言を消させてはならない。
+            _say(
+                f"食い違いがあります: 指定した資源は {naming.display_default(wanted)} ですが、"
+                f"--nonce が指しているのは {naming.display_default(entry.resource)} です",
+                err=True,
+            )
+            _say(
+                f"  nonce {entry.nonce[:8]}  {entry.session} / {entry.job}（since {entry.since}）",
+                err=True,
+            )
+            board.audit(
+                "release_nonce_rejected",
+                reason="resource と --nonce が食い違う",
+                prefix=prefix,
+                requested_resource=wanted,
+                actual_resource=entry.resource,
+            )
+            return EXIT_USAGE
+
+    if force:
+        # **所有チェックという概念自体が要らない場面。** `remove_own` の nonce 経路は
+        # 内部で「nonce が一致すれば所有とみなす」ため、既に所有確認を終えている
+        # 非強制路とは違い、ここでは素の CAS（`remove_if_nonce`）を直接使う。
+        removal = board.remove_if_nonce(
+            entry.resource, expect_nonce=entry.nonce, reason="release --nonce --force コマンド"
+        )
+        if removal is RemovalResult.REMOVED:
+            _say(
+                f"強制解放しました: {naming.display_default(entry.resource)}"
+                f"（nonce {entry.nonce[:8]}, {entry.session} / {entry.job}）"
+            )
+            return EXIT_OK
+        if removal is RemovalResult.ABSENT:
+            _say(f"宣言は既にありませんでした: nonce {entry.nonce[:8]}")
+            return EXIT_OK
+        if removal is RemovalResult.NOT_OWNED:
+            _say("宣言が入れ替わりました（解放していません）", err=True)
+            return EXIT_BUSY
+        _say("警告: 宣言を取り下げられませんでした（掲示板に残っています）", err=True)
+        return EXIT_BUSY
+
+    # **所有は既に確認済み。** ここへ来る entry は必ず自分のものなので、
+    # `remove_own` の nonce 経路（cwd・session_id を問わず 1 本だけを狙う）を
+    # そのまま使ってよい。**`cwd` も転送する**——`remove_own` は nonce が非空なら
+    # 内部の所有判定を nonce 一致だけで済ませるので通常は無くても効くが、nonce を
+    # 持たない旧形式の宣言（cwd の祖先フォールバックでしか所有と判定できない）が
+    # 将来ここへ来ても、掲示板に残っているのに「無い」と嘘を言わないための保険である。
+    result = board.remove_own(
+        entry.resource, reason="release --nonce コマンド", nonce=entry.nonce, cwd=cwd
+    )
+    if result.removed:
+        _say(f"解放しました: {naming.display_default(entry.resource)}（nonce {entry.nonce[:8]}）")
+        return EXIT_OK
+    if result.swapped:
+        _say("宣言が入れ替わりました（解放していません）", err=True)
+        return EXIT_BUSY
+    if result.failed:
+        _say("警告: 宣言を取り下げられませんでした（掲示板に残っています）", err=True)
+        return EXIT_BUSY
+    # **ここへは通常来ない。** 所有は既に確認済みなので `remove_own` は原則
+    # removed/swapped/failed のいずれかで返る。絞り込みからここまでの間に
+    # 他セッションが同じ宣言を消していた場合だけ素通りする。「無かった」を
+    # 「消せなかった」と混ぜない。
+    _say(
+        f"宣言を取り下げませんでした（既に掲示板に無い可能性）: nonce {entry.nonce[:8]}",
+        err=True,
+    )
+    return EXIT_BUSY
 
 
 def _release_forced(board: Board, resource_id: str) -> int:
@@ -1184,14 +1367,43 @@ def _release_forced(board: Board, resource_id: str) -> int:
     return EXIT_OK
 
 
-def _release_own(board: Board, resource_id: str) -> int:
+def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> int:
     """自分の宣言を取り下げる。
 
     照合は :meth:`Board.owns` と同じ規則（nonce → session_id → cwd の祖先）。
     **他人のものは消さない。** 消したものは 1 件ずつ表示する——祖先フォールバックで
     誤って選んだとき、目視できなければ気づく手段が無い。
+
+    **自分の宣言が 2 件以上あるときは、``--all`` が無ければ何も消さずに拒否する。**
+    曖昧なまま 1 件を選ぶと、黙って間違った方を消すことになり、2 件とも消すより悪い
+    （DESIGN.md「採らなかった案」）。1 件のときは摩擦を足さない——曖昧なときだけの保険である。
     """
     cwd = os.getcwd()
+    session_id = platform_info.session_id()
+
+    if not take_all:
+        mine = [
+            entry
+            for entry in board.list_for(resource_id)
+            if board.owns(entry, cwd=cwd, session_id=session_id)
+        ]
+        if len(mine) > 1:
+            # **消す前に止める。** 曖昧なまま 1 件選ぶと、黙って間違った方を消すのが
+            # 「2 件とも消す」より悪い（DESIGN.md「採らなかった案」）。
+            _say(
+                f"自分の宣言が {len(mine)} 件あります。曖昧なので何も消しません",
+                err=True,
+            )
+            for entry in mine:
+                _say(f"  nonce {entry.nonce[:8]}  {entry.job}（since {entry.since}）", err=True)
+            _say("  1 本だけ消すには rb release --nonce <nonce の先頭 8 桁>", err=True)
+            _say(
+                f"  まとめて消すには rb release {naming.display_default(resource_id)} --all",
+                err=True,
+            )
+            board.audit("release_ambiguous", resource=resource_id, count=len(mine))
+            return EXIT_USAGE
+
     result = board.remove_own(resource_id, reason="release コマンド", cwd=cwd)
     if result.removed:
         _say(f"解放しました: {naming.display_default(resource_id)}（{len(result.removed)} 件）")
@@ -1317,11 +1529,27 @@ def build_parser() -> argparse.ArgumentParser:
         "release",
         help="宣言を解放する（自分のものだけ）",
         description=(
-            "自分の宣言を取り下げる。同じ資源へ並行して 2 件出していれば 2 件とも消える。"
+            "自分の宣言を取り下げる。自分の宣言が 2 件以上あるときは、曖昧なので"
+            "既定では何も消さずに拒否する（--all でまとめて消せる）。"
+            "--nonce を使えば資源 ID 無しで 1 本だけを狙って消せる。"
             "他セッションの宣言まで消すのは --force だけである。"
         ),
     )
-    release.add_argument("resource", nargs="?", help="資源 ID（--clean のときは不要）")
+    release.add_argument("resource", nargs="?", help="資源 ID（--clean / --nonce のときは不要）")
+    release.add_argument(
+        "--nonce",
+        default=None,
+        help=(
+            "資源 ID の代わりに nonce の前方一致で 1 本を指定する（rb status に表示される"
+            "先頭 8 桁でよい）。既定では自分が所有する宣言だけに絞り込み、一意に決まらなければ"
+            "何も消さず候補を挙げて拒否する。他セッションの宣言を消すには --force を併用する"
+        ),
+    )
+    release.add_argument(
+        "--all",
+        action="store_true",
+        help="自分の宣言が複数あっても全部まとめて解放する（曖昧さの拒否を明示的に上書きする）",
+    )
     release.add_argument(
         "--force", action="store_true", help="他セッションの宣言も強制的に解放する"
     )
