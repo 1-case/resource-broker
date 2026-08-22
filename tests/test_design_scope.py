@@ -67,7 +67,31 @@ DESIGN = ROOT / "docs" / "DESIGN.md"
 MAX_LINES = 684
 
 #: 公開しない文書。**公開物からここへリンクすると参照切れになる。**
-PRIVATE_DOCS = ("EXPERIMENTS.md", "STATUS.md", "tools/speak.py", "tools/speak_dict.json")
+#:
+#: ``CLAUDE.md`` は ``.gitignore`` で意図的に非公開にしている本リポジトリの作業規則
+#: だが、公開ソース（``src/`` / ``hooks/``）が合計 29 箇所で引用していた（issue #10）。
+#: 読者は誰も辿れない出典表示だったので、参照そのものを消したうえでここに加えた。
+PRIVATE_DOCS = (
+    "EXPERIMENTS.md",
+    "STATUS.md",
+    "tools/speak.py",
+    "tools/speak_dict.json",
+    "CLAUDE.md",
+)
+
+#: 公開しているソース。ここから非公開文書を参照すると、読者は永遠に出典を辿れない
+#: （issue #10）。``docs/DESIGN.md`` だけを見ていたのが元の穴で、実際に破っていたのは
+#: この 2 ディレクトリだった。
+PUBLIC_SOURCE_FILES = sorted(
+    str(path.relative_to(ROOT)).replace("\\", "/")
+    for folder in ("src", "hooks")
+    for path in (ROOT / folder).rglob("*.py")
+    if "__pycache__" not in path.parts
+)
+
+#: ``DESIGN.md「見出し」`` 形式の引用。見出し名の途中で行が折り返されることがある
+#: ので ``re.S`` で改行をまたいで拾い、比較前に空白へ畳む。
+DESIGN_QUOTE = re.compile(r"DESIGN\.md[^」]{0,20}「([^」]*)」", re.S)
 
 #: 経緯の徴候。日付そのものは JSON の例示で正当に現れるので、**散文の中の日付**だけを見る。
 NARRATIVE = re.compile(
@@ -97,6 +121,43 @@ def test_design_does_not_point_at_unpublished_files(name: str) -> None:
     text = DESIGN.read_text(encoding="utf-8")
 
     assert name not in text, f"docs/DESIGN.md が非公開の {name} を参照している"
+
+
+@pytest.mark.parametrize("name", PUBLIC_SOURCE_FILES)
+def test_public_source_does_not_point_at_unpublished_files(name: str) -> None:
+    """公開しているソース（``src/`` / ``hooks/``）が非公開の文書を参照していない。
+
+    上の検査が ``docs/DESIGN.md`` しか見ていなかった穴を塞ぐ。**公開物からここへ
+    リンクすると参照切れになる**という原則は同じで、見る場所を広げただけである
+    （issue #10：``CLAUDE.md`` への参照が 12 ファイル・29 箇所に散っていた）。
+    """
+    text = (ROOT / name).read_text(encoding="utf-8")
+
+    offenders = [doc for doc in PRIVATE_DOCS if doc in text]
+    assert not offenders, f"{name} が非公開文書を参照している: {offenders}"
+
+
+def test_design_md_quotations_in_source_resolve() -> None:
+    """``DESIGN.md「見出し」`` の形の引用が、実在する文字列へ解決する。
+
+    節名を変更・削除しても引用側の文字列は自動では追随しない。放置すると、
+    読者は存在しない見出しを探すはめになる（issue #10 で 3 件が解決しなかった。
+    うち 1 件は見出し自体が ``CLAUDE.md`` 側の概念の誤記で、``docs/DESIGN.md`` には
+    最初から存在しなかった）。
+    """
+    design_text = DESIGN.read_text(encoding="utf-8")
+
+    offenders: list[str] = []
+    for name in PUBLIC_SOURCE_FILES:
+        path = ROOT / name
+        text = path.read_text(encoding="utf-8")
+        for match in DESIGN_QUOTE.finditer(text):
+            heading = match.group(1).replace("\n", " ")
+            if heading not in design_text:
+                line = text.count("\n", 0, match.start()) + 1
+                offenders.append(f"{name}:{line}: 「{heading}」")
+
+    assert not offenders, "DESIGN.md「…」の引用が解決しない:\n" + "\n".join(offenders)
 
 
 def test_design_does_not_narrate_history() -> None:

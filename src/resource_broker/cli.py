@@ -261,7 +261,7 @@ def _known_resources_detailed(board: Board) -> tuple[list[str], bool]:
     """掲示板に載っている資源と、**読めなかったものがあったか**を返す。
 
     読めなかったことを畳まない。畳むと「掲示板は空です」と断定してしまい、
-    **実際には使われている資源を空きとして配る**（DESIGN.md「Liveness Judgment」の
+    **実際には使われている資源を空きとして配る**（DESIGN.md「Ghost Detection」の
     非対称性の裏返しであり、断定してよい側ではない）。
     """
     listing = board.list_all_detailed()
@@ -488,7 +488,7 @@ def acquire(
     with board.locked(resource_id) as lock:
         if lock is not LockState.ACQUIRED:
             # **囲えなくても続行する。** ロックは競り合いを減らすだけで、正しさは
-            # nonce の CAS が担保している（DESIGN.md「Locking」）。
+            # nonce の CAS が担保している（DESIGN.md「Per-Resource Lock」）。
             #
             # **黙って続行しない。** ロックが取れないのは本ツール側の事情であって
             # 資源の競合ではない。混同すると「使用中」と読まれる。
@@ -806,7 +806,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # `OSError` で落ちると、宣言だけが掲示板に残る。
     # 子の終了コード。**後始末で監査ログに残すために保持する。** 解放の記録が
     # 「rb run の終了」だけだと、走らずに即死したジョブと完走したジョブが同じ 1 行になり、
-    # 後から振り返ったときに区別できない（CLAUDE.md「Silence Is Not Success」）。
+    # 後から振り返ったときに区別できない。
     # ラッパー自身が落ちて finally だけが通った場合は None のままにする。
     exit_code: int | None = None
     try:
@@ -901,7 +901,7 @@ def _held_seconds(entry: Entry) -> float | None:
     """宣言してからの経過秒数。時刻が読めなければ None。
 
     **これは表示のための値であって、判断には使わない。** 長く持っていることは
-    幽霊である証拠にならない（CLAUDE.md「Liveness Judgment」）。9 時間の宣言が
+    幽霊である証拠にならない。9 時間の宣言が
     正当なことは実際にある。古さが一目で分かるようにするだけである。
     """
     since = entry.since_dt
@@ -931,7 +931,7 @@ def _cmd_wait(args: argparse.Namespace) -> int:
     """資源が解放されるまで待つ。
 
     ETA では打ち切らない。掲示板の ETA は申告であって約束ではないため、
-    過ぎたからといって待機をやめる根拠にはしない（CLAUDE.md「Time Handling」）。
+    過ぎたからといって待機をやめる根拠にはしない。
     打ち切るのは呼び出し側が指定した ``--timeout`` だけである。
     """
     board = Board(args.home)
@@ -1198,7 +1198,7 @@ def _elapsed_and_stated(record: dict, release: dict | None) -> tuple[float | Non
     解釈すると、解釈がずれたときにどちらが正しいか分からなくなる。
 
     ここで出す値は**人間が申告の精度を振り返るための表示**であり、
-    ツールの判断には一切使わない（CLAUDE.md「Time Handling」）。
+    ツールの判断には一切使わない。
     """
     started = _parse_at(record.get("at"))
 

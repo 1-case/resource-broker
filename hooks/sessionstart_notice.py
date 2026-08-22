@@ -195,7 +195,7 @@ def read_entries_directly() -> list[dict[str, object]] | None:
     ``rb`` が動かない環境（Python が古い、PATH に載っていない）でも、**使い方の説明と
     掲示板の中身は届けなければならない**。ここで黙ると、このフックが唯一配っている
     使い方が丸ごと消える。しかも fail-open なので誰も気づかない——
-    CLAUDE.md「Silence Is Not Success」が戒めている壊れ方そのものである。
+    「沈黙は成功ではない」が戒めている壊れ方そのものである。
 
     ``rb status --json`` と同じ形（``resource`` / ``holder`` / ``since`` …）に整えて返す。
     ただし**判定（幽霊かどうか）はできない**。ここは資源の状態を判断する場所ではなく、
