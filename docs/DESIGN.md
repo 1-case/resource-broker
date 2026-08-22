@@ -60,7 +60,7 @@
 
 ```
 src/resource_broker/
-  clock.py / naming.py        時刻生成の唯一の入口 / 資源 ID の正規化・安全なファイル名・表示ラベル
+  clock.py / naming.py        時刻生成の唯一の入口 / 資源 ID の正規化・安全なファイル名
   board.py / liveness.py      掲示板の読み書き（O_EXCL・nonce の CAS・ロック） / 幽霊判定（純粋関数）
   audit.py / platform_info.py 監査ログの追記 / boot time・PID 生存・ホスト名（OS 依存の隔離）
   runner.py / waiting.py      子プロセスの起動とログの強制 / 宣言が減るまで待つ
@@ -119,7 +119,7 @@ uv run rb run --res GPU0 --job "E009 学習" --observed "..." --eta 40m -- uv ru
 |---|---|
 | 掲示板の場所 | `%LOCALAPPDATA%\resource-broker\board\`（無ければ `~/.resource-broker/board/`）。**マシン全体で 1 箇所**に置く（全アセットから参照するため、プロジェクト配下には置かない） |
 | 宣言 | 宣言 1 件につき 1 ファイル（名前は nonce）。単一ファイルに集約しない（破損を局所化する） |
-| 旧い置き場 | `board/<safe-name>.json` と `board/joins/*.json`。**ただの宣言として読む**（形式を変えた瞬間に稼働中の宣言を見失わないため）。新しく作ることはない |
+| 旧い固定パス | `board/<safe-name>.json`。このディレクトリの走査に含まれるので、ただの宣言として読める。新しく作ることはない。旧い別ディレクトリ（`board/joins/*.json`）はもう走査しない（下記「nonce を持たない宣言」） |
 | 宣言 | `O_CREAT｜O_EXCL` 相当だが、名前が nonce なので**必ず成功する**。**先着を決める仕組みは無い**——条件付き書き込みのプリミティブが OS に無い。書いた直後に読み直し、同時に入った相手を双方へ知らせる |
 | 排他区間のロック | `board/<safe-name>.lock`。資源ごとに 1 つ |
 | 待機列 | **未実装（Phase 4 の予定）**。`<safe-name>.waiters.jsonl`（append-only）を想定する |
@@ -134,27 +134,32 @@ uv run rb run --res GPU0 --job "E009 学習" --observed "..." --eta 40m -- uv ru
 | 操作 | 形 | 原子性の根拠 |
 |---|---|---|
 | 宣言 | `declare` | `os.link`（中身のある一時ファイルへ名前を付ける）。名前が nonce なので**必ず成功する**——先着は決まらない |
-| 削除 | `_remove_if_nonce` / `_remove_matching` | `os.rename` で一時名へ**捕まえる**。捕まえられるのは 1 人だけ |
+| 削除 | `_remove_if_nonce` | `os.rename` で一時名へ**捕まえる**。捕まえられるのは 1 人だけ |
 | 置換 | `replace(expect_nonce=...)` | 読んで確かめてから一時ファイルを `os.replace` |
 
 削除は「先読み → 捕獲 → nonce 照合 → 一致なら消す / 違えば元へ戻す」の順で行う（詳細は `board.py`）。**戻せなかった**ときだけ事象名を分け
 `declaration_lost` で記録する。他人の生きた宣言が消えて資源が空きに見える唯一の状態であり、監査ログから grep 一発で見つかることが回復手段
-だからである。**`rb release`（`--force` を含む全経路）もこの CAS に乗る**——無条件の `unlink` は残っていない。
+だからである。**`rb release`（`--force` を含む全経路）もこの CAS に乗る**——nonce を持つ宣言に無条件の `unlink` は使わない
+（nonce を持たない旧形式の宣言だけが例外。下記「nonce を持たない宣言」）。
 
 ##### 型で強制する削除（issue #18）
 
 3 回のレビューで毎回「別の破壊的経路が完全性の確認を忘れている」が出た。関数ごとの手当てをやめ、**型と公開 API の形そのもの
-で「確認を忘れる」を書けなくする**。低水準 CAS（`_remove_if_nonce` / `_remove_matching`）は private。個別の宣言を消す唯一の
-公開入口 `Board.remove_confirmed(selection, *, reason)` は `ConfirmedEntry` **でなければ呼べない**（型を実行時にも検査する）。
+で「確認を忘れる」を書けなくする**。低水準 CAS（`_remove_if_nonce`）は private。個別の宣言を消す唯一の公開入口
+`Board.remove_confirmed(selection, *, reason, force=False)` は `ConfirmedEntry` **でなければ呼べない**（型を実行時にも検査する）。
 `ConfirmedEntry` を作れる経路は 2 つだけ——`BoardListing.confirmed()`（**完全に**読めた列挙から。不完全なら送出する
 `PartialListingError` が 1 件も作らせない）と `Board.confirm_own_declaration(entry)`（**自分がいま書いた**宣言。列挙を経由
 しないので完全性という概念自体が要らず、`rb run` の後始末が使う）。複数件を扱う入口も同じ形——`Board.remove_own` の
-`declared: list[ConfirmedEntry]` は**必須**、`--force` の実体 `Board.remove_selected(resource_id, selections, *, reason)`
-は渡された `selections` **以外は対象にならない**。資源名だけで何件消えるか決まる公開入口（旧 `remove_all`）は廃した——
-**列挙（表示用）と削除を同じ並びから行う**ので、以前あった「表示と実削除の食い違い」（issue #15 指摘 12）も閉じる。
+`declared: list[ConfirmedEntry]` は**必須**、`--force` の実体 `Board.remove_selected` は渡された `selections`
+**以外は対象にならない**。資源名だけで何件消えるか決まる公開入口（旧 `remove_all`）は廃した——**列挙（表示用）と削除を
+同じ並びから行う**ので、以前あった「表示と実削除の食い違い」（issue #15 指摘 12）も閉じる。
 
 置換（`replace`）だけは捕獲型にしない — 捕まえた直後にプロセスが死ぬと**宣言そのものが消える**ためで、読みと置きの間の窓は
 **既知の残余**として受け入れる。
+
+**nonce を持たない旧形式の宣言**（issue #9）は個体を指す鍵が無く CAS を組めない。**消さず `rb status` には出す**（見え
+ないまま残さない）。消せるのは `--force`（`remove_confirmed(force=True)` → `_remove_unkeyed`。単純な `unlink`）と
+`--clean` だけ。通常の解放（`rb release`／`--nonce`）は個体を確認できないので `NOT_OWNED` として拒否する。
 
 #### Per-Resource Lock
 
@@ -209,10 +214,10 @@ uv run rb run --res GPU0 --job "E009 学習" --observed "..." --eta 40m -- uv ru
 
 ### Checking The Board
 
-**確認は `rb status`（引数なし・全件）で行う。資源名を指定しない。** `normalize()` は大文字小文字を保持するため `GPU0` と `gpu0` は
-**別の資源**になり、名指しで聞くと相手の宣言が見えず「空き」と出る。表記は強制せず**収束に任せる** — `rb status` は全件を出し、
-2 つのフックが宣言中の資源を**全件**、全セッションの文脈へ流し込むので、表記が分かれるのは**掲示板がその資源について空だった瞬間
-だけ**であり、そのとき衝突する相手はいない。
+**確認は `rb status` で行う。資源 ID は受け取らない**（issue #9）。`normalize()` は大文字小文字を保持するため `GPU0` と
+`gpu0` は**別の資源**になり、名指しで聞くと相手の宣言が見えず「空き」と出る——フックの通知文と `SessionStart` の使い方が
+案内している規約（名指しせず全件を見る）を機能としても強制する。表記は強制せず**収束に任せる**——2 つのフックも宣言中の
+資源を**全件**、全セッションの文脈へ流し込むので、表記が分かれるのは掲示板がその資源について空だった瞬間だけである。
 
 ### Who Investigates
 
@@ -242,7 +247,7 @@ uv run rb run --res GPU0 --job "E009 学習" --observed "..." --eta 40m -- uv ru
 - `--found` は `busy` / `free` / `unknown` の 3 値（既定 `unknown`）。幽霊判定に渡す唯一の機械可読な入力である
 - `--found busy` を申告した `claim` は**必ず失敗する**（使用中と分かっているものを場所取りしても衝突は防げない）。`join` は逆に
   `--found busy` は断る（実測は単独で確定する）。`--share` を付ければ承知で並べる
-- `--peak` / `--avg` / `--sharing` / `--log` / `--display` は任意。いずれも**解釈しない**
+- `--peak` / `--avg` / `--sharing` / `--log` は任意。いずれも**解釈しない**
 - ETA を必須にしているのは、**正確な値が欲しいからではなく、一度考えさせるため**である。外れても本ツールは何も判断しない
 
 #### History
@@ -265,22 +270,24 @@ uv run rb run --res GPU0 --job "E009 学習" --observed "..." --eta 40m -- uv ru
 
 原則は 2 つ。**その端末で一意**であること、**人間が現物を指させる**こと。
 
-| 種別 | 正規名（ID） | 併記する表示名 |
-|---|---|---|
-| シリアル | `COM3` | `USB Serial Port (COM3)` |
-| USB 機器 | `USB\VID_0403&PID_6001\A50285BI`（デバイス インスタンス パス） | フレンドリ名 |
-| GPU | `GPU-xxxxxxxx-....`（UUID） | `GPU0 / RTX 4060 Laptop 8GB` |
-| ネットワークドライブ | `\\nas\share`（**UNC 固定**。`Z:` は端末ごとに違う） | マウント先レター |
-| Web API | `api.openai.com/v1/embeddings` | サービス名・制限値 |
+| 種別 | 正規名（ID） |
+|---|---|
+| シリアル | `COM3` |
+| USB 機器 | `USB\VID_0403&PID_6001\A50285BI`（デバイス インスタンス パス） |
+| GPU | `GPU-xxxxxxxx-....`（UUID） |
+| ネットワークドライブ | `\\nas\share`（**UNC 固定**。`Z:` は端末ごとに違う） |
+| Web API | `api.openai.com/v1/embeddings` |
 
 - ID は将来のマシン追加に備えて **`<hostname>::<resource-id>`** の形にする。区切りは `::`（`/` は UNC パスや Web API の ID に含まれ、
-  先頭セグメントの判別ができなくなる）。GPU の index は起動順で変わりうるため、**正規名は UUID とし、`GPU0` は表示名に落とす**
+  先頭セグメントの判別ができなくなる）。GPU の index は起動順で変わりうるため、**正規名は UUID とする**（`GPU0` のような起動順
+  依存の名前を ID にしない）
 - 掲示板のファイル名は `[A-Za-z0-9._-]` 以外を `_` に置換した文字列 + ID の短縮ハッシュ。**真の ID はファイルの中**
+- **読みにくい ID に別名を添える専用の場は無い**（issue #9 で廃止）。一覧・通知の見出しは常に資源 ID そのもの
 
 ### Board Schema
 
 ```json
-{ "schema": 1, "resource": "myhost/GPU-xxxxxxxx-....", "display": "GPU0 / RTX 4060 Laptop 8GB",
+{ "schema": 1, "resource": "myhost/GPU-xxxxxxxx-....",
   "holder": { "session": "malm", "session_id": "b1f0...", "cwd": "c:\\work\\assets\\malm",
               "pid": 16152, "job": "E008 sweep", "nonce": "9f2c1ab4e5d74f0a8c3b6e1d92047fa5" },
   "log": "c:\\work\\assets\\malm\\runs\\train.log", "boot": "2026-08-12T04:27:53+09:00",
@@ -299,10 +306,6 @@ uv run rb run --res GPU0 --job "E009 学習" --observed "..." --eta 40m -- uv ru
   かを後から追うための記録である
 - `holder.nonce` は**宣言ごとに一意**な値（uuid）。`cwd` だけでは同じ場所からの解放と再取得を見分けられず、`since` は秒精度なので
   照合に使わない。未知フィールドは無視して読む（前方互換）。`schema` の非互換な変更は破壊的変更として扱う
-
-**`display` は読みにくい資源 ID に別名を添えるためのもの**であって、資源の同一性を置き換えるものではない。一覧・通知の見出しは
-`naming.label()` が作り、**必ず資源 ID を含める** — 置き換えを許すと `display` にジョブ名が入った瞬間に「どの資源が押さえられて
-いるか」が掲示板から消える。取得の排他は資源 ID で効くので衝突は起きないが、**掲示板は読まれて初めて意味を持つ**。
 
 #### Ownership
 

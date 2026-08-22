@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import subprocess
 import sys
@@ -94,9 +95,8 @@ def test_a_resource_held_only_by_joiners_is_reported(tmp_path: Path) -> None:
     絞り込みは ``occupied``（誰か 1 人でも宣言しているか）で行う。``free``
     （主宣言の枠が取れるか）で絞ると、実際に使っている者がいるのに通知から消える。
 
-    さらに、``rb status --json`` は相乗りを ``joins`` に入れるため、相乗りだけの行では
-    ``holder`` が None になる。主宣言と同じ型で整形すると
-    ``GPU0 <- ? / (ジョブ未記入)`` になり、**誰が使っているかもログも隠れる**。
+    主宣言と相乗りを分けていた頃は、相乗りだけが残った資源で ``holder`` が None に
+    なり、同じ型で整形すると ``GPU0 <- ? / (ジョブ未記入)`` になっていた。
     資源名が出るだけでは足りない。
     """
     board = Board(tmp_path)
@@ -576,30 +576,29 @@ def test_empty_stdin_is_tolerated(tmp_path: Path) -> None:
     assert result.returncode == 0
 
 
-def test_a_display_name_does_not_hide_which_resource_is_held(tmp_path: Path) -> None:
-    """``display`` にジョブ名が入っても、起動時の通知から資源 ID が消えない。
+def test_a_legacy_display_field_does_not_leak_into_the_notice(tmp_path: Path) -> None:
+    """掲示板に残っている旧い ``display`` フィールドは、通知の見出しに使わない。
 
-    ``display`` は「UUID を読みやすくするための資源の別名」であって、資源の
-    同一性を置き換えるものではない。実運用で display が ``malm E017 学習`` に
-    なり、GPU0 が押さえられていることが全セッションの通知から見えなくなった。
-    取得の排他は資源 ID で効くので衝突そのものは起きないが、**掲示板は読まれて
-    初めて意味を持つ**。読めない通知は通知が無いのと変わらない。
+    別名を併記する仕組み（``display`` / ``naming.label()``）は廃止した——実運用で
+    2 度ともジョブ名が入り、通知から資源 ID が読み取れなくなった。しかも資源 ID は
+    自由記述で括弧を含む ID が実在するため、合成した見出しと本物の資源 ID が書式で
+    区別できず、逆向きの誤読も生んだ（issue #9）。既存の掲示板に残った ``display``
+    は読まず、消さず、特別な処理もしない——見出しは常に資源 ID だけになる。
     """
     board = Board(tmp_path)
-    assert board.declare(
-        build_entry(
-            normalize("GPU0"),
-            job="E017 A/B 学習 10 本",
-            session="malm",
-            display="malm E017 学習",
-        )
+    board.entries_dir.mkdir(parents=True)
+    entry = build_entry(normalize("GPU0"), job="E017 A/B 学習 10 本", session="malm")
+    payload = entry.to_dict()
+    payload["display"] = "malm E017 学習"  # 旧い版が書いた形を模す
+    (board.entries_dir / f"{entry.nonce}.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
     )
 
     result = run_hook(home=tmp_path)
 
     assert result.returncode == 0
     assert "GPU0" in result.stdout
-    assert "malm E017 学習" in result.stdout
+    assert "malm E017 学習" not in result.stdout
 
 
 def test_usage_tells_you_to_read_the_whole_board(tmp_path: Path) -> None:

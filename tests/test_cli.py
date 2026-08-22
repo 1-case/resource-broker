@@ -49,6 +49,18 @@ def test_status_on_empty_board_succeeds(
     assert capsys.readouterr().out
 
 
+def test_status_does_not_accept_a_resource_argument(tmp_path: Path) -> None:
+    """``rb status <資源>`` は受け付けない（argparse が unrecognized として拒否する）。
+
+    本ツール自身が 3 か所（フックの通知文と ``SessionStart`` の使い方）で
+    「資源名を指定するな」と案内していたのに機能として残すのは、注意書きで
+    防ごうとしているのと同じだった。実運用で `gpu0` が 7.3 時間押さえられ、
+    その間 `rb status GPU0` は空きと答えていた（issue #9）。機能ごと消し、
+    常に全件表示にする。
+    """
+    assert run(tmp_path, "status", "GPU0") == 2
+
+
 def test_claim_requires_the_observation(tmp_path: Path) -> None:
     """``--observed`` なしでは宣言できない。
 
@@ -136,7 +148,7 @@ def test_status_json_exposes_verdict_and_holder(
     claim(tmp_path, "COM3", "実機の教示", "--log", "runs/probe.log")
     capsys.readouterr()
 
-    assert run(tmp_path, "status", "COM3", "--json") == 0
+    assert run(tmp_path, "status", "--json") == 0
     payload = json.loads(capsys.readouterr().out)
     row = payload["resources"][0]
 
@@ -147,15 +159,16 @@ def test_status_json_exposes_verdict_and_holder(
     assert row["declarations"][0]["since"]
 
 
-def test_status_reports_free_for_unclaimed_resource(
+def test_status_reports_free_when_nothing_is_declared(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """宣言が無い資源は空きとして返る。"""
-    assert run(tmp_path, "status", "COM7", "--json") == 0
-    row = json.loads(capsys.readouterr().out)["resources"][0]
+    """何も宣言していなければ、資源は 1 件も返らない（空きとして出す対象すら無い）。
 
-    assert row["occupied"] is False
-    assert row["occupied"] is False
+    ``status`` は資源 ID を受け取らない（issue #9）ので、「未宣言のこの資源だけ
+    見る」という問いはもう存在しない——見るのは常に「宣言のある全件」である。
+    """
+    assert run(tmp_path, "status", "--json") == 0
+    assert json.loads(capsys.readouterr().out)["resources"] == []
 
 
 def test_claim_records_the_log_path(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -165,7 +178,7 @@ def test_claim_records_the_log_path(tmp_path: Path, capsys: pytest.CaptureFixtur
     """
     claim(tmp_path, "COM3", "収録", "--log", "runs/rec.log")
     capsys.readouterr()
-    run(tmp_path, "status", "COM3", "--json")
+    run(tmp_path, "status", "--json")
 
     row = json.loads(capsys.readouterr().out)["resources"][0]
     assert row["declarations"][0]["log"] == "runs/rec.log"
@@ -193,7 +206,7 @@ def test_claim_records_the_observation_verbatim(
         "free",
     )
     capsys.readouterr()
-    run(tmp_path, "status", "\\\\nas\\share", "--json")
+    run(tmp_path, "status", "--json")
 
     observed = json.loads(capsys.readouterr().out)["resources"][0]["declarations"][0]["observed"]
     assert observed["note"] == "net use: 接続なし / 空き容量 2.1TB"
@@ -201,10 +214,10 @@ def test_claim_records_the_observation_verbatim(
     assert observed["at"]  # 観測時刻は機械が刻む
 
 
-def test_status_without_arguments_lists_only_declared_resources(
+def test_status_lists_only_declared_resources(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """引数なしの status は、宣言のある資源だけを出す。
+    """``status`` は、宣言のある資源だけを出す。
 
     「このマシンにある資源」を本ツールは知らない。列挙しようとすれば資源種別を
     実装に持つことになる。掲示板に載っているものだけが本ツールの知り得る全てである。
@@ -215,7 +228,7 @@ def test_status_without_arguments_lists_only_declared_resources(
     assert run(tmp_path, "status", "--json") == 0
     resources = json.loads(capsys.readouterr().out)["resources"]
 
-    assert [row["display"] for row in resources] == ["COM3"]
+    assert [row["label"] for row in resources] == ["COM3"]
 
 
 def test_wait_returns_when_nothing_holds_the_resource(
@@ -244,49 +257,56 @@ def test_an_interrupted_command_is_not_reported_as_busy(
     assert "中断しました" in capsys.readouterr().err
 
 
-# --- 表示名は資源 ID を隠さない ---------------------------------------------------
+# --- 見出しは資源 ID だけである（表示名を併記する仕組みは廃止した。issue #9） -------
 
 
-def test_status_shows_the_resource_id_even_with_a_display_name(
+def test_status_json_exposes_a_label_that_is_exactly_the_resource_id(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``--display`` にジョブ名を入れられても、一覧から資源 ID が消えない。
-
-    実運用で display が ``malm E017 学習`` になり、GPU0 が押さえられていることが
-    一覧から見えなくなった。取得の排他は資源 ID で効くので衝突そのものは
-    起きないが、**掲示板は読まれて初めて意味を持つ**。GPU を使おうとする側は
-    見覚えのないジョブ名しか見えず、空きだと誤読しうる状態だった。
-    """
-    claim(tmp_path, "GPU0", "E017 A/B 学習", "--display", "malm E017 学習")
-    capsys.readouterr()
-
-    assert run(tmp_path, "status") == 0
-    out = capsys.readouterr().out
-
-    assert "GPU0" in out
-    assert "malm E017 学習" in out
-
-
-def test_status_json_exposes_a_label_that_keeps_the_resource_id(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """JSON でも見出し（label）に資源 ID が含まれる。"""
-    claim(tmp_path, "GPU0", "E017 A/B 学習", "--display", "malm E017 学習")
+    """JSON の見出し（``label``）は資源 ID そのものである。別名は併記されない。"""
+    claim(tmp_path, "GPU0", "E017 A/B 学習")
     capsys.readouterr()
 
     assert run(tmp_path, "status", "--json") == 0
     (row,) = json.loads(capsys.readouterr().out)["resources"]
 
-    assert row["label"] == "GPU0（malm E017 学習）"
-    # display そのものは申告された値のまま残す（意味を変えない）。
-    assert row["display"] == "malm E017 学習"
+    assert row["label"] == "GPU0"
+    assert "display" not in row
+
+
+def test_claim_and_run_no_longer_accept_display(tmp_path: Path) -> None:
+    """``--display`` は ``claim`` にも ``run`` にも存在しない（argparse が拒否する）。"""
+    assert claim(tmp_path, "GPU0", "E017 A/B 学習", "--display", "malm E017 学習") == 2
+
+    code = main(
+        [
+            "--home",
+            str(tmp_path),
+            "run",
+            "--res",
+            "GPU0",
+            "--job",
+            "E017",
+            "--observed",
+            "見た",
+            "--eta",
+            "10m",
+            "--display",
+            "malm E017 学習",
+            "--",
+            sys.executable,
+            "-c",
+            "print('ok')",
+        ]
+    )
+    assert code == 2
 
 
 def test_wait_names_the_resource_it_is_waiting_for(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """待機の表示にも資源 ID を出す。何を待っているか分からなくなる。"""
-    claim(tmp_path, "GPU0", "E017 A/B 学習", "--display", "malm E017 学習")
+    claim(tmp_path, "GPU0", "E017 A/B 学習")
     capsys.readouterr()
 
     assert run(tmp_path, "wait", "GPU0", "--timeout", "0") != 0

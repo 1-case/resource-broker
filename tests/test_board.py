@@ -252,7 +252,7 @@ def test_a_known_key_with_an_unexpected_type_is_not_silently_dropped() -> None:
         {
             "resource": "pc-a::GPU0",
             "sharing": {"allowed": True, "limit": "5GB"},  # 将来 dict 化した想定
-            "display": ["GPU0", "RTX"],
+            "boot": 12345,  # 将来 数値化した想定
             "未知のキー": 1,
         }
     )
@@ -260,7 +260,7 @@ def test_a_known_key_with_an_unexpected_type_is_not_silently_dropped() -> None:
     assert entry is not None
     assert entry.sharing == ""  # 型が合わないので既定値へ倒れる
     assert entry.extra["x-sharing"] == {"allowed": True, "limit": "5GB"}, "退避されていない"
-    assert entry.extra["x-display"] == ["GPU0", "RTX"]
+    assert entry.extra["x-boot"] == 12345
     assert entry.extra["未知のキー"] == 1  # 従来の前方互換も効いている
 
     # 書き戻しても失われない
@@ -400,99 +400,96 @@ def test_without_the_lock_two_claims_both_get_through(
     assert len(board.list_for(normalize("GPU0"))) == 2
 
 
-def test_a_declaration_in_the_legacy_layout_is_read(tmp_path: Path) -> None:
-    """旧い置き場（``board/<資源>.json`` と ``board/joins/*.json``）を宣言として読む。
+def test_a_declaration_in_the_legacy_fixed_path_is_still_read(tmp_path: Path) -> None:
+    """旧い固定パス形式（``board/<資源>.json``）の宣言は、``board/`` 直下にあれば読める。
 
-    形式を変えた瞬間に、稼働中のセッションの宣言を見失わないための経路である。
-    **ここが消えても本番の掲示板からしか気づけない**ので、テストで固定する。
+    平坦化後もこの走査（``board/`` 直下の ``*.json``）自体は変わっていないので、
+    ファイル名が資源由来の固定名であっても、単に 1 件の宣言として読める。
+    """
+    board = Board(tmp_path)
+    board.entries_dir.mkdir(parents=True)
+    old_primary = build_entry("pc-a::GPU0", job="旧い宣言", session="old")
+    (board.entries_dir / "pc-a__GPU0.json").write_text(
+        json.dumps(old_primary.to_dict(), ensure_ascii=False), encoding="utf-8"
+    )
+
+    assert [e.job for e in board.list_for("pc-a::GPU0")] == ["旧い宣言"]
+
+
+def test_the_legacy_joins_directory_is_no_longer_scanned(tmp_path: Path) -> None:
+    """``board/joins/`` はもう走査しない。
+
+    宣言の寿命を監査ログで実測すると中央値 5.4 分・最長 2.1 時間・24 時間超はゼロ
+    だった（issue #9）。その短い窓のためだけに別ディレクトリの走査を残す理由が
+    無く、実際にそこから複数の欠陥が出ていた（issue #19 指摘 8・10、issue #18
+    指摘 3）。**ここが変わっても本番の掲示板からしか気づけない**ので、テストで
+    固定する。
     """
     board = Board(tmp_path)
     (tmp_path / "board" / "joins").mkdir(parents=True)
-    old_primary = build_entry("pc-a::GPU0", job="旧い主宣言", session="old")
     old_join = build_entry("pc-a::GPU0", job="旧い相乗り", session="old2")
-    (tmp_path / "board" / "pc-a__GPU0.json").write_text(
-        json.dumps(old_primary.to_dict(), ensure_ascii=False), encoding="utf-8"
-    )
     (tmp_path / "board" / "joins" / "何か.json").write_text(
         json.dumps(old_join.to_dict(), ensure_ascii=False), encoding="utf-8"
     )
 
-    assert sorted(e.job for e in board.list_for("pc-a::GPU0")) == ["旧い主宣言", "旧い相乗り"]
-
-
-def test_a_declaration_in_the_legacy_layout_can_be_removed(tmp_path: Path) -> None:
-    """旧い置き場の宣言を**消せる**（nonce があれば CAS、無ければ中身の照合）。"""
-    board = Board(tmp_path)
-    (tmp_path / "board" / "joins").mkdir(parents=True)
-    with_nonce = build_entry("pc-a::GPU0", job="nonce あり", session="old")
-    without = build_entry("pc-a::GPU0", job="nonce なし", session="old2")
-    without.holder.pop("nonce", None)
-    (tmp_path / "board" / "pc-a__GPU0.json").write_text(
-        json.dumps(with_nonce.to_dict(), ensure_ascii=False), encoding="utf-8"
-    )
-    (tmp_path / "board" / "joins" / "何か.json").write_text(
-        json.dumps(without.to_dict(), ensure_ascii=False), encoding="utf-8"
-    )
-
-    assert (
-        board._remove_if_nonce("pc-a::GPU0", expect_nonce=with_nonce.nonce, reason="テスト")
-        is RemovalResult.REMOVED
-    )
-
-    path, entry = board.pairs_for("pc-a::GPU0")[0]
-    assert board._remove_matching(path, entry, reason="テスト") is RemovalResult.REMOVED
     assert board.list_for("pc-a::GPU0") == []
 
 
-def test_remove_matching_returns_absent_when_truly_nothing_remains(tmp_path: Path) -> None:
-    """旧形式（nonce 無し）でも、本当に無ければ ``ABSENT``。"""
-    board = Board(tmp_path)
-    entry = build_entry("pc-a::GPU0", job="唯一の宣言", session="old")
-    entry.holder.pop("nonce", None)
-    path = board.entries_dir
-    path.mkdir(parents=True)
-    target = path / "old.json"
-    target.write_text(json.dumps(entry.to_dict(), ensure_ascii=False), encoding="utf-8")
+def test_a_declaration_without_a_nonce_is_still_listed(tmp_path: Path) -> None:
+    """nonce を持たない宣言（旧形式）も ``board/`` 直下にあれば見える。
 
-    assert board._remove_matching(target, entry, reason="テスト") is RemovalResult.REMOVED
-    # 既に消えている。掲示板全体も他に何も無いので、確認できて「無い」と言える。
-    assert board._remove_matching(target, entry, reason="テスト") is RemovalResult.ABSENT
-
-
-def test_remove_matching_does_not_report_absent_when_it_cannot_confirm(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """**旧形式でも**、「無い」と「確認できない」を分ける（issue #18 指摘 3）。
-
-    以前は ``remove_if_nonce``（新形式）の ``known`` 経路だけがこの区別を持ち、
-    ``remove_matching``（旧形式）は捕獲が ``ABSENT`` に終わった瞬間、掲示板の
-    他の部分が読めるかを一切確かめずに「無い」と断定していた。旧形式の宣言が
-    残っているセッション（ローリング更新の途中）では、この非対称そのものが
-    欠陥である。
+    「見えないまま残る」を作らないための最低条件——消す手段が ``--force`` /
+    ``--clean`` に絞られても、``rb status`` の元になる列挙には出続ける（issue #9）。
     """
     board = Board(tmp_path)
-    entry = build_entry("pc-a::GPU0", job="唯一の宣言", session="old")
+    entry = build_entry("pc-a::GPU0", job="nonce なし", session="old")
     entry.holder.pop("nonce", None)
     board.entries_dir.mkdir(parents=True)
-    target = board.entries_dir / "old.json"
-    target.write_text(json.dumps(entry.to_dict(), ensure_ascii=False), encoding="utf-8")
-    assert board._remove_matching(target, entry, reason="事前に消す") is RemovalResult.REMOVED
+    (board.entries_dir / "pc-a__GPU0.json").write_text(
+        json.dumps(entry.to_dict(), ensure_ascii=False), encoding="utf-8"
+    )
 
-    # 別の宣言をもう 1 件置く。これが読めなくなる。
-    board.declare(build_entry("pc-a::GPU0", job="読めなくなる宣言"))
+    found = board.list_for("pc-a::GPU0")
 
-    real_read_text = Path.read_text
+    assert [e.job for e in found] == ["nonce なし"]
+    assert found[0].nonce == ""
 
-    def boom(self: Path, *args: object, **kwargs: object) -> str:
-        raise PermissionError("共有違反")
 
-    monkeypatch.setattr(Path, "read_text", boom)
-    try:
-        result = board._remove_matching(target, entry, reason="テスト")
-    finally:
-        monkeypatch.setattr(Path, "read_text", real_read_text)
+def test_a_declaration_without_a_nonce_is_not_removed_without_force(tmp_path: Path) -> None:
+    """nonce を持たない宣言は、個体として指せないので通常の削除経路では消えない。
 
-    assert result is RemovalResult.UNCONFIRMED, f"確認できないのに {result} と断定した"
+    ``_remove_matching``（中身の照合で消す経路）を削除した代わりに、
+    :meth:`Board.remove_confirmed` は ``force=True`` を渡さない限りこの形の宣言を
+    拒否する（issue #9）。
+    """
+    board = Board(tmp_path)
+    entry = build_entry("pc-a::GPU0", job="nonce なし", session="old")
+    entry.holder.pop("nonce", None)
+    board.entries_dir.mkdir(parents=True)
+    (board.entries_dir / "pc-a__GPU0.json").write_text(
+        json.dumps(entry.to_dict(), ensure_ascii=False), encoding="utf-8"
+    )
+    (selection,) = board.pairs_for_detailed("pc-a::GPU0").confirmed()
+
+    assert board.remove_confirmed(selection, reason="テスト") is RemovalResult.NOT_OWNED
+    assert len(board.list_for("pc-a::GPU0")) == 1  # 消えていない
+
+
+def test_a_declaration_without_a_nonce_can_be_removed_with_force(tmp_path: Path) -> None:
+    """``--force``（``remove_confirmed(force=True)``）だけがこの形の宣言を消せる。"""
+    board = Board(tmp_path)
+    entry = build_entry("pc-a::GPU0", job="nonce なし", session="old")
+    entry.holder.pop("nonce", None)
+    board.entries_dir.mkdir(parents=True)
+    (board.entries_dir / "pc-a__GPU0.json").write_text(
+        json.dumps(entry.to_dict(), ensure_ascii=False), encoding="utf-8"
+    )
+    (selection,) = board.pairs_for_detailed("pc-a::GPU0").confirmed()
+
+    result = board.remove_confirmed(selection, reason="テスト", force=True)
+
+    assert result is RemovalResult.REMOVED
+    assert board.list_for("pc-a::GPU0") == []
 
 
 def test_an_empty_nonce_is_never_a_cas_key(tmp_path: Path) -> None:
@@ -654,7 +651,7 @@ def test_pairs_for_detailed_is_complete_when_nothing_is_broken(board: Board) -> 
 
 # --- 型による強制: 完全性を確認していない状態から削除できない（issue #18） --------
 #
-# ここが今回の設計の核心である。低水準の CAS（`_remove_if_nonce` / `_remove_matching`）
+# ここが今回の設計の核心である。低水準の CAS（`_remove_if_nonce`）
 # は private にし、個別の宣言を消す唯一の公開入口 `remove_confirmed` は
 # `ConfirmedEntry` を要求する。`ConfirmedEntry` を作れるのは
 # `BoardListing.confirmed()`（完全性を確認した列挙からのみ、`complete=False` なら

@@ -51,7 +51,17 @@ DESIGN = ROOT / "docs" / "DESIGN.md"
 #: `wait` の「その時点のポーリング」判定を Waiting へ、監査対応付けの
 #: nonce 不一致除外を History へ、それぞれ 1 段落ずつ足したためである。
 #: いずれも「今後も真であり続ける仕様」であって経緯ではない。
-MAX_LINES = 680
+#:
+#: 678 へ下げたのは、issue #9 の指摘を受けて 3 つの機能を削除したためである
+#: （`rb status` の資源 ID 引数、`--display` と表示名の併記、`_remove_matching`
+#: と旧い置き場 ``board/joins/`` の走査）。Resource Naming の表から表示名の列を、
+#: Board Schema の例から ``display`` フィールドを、Declaration Fields から
+#: `--display` を、それぞれ落とした。代わりに、nonce を持たない宣言をどう
+#: 扱うか（``rb status`` には出すが、消せるのは ``--force`` と ``--clean``
+#: だけ）を Conditional Writes に 1 段落足した——これも「今後も真であり
+#: 続ける仕様」であって経緯ではない。**上げっぱなしにしない**：機能を消せば
+#: 文書も軽くなるはずなので、実測に合わせて下げる。
+MAX_LINES = 678
 
 #: 公開しない文書。**公開物からここへリンクすると参照切れになる。**
 PRIVATE_DOCS = ("EXPERIMENTS.md", "STATUS.md", "tools/speak.py", "tools/speak_dict.json")
@@ -311,7 +321,19 @@ def test_public_documents_do_not_mention_removed_machinery() -> None:
     のは看板の問題である。実装の関数名と突き合わせるより、消した名前の禁止のほうが
     保守が楽で、実際に起きた取り残しは全部これで拾える。
     """
-    gone = ("try_claim", "rb join", "--primary", "add_join", "find_own_join", "JoinResult")
+    gone = (
+        "try_claim",
+        "rb join",
+        "--primary",
+        "add_join",
+        "find_own_join",
+        "JoinResult",
+        # issue #9: 資源引数を受け取る `rb status`、表示名を併記する仕組み、
+        # 中身の照合で消す旧形式の削除経路（消した理由は本文が別に説明する）。
+        "--display",
+        "naming.label",
+        "_remove_matching",
+    )
     for name in ("docs/DESIGN.md", "README.md", "README.en.md"):
         text = (ROOT / name).read_text(encoding="utf-8")
         for word in gone:

@@ -273,12 +273,14 @@ def test_release_own_returns_exit_broken_when_the_deletion_cannot_be_confirmed(
     original_remove_confirmed = Board.remove_confirmed
     state = {"done": False}
 
-    def interleaved_remove_confirmed(self: Board, selection: object, *, reason: str):  # type: ignore[no-untyped-def]
+    def interleaved_remove_confirmed(  # type: ignore[no-untyped-def]
+        self: Board, selection: object, *, reason: str, force: bool = False
+    ):
         if not state["done"]:
             state["done"] = True
             monkeypatch.setattr(os_module, "rename", rename_always_absent)
             monkeypatch.setattr(Path, "read_text", read_text_always_broken)
-        return original_remove_confirmed(self, selection, reason=reason)
+        return original_remove_confirmed(self, selection, reason=reason, force=force)
 
     monkeypatch.setattr(Board, "remove_confirmed", interleaved_remove_confirmed)
     capsys.readouterr()
@@ -317,10 +319,12 @@ def test_release_by_nonce_force_returns_exit_broken_when_the_deletion_cannot_be_
     # 検査したい「削除直前の窓」ではなく別の（既存の）分岐を通ってしまう。
     original_remove_confirmed = Board.remove_confirmed
 
-    def interleaved_remove_confirmed(self: Board, selection: object, *, reason: str):  # type: ignore[no-untyped-def]
+    def interleaved_remove_confirmed(  # type: ignore[no-untyped-def]
+        self: Board, selection: object, *, reason: str, force: bool = False
+    ):
         monkeypatch.setattr(os_module, "rename", rename_always_absent)
         monkeypatch.setattr(Path, "read_text", read_text_always_broken)
-        return original_remove_confirmed(self, selection, reason=reason)
+        return original_remove_confirmed(self, selection, reason=reason, force=force)
 
     monkeypatch.setattr(Board, "remove_confirmed", interleaved_remove_confirmed)
     capsys.readouterr()
@@ -779,13 +783,15 @@ def test_release_by_nonce_does_not_remove_a_declaration_reclaimed_mid_flight(
     original = Board.remove_confirmed
     state = {"nested": False}
 
-    def interleave(self: Board, selection: object, *, reason: str) -> RemovalResult:
+    def interleave(
+        self: Board, selection: object, *, reason: str, force: bool = False
+    ) -> RemovalResult:
         if not state["nested"]:
             state["nested"] = True
             # 選択が終わった直後、削除の直前に T が force で取り直す。
             assert run(tmp_path, "release", "GPU0", "--force") == EXIT_OK
             assert claim(tmp_path, "GPU0", "後から入れ替わった方") == EXIT_OK
-        return original(self, selection, reason=reason)
+        return original(self, selection, reason=reason, force=force)
 
     monkeypatch.setattr(Board, "remove_confirmed", interleave)
     capsys.readouterr()

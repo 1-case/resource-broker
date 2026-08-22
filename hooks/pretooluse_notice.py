@@ -299,22 +299,25 @@ def declarations_for(root: Path, resource: str | None) -> list[dict[str, object]
     if resource is None:
         return []
 
+    # **``board/joins/`` はもう走査しない。** 旧形式の相乗りを見失わないための
+    # 経路だったが、監査ログで宣言の寿命を実測すると中央値 5.4 分・最長 2.1 時間
+    # だった（issue #9）。とうにその窓を過ぎている旧ディレクトリを読み続ける理由が
+    # 無い。
     board = root / "board"
     found: list[dict[str, object]] = []
-    for directory in (board, board / "joins"):
+    try:
+        paths, _ = json_files(board)
+    except OSError:
+        return found
+    for path in paths:
         try:
-            paths, _ = json_files(directory)
-        except OSError:
+            entry = json.loads(path.read_text(encoding=ENCODING))
+        except (OSError, json.JSONDecodeError, ValueError):
             continue
-        for path in paths:
-            try:
-                entry = json.loads(path.read_text(encoding=ENCODING))
-            except (OSError, json.JSONDecodeError, ValueError):
-                continue
-            if not isinstance(entry, dict) or not entry.get("resource"):
-                continue
-            if bare_resource(str(entry["resource"])) == bare_resource(resource):
-                found.append(entry)
+        if not isinstance(entry, dict) or not entry.get("resource"):
+            continue
+        if bare_resource(str(entry["resource"])) == bare_resource(resource):
+            found.append(entry)
     return found
 
 

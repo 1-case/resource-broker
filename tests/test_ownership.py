@@ -221,7 +221,7 @@ def test_update_rewrites_my_own_declaration(
     assert run(tmp_path, "update", "GPU0", "--peak", "VRAM 2GB", "--sharing", "可") == 0
     capsys.readouterr()
 
-    run(tmp_path, "status", "GPU0", "--json")
+    run(tmp_path, "status", "--json")
     row = json.loads(capsys.readouterr().out)["resources"][0]
     declaration = row["declarations"][0]
     assert declaration["usage"]["peak"] == "VRAM 2GB"
@@ -683,7 +683,9 @@ def test_two_sessions_seeing_one_ghost_do_not_both_acquire(
     original = Board.remove_confirmed
     state = {"nested": False}
 
-    def interleave(self: Board, selection: ConfirmedEntry, *, reason: str) -> RemovalResult:
+    def interleave(
+        self: Board, selection: ConfirmedEntry, *, reason: str, force: bool = False
+    ) -> RemovalResult:
         if not state["nested"]:
             state["nested"] = True
             # B が最初から最後まで走り切る（幽霊を退けて宣言する）
@@ -701,7 +703,7 @@ def test_two_sessions_seeing_one_ghost_do_not_both_acquire(
                 )
                 == 0
             )
-        return original(self, selection, reason=reason)
+        return original(self, selection, reason=reason, force=force)
 
     monkeypatch.setattr(Board, "remove_confirmed", interleave)
 
@@ -791,7 +793,9 @@ def test_release_does_not_remove_a_declaration_reclaimed_mid_flight(
     original = Board.remove_confirmed
     state = {"nested": False}
 
-    def interleave(self: Board, selection: ConfirmedEntry, *, reason: str) -> RemovalResult:
+    def interleave(
+        self: Board, selection: ConfirmedEntry, *, reason: str, force: bool = False
+    ) -> RemovalResult:
         if not state["nested"]:
             state["nested"] = True
             # S が読んだ後・消す前に、T が割り込んで取り直す
@@ -810,7 +814,7 @@ def test_release_does_not_remove_a_declaration_reclaimed_mid_flight(
                 )
                 == 0
             )
-        return original(self, selection, reason=reason)
+        return original(self, selection, reason=reason, force=force)
 
     monkeypatch.setattr(Board, "remove_confirmed", interleave)
     capsys.readouterr()
@@ -1081,7 +1085,7 @@ def test_joins_only_resource_is_listed_without_arguments(
     run(tmp_path, "status", "--json")
     resources = json.loads(capsys.readouterr().out)["resources"]
 
-    assert [r["display"] for r in resources] == ["GPU0"]
+    assert [r["label"] for r in resources] == ["GPU0"]
 
 
 # --- join の CLI 経路 -----------------------------------------------------------

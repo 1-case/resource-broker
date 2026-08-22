@@ -61,13 +61,6 @@ LOCK_STALE_S = 30.0
 UNLINK_ATTEMPTS = 4
 UNLINK_DELAY_S = 0.05
 
-#:
-#: 判定は ``since < boot - この余裕`` で行う。``boot`` は起動からの経過時間から
-#: 逆算した値なので、NTP が時計を**前方**へ飛ばすと、直前に出したばかりの相乗りが
-#: 起動時刻より前に見えることがある。余裕を取っておけばその窓がゼロになる。
-#: コストは「再起動直後の 1 分間だけ掃除が遅れる」ことだけである。
-JOIN_BOOT_MARGIN_S = 60.0
-
 
 class LockState(StrEnum):
     """ロックの取得結果。
@@ -254,11 +247,15 @@ def _read_entry_at(path: Path) -> Entry | None:
 #: 既定値へ倒すが、そのとき元の値を ``extra`` へ退避する。退避しないと、スキーマを
 #: 拡張した新しい版が書いた値を、古い版が読んで書き戻した瞬間に**黙って消す**。
 #: 前方互換は「未知のキー」だけでなく「既知のキーの未知の形」も守る必要がある。
+#:
+#: **``display`` はここに含めない（意図的）。** 表示名を添える仕組みそのものを廃止した
+#: （issue #9）ので、既に掲示板にある ``display`` を読む・消す・特別に扱う必要は無い
+#: ——``_KNOWN_KEYS`` から外れているだけで、上の前方互換の仕組みがそのまま ``extra`` へ
+#: 退避して保存する。書き戻しても既存の宣言を壊さない。
 _KNOWN_KEYS = frozenset(
     {
         "schema",
         "resource",
-        "display",
         "holder",
         "log",
         "since",
@@ -369,7 +366,6 @@ class Entry:
     """
 
     resource: str
-    display: str = ""
     holder: dict[str, object] = field(default_factory=dict)
     log: str | None = None
     since: str = ""
@@ -427,7 +423,6 @@ class Entry:
             {
                 "schema": self.schema,
                 "resource": self.resource,
-                "display": self.display,
                 "holder": self.holder,
                 "log": self.log,
                 "since": self.since,
@@ -458,7 +453,6 @@ class Entry:
         usage = data.get("usage")
         return cls(
             resource=resource,
-            display=data["display"] if isinstance(data.get("display"), str) else "",
             holder=holder if isinstance(holder, dict) else {},
             log=data["log"] if isinstance(data.get("log"), str) else None,
             since=data["since"] if isinstance(data.get("since"), str) else "",
@@ -500,7 +494,6 @@ class Entry:
             # ——つまり「schema 1 なのに未来の鍵がある」という、この仕組みが防ごうと
             # している状態そのものになる。
             "schema": int,
-            "display": str,
             "holder": dict,
             "log": str,
             "since": str,
@@ -547,8 +540,8 @@ class PartialListingError(RuntimeError):
 class ConfirmedEntry:
     """**削除の公開入口へ渡せる、確認済みの選択 1 件。**
 
-    低水準の CAS（``Board._remove_if_nonce`` / ``Board._remove_matching``）は
-    private にしてある。外から直接呼べる限り、呼び出し側が「掲示板を完全に
+    低水準の CAS（``Board._remove_if_nonce``）は private にしてある。
+    外から直接呼べる限り、呼び出し側が「掲示板を完全に
     読めたか」の確認を**忘れられる**——3 回のレビューで毎回別の経路がこれを
     やっていた（issue #18）。この型を経由しなければ :meth:`Board.remove_confirmed`
     は呼べないので、確認を忘れるという事態がそもそも起こらない。
@@ -877,8 +870,13 @@ class Board:
         走っている相乗りがいても「空き」になり、二重取得が成立した——という非対称が
         あった。対等にすれば、**どれがいつ消えても他の宣言の意味は変わらない。**
 
-        旧い置き場（``board/<資源>.json`` と ``board/joins/*.json``）も**同じ宣言として
-        読む**。稼働中のセッションの宣言を、形式を変えた瞬間に見失わないためである。
+        旧い固定パス形式（``board/<資源>.json``）の宣言も、このディレクトリを走査する
+        だけで**同じ宣言として読める**（nonce を鍵にした平坦なファイル名と、ファイルの
+        置き場所そのものは変わっていない）。ただし ``board/joins/`` という**別の
+        ディレクトリ**の走査はしない——旧形式の相乗りを見失わないための経路だったが、
+        監査ログで宣言の寿命を実測すると中央値 5.4 分・最長 2.1 時間だった（issue #9）。
+        その短い窓のためだけに、もう 1 本の削除経路と走査が掲示板の複雑さとして
+        残り続ける理由が無い。
         """
         return self.declarations_detailed().pairs
 
@@ -903,11 +901,8 @@ class Board:
             self.audit("entry_unreadable", path=str(path), kind=kind)
 
         paths, unreadable = _json_files(self.entries_dir, on_anomaly=report_anomaly)
-        legacy, legacy_unreadable = _json_files(
-            self.entries_dir / "joins", on_anomaly=report_anomaly
-        )
-        complete = not (unreadable or legacy_unreadable)
-        for path in sorted(paths) + sorted(legacy):
+        complete = not unreadable
+        for path in sorted(paths):
             try:
                 text = path.read_text(encoding="utf-8")
             except OSError as exc:
@@ -974,34 +969,33 @@ class Board:
         def report_anomaly(path: Path, kind: str) -> None:
             self.audit("entry_unreadable", path=str(path), kind=kind)
 
-        for directory in (self.entries_dir, self.entries_dir / "joins"):
-            paths, unreadable = _json_files(directory, on_anomaly=report_anomaly)
-            if unreadable:
-                # **走査そのものが崩れた。** 個別ファイルの壊れ方とは別の事象で、
-                # 「見つけたものが全部」とは言えなくなる。
-                complete = False
-            for path in paths:
-                try:
-                    text = path.read_text(encoding="utf-8")
-                except OSError:
-                    # **「読めない」を「壊れている」と混ぜない。** 他セッションが捕獲の
-                    # 途中で名前を外した瞬間（`FileNotFoundError`）や、一時的な共有違反
-                    # （`PermissionError`）は、**生きた宣言**でも起こる。ここへ入れると
-                    # `--clean` がそれを消し、掲示板は空・資源は掴まれたままになる。
-                    continue
-                except (UnicodeDecodeError, ValueError):
-                    # **不正な UTF-8 は「壊れている」側。** バイト列は取れているので
-                    # 生きた宣言が一時的に読めないケースとは違う。JSON デコード失敗と
-                    # 同じ扱いにする（``declarations_detailed`` と揃える）。
-                    found.append(path)
-                    continue
-                try:
-                    data = json.loads(text)
-                except (json.JSONDecodeError, ValueError):
-                    found.append(path)
-                    continue
-                if Entry.from_dict(data) is None:
-                    found.append(path)
+        paths, unreadable = _json_files(self.entries_dir, on_anomaly=report_anomaly)
+        if unreadable:
+            # **走査そのものが崩れた。** 個別ファイルの壊れ方とは別の事象で、
+            # 「見つけたものが全部」とは言えなくなる。
+            complete = False
+        for path in paths:
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                # **「読めない」を「壊れている」と混ぜない。** 他セッションが捕獲の
+                # 途中で名前を外した瞬間（`FileNotFoundError`）や、一時的な共有違反
+                # （`PermissionError`）は、**生きた宣言**でも起こる。ここへ入れると
+                # `--clean` がそれを消し、掲示板は空・資源は掴まれたままになる。
+                continue
+            except (UnicodeDecodeError, ValueError):
+                # **不正な UTF-8 は「壊れている」側。** バイト列は取れているので
+                # 生きた宣言が一時的に読めないケースとは違う。JSON デコード失敗と
+                # 同じ扱いにする（``declarations_detailed`` と揃える）。
+                found.append(path)
+                continue
+            try:
+                data = json.loads(text)
+            except (json.JSONDecodeError, ValueError):
+                found.append(path)
+                continue
+            if Entry.from_dict(data) is None:
+                found.append(path)
         return sorted(found), complete
 
     def remove_unreadable(self, *, reason: str) -> CleanResult:
@@ -1181,7 +1175,9 @@ class Board:
         if not expect_nonce:
             # **空文字を鍵にしてはならない。** nonce を持たない古い宣言は複数ありうるので、
             # 「nonce が空のもの」に一致させると**別の生きた宣言**を捕まえて消す。
-            # 古い宣言の削除は :meth:`_remove_matching` が中身の照合で行う。
+            # 呼び出し元は :meth:`remove_confirmed` であり、nonce を持たない宣言を
+            # ここへ渡してくるのは ``--force``（:meth:`remove_selected`）だけである
+            # ——そちらは個体の照合をそもそも要求しない（``_remove_unkeyed`` 参照）。
             self.audit("remove_refused", resource=resource_id, reason="nonce が空である")
             return RemovalResult.NOT_OWNED
 
@@ -1237,63 +1233,28 @@ class Board:
             reason=reason,
         )
 
-    def _remove_matching(self, path: Path, expected: Entry, *, reason: str) -> RemovalResult:
-        """**中身が一致するときだけ**消す。nonce を持たない古い宣言のための経路。**private。**
+    def _remove_unkeyed(self, path: Path, *, resource_id: str, reason: str) -> RemovalResult:
+        """nonce を持たない宣言を消す。``--force`` だけが通る経路。**private。**
 
-        捕まえてから、読み直した中身が期待どおりかを確かめる。nonce が無いので
-        照合は「資源・宣言時刻・宣言者」の三つ組で行う。一致しなければ元へ戻す。
+        nonce が無いと個体を指す鍵が無いので、:meth:`_remove_if_nonce` のように
+        「捕まえてから中身を確かめて、違えば戻す」という CAS は組めない——確かめる
+        相手（期待する nonce）がそもそも無い。``--force`` は元から「見ずに全部消す」
+        という意味であり、この形の宣言もその対象に含めてよい。確認の手段が無い
+        ことを、確認しないことで受け入れる。
 
-        **無条件の unlink にしてはならない。** 古い置き場は資源ごとの固定パスなので、
-        読んでから消すまでに別セッションが同じ名前を作り直しうる。
-
-        低水準の CAS なので :meth:`_remove_if_nonce` と同じく private である。
-        公開の削除入口は :meth:`remove_confirmed` を経由すること。
+        以前はここに、捕まえた中身を「資源・宣言時刻・宣言者」の三つ組で照合してから
+        消す :func:`_remove_matching`（削除済み）があった。監査ログで宣言の寿命を
+        実測すると中央値 5.4 分・最長 2.1 時間・24 時間超はゼロ（issue #9）で、
+        この形の宣言が生き残る窓はごく短い。その短い窓のためだけに、もう 1 本の
+        削除経路と、それが呼ぶ ``joins/`` の走査が掲示板の複雑さとして残り、
+        そこから欠陥が複数出た。単純な unlink に戻す。
         """
-        tombstone = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.taken")
-        moved, error = _rename_with_retry(path, tombstone)
-        if moved is MoveResult.ABSENT:
-            # **ABSENT を早合点しない。** nonce 版（`_remove_if_nonce` の `known`
-            # 経路）と同じ理由で、「本当に無い」と「確認できない」を分ける
-            # （issue #18 指摘 3。以前はここが唯一この区別を持たなかった）。
-            listing = self.pairs_for_detailed(expected.resource)
-            if not listing.complete:
-                self.audit(
-                    "remove_unconfirmed",
-                    resource=expected.resource,
-                    reason="削除直後の再確認で掲示板の一部が読めない",
-                )
-                return RemovalResult.UNCONFIRMED
-            return RemovalResult.ABSENT
-        if moved is not MoveResult.MOVED:
-            self.audit("remove_failed", resource=expected.resource, error=error)
-            return RemovalResult.FAILED
-
-        captured = _read_entry_at(tombstone)
-        if captured is None or (
-            captured.resource,
-            captured.since,
-            captured.session,
-        ) != (expected.resource, expected.since, expected.session):
-            self._restore(tombstone, path, expected.resource)
-            self.audit(
-                "remove_refused", resource=expected.resource, reason="捕まえた宣言が別物だった"
-            )
-            return RemovalResult.NOT_OWNED
-
-        result, error = _unlink_with_retry(tombstone)
+        result, error = _unlink_with_retry(path)
         if result is RemovalResult.FAILED:
-            self.audit("tombstone_left", resource=expected.resource, error=error)
-        # **nonce を持たない旧形式の宣言である。** `captured.nonce` は空文字列のまま
-        # 残す（無いことを隠さない）。`rb history` の対応付けは nonce が空なら
-        # 資源 + job へフォールバックするので、ここで書かなくても壊れない。
-        self.audit(
-            "removed",
-            resource=expected.resource,
-            job=captured.job,
-            nonce=captured.nonce,
-            reason=reason,
-        )
-        return RemovalResult.REMOVED
+            self.audit("remove_failed", resource=resource_id, error=error)
+        elif result is RemovalResult.REMOVED:
+            self.audit("removed", resource=resource_id, job="", nonce="", reason=reason)
+        return result
 
     def _capture_and_remove(
         self,
@@ -1306,11 +1267,10 @@ class Board:
     ) -> RemovalResult:
         """**捕まえてから確かめて消す**（CAS の 2〜3 段目）。先読みは呼び出し側の仕事。
 
-        パスを引数に取るのは、主宣言（``board/<safe>.json``）と相乗り
-        （``board/joins/<safe>.json``）で**同じ形を使う**ためである。無条件の ``unlink``
-        は、読んだ内容と消す対象が同じである保証を持たない。読んでから消すまでの間に
-        別プロセスが同じ名前を消して作り直すと、**新しい生きた申告を消す**。
-        主宣言で塞いだ read-delete race と同じものなので、相乗りにも同じ形を適用する。
+        無条件の ``unlink`` は、読んだ内容と消す対象が同じである保証を持たない。
+        読んでから消すまでの間に別プロセスが同じ名前を消して作り直すと、
+        **新しい生きた申告を消す**。パスを引数に取って捕獲（``os.rename``）を
+        経由するのは、この read-delete race を塞ぐためである。
 
         Returns
         -------
@@ -1411,17 +1371,29 @@ class Board:
         self.audit("restore_dropped", resource=resource_id, reason="新しい宣言が既にある")
         _unlink_with_retry(tombstone)
 
-    def remove_confirmed(self, selection: ConfirmedEntry, *, reason: str) -> RemovalResult:
+    def remove_confirmed(
+        self, selection: ConfirmedEntry, *, reason: str, force: bool = False
+    ) -> RemovalResult:
         """**確認済みの選択**を消す。**個別の宣言を消す唯一の公開入口。**
 
-        低水準の CAS（:meth:`_remove_if_nonce` / :meth:`_remove_matching`）は
-        private にしてある。ここは :class:`ConfirmedEntry` **でなければ呼べない**
-        ——渡すものが無ければ削除できないので、「完全性の確認を忘れる」という
-        3 回繰り返した欠陥の形が、そもそも書けなくなる（issue #18）。
+        低水準の CAS（:meth:`_remove_if_nonce`）は private にしてある。ここは
+        :class:`ConfirmedEntry` **でなければ呼べない**——渡すものが無ければ
+        削除できないので、「完全性の確認を忘れる」という 3 回繰り返した欠陥の形が、
+        そもそも書けなくなる（issue #18）。
 
         選択した実体（``selection.path`` / ``selection.entry``）に対してそのまま
         削除を試みる。**再列挙しない**——選択と削除の間で完全性の情報を
         捨て直さないことが、この設計の核心である。
+
+        Parameters
+        ----------
+        force : bool, optional
+            ``entry`` が nonce を持たない（旧形式の）宣言のとき、それでも消すか。
+            **既定では消さない**——nonce が無いと個体を指す鍵が無く、``remove_own``
+            や ``--nonce`` のような「この 1 件だけを狙う」経路がこの形の宣言に
+            辿り着いても、安全に個体として確認する手段が無い（issue #9）。
+            ``--force``（:meth:`remove_selected`）だけがこの形の宣言も対象に
+            含める——「見ずに全部消す」がその意味だからである。
         """
         if not isinstance(selection, ConfirmedEntry):
             # **型を実行時にも守る。** 静的型検査を経ない呼び出し（動的な dispatch、
@@ -1435,9 +1407,16 @@ class Board:
             return self._remove_if_nonce(
                 entry.resource, expect_nonce=entry.nonce, reason=reason, known=(path, entry)
             )
-        # nonce を持たない古い宣言。**無条件に消さない**——固定パスなので、
-        # 読んでから消すまでに別セッションが同じ名前を作り直しうる。
-        return self._remove_matching(path, entry, reason=reason)
+        if force:
+            return self._remove_unkeyed(path, resource_id=entry.resource, reason=reason)
+        # **個体として指せない（nonce が無い）。** `--force` 以外の経路（`remove_own`
+        # 経由の自分の宣言の解放、`--nonce`）はここで拒否する。`rb status` には
+        # 引き続き載るので「見えないまま残る」にはならない——消す手段が `--force` と
+        # `--clean`（`remove_unreadable`。別経路）だけになるだけである。
+        self.audit(
+            "remove_refused", resource=entry.resource, reason="nonce が無い個体は指定できない"
+        )
+        return RemovalResult.NOT_OWNED
 
     def confirm_own_declaration(self, entry: Entry) -> ConfirmedEntry:
         """**自分がいま書いた**宣言を、削除できる選択にする。
@@ -1452,13 +1431,21 @@ class Board:
         return ConfirmedEntry(path=self.declaration_path(entry.nonce), entry=entry)
 
     def _remove_each(
-        self, selections: list[ConfirmedEntry], *, reason: str
+        self, selections: list[ConfirmedEntry], *, reason: str, force: bool = False
     ) -> tuple[list[Entry], list[Entry], list[Entry], list[Entry]]:
         """選択の並びを 1 件ずつ、:meth:`remove_confirmed` で消す。
 
         ``remove_own``（所有で絞ってから呼ぶ）と ``remove_selected``（``--force``。
         絞らずに全件へ呼ぶ）が共有する実装——別々に実装すると、片方だけ直して
         もう片方を直し忘れる経路ができる（このプロジェクトが 3 回繰り返した形）。
+
+        Parameters
+        ----------
+        force : bool, optional
+            そのまま :meth:`remove_confirmed` へ渡す。``True`` は
+            ``remove_selected``（``--force``）だけが渡し、nonce を持たない
+            宣言も対象に含める。``remove_own`` は既定の ``False`` のまま
+            ——個体として指せない宣言は、自分の所有物に見えても消さない。
 
         Returns
         -------
@@ -1472,7 +1459,7 @@ class Board:
         swapped: list[Entry] = []
         failed: list[Entry] = []
         for selection in selections:
-            result = self.remove_confirmed(selection, reason=reason)
+            result = self.remove_confirmed(selection, reason=reason, force=force)
             if result is RemovalResult.REMOVED:
                 removed.append(selection.entry)
             elif result is RemovalResult.ABSENT:
@@ -1564,11 +1551,18 @@ class Board:
         - 各個体は CAS（:meth:`remove_confirmed`）を通るので、選択した実体
           以外は消えない。``--force`` でも、選択と削除の間に他セッションが
           その場所を取り直していれば ``swapped`` として区別される
+        - **nonce を持たない宣言もここでは対象に含める**（``force=True``）。
+          個体として指す鍵が無いので確かめる CAS は組めないが、``--force`` は
+          元から「見ずに全部消す」という意味であり、この形の宣言だけを
+          取り残さない（issue #9。消す手段が ``--force`` と ``--clean`` に
+          絞られる代わり）
         """
         with self.locked(resource_id) as lock:
             if lock is not LockState.ACQUIRED:
                 self.audit("remove_unlocked", resource=resource_id, lock=str(lock))
-            removed, unconfirmed, swapped, failed = self._remove_each(selections, reason=reason)
+            removed, unconfirmed, swapped, failed = self._remove_each(
+                selections, reason=reason, force=True
+            )
         return ForcedRemoval(
             removed=removed, unconfirmed=unconfirmed, swapped=swapped, failed=failed
         )
@@ -1769,7 +1763,6 @@ def build_entry(
     resource_id: str,
     *,
     job: str,
-    display: str = "",
     log: str | None = None,
     pid: int | None = None,
     cwd: str | None = None,
@@ -1796,7 +1789,6 @@ def build_entry(
     boot = platform_info.boot_time()
     return Entry(
         resource=resource_id,
-        display=display or naming.display_default(resource_id),
         holder={
             "session": session or Path(cwd or os.getcwd()).name,
             "cwd": cwd or os.getcwd(),

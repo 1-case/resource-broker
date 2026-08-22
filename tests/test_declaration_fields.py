@@ -46,7 +46,7 @@ def row(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> dict[str, object]
     平坦化で資源ごとの行は ``declarations`` の配列を持つようになった。1 件だけを
     見たいテストのための入り口である。
     """
-    run(tmp_path, "status", "GPU0", "--json")
+    run(tmp_path, "status", "--json")
     resource = json.loads(capsys.readouterr().out)["resources"][0]
     declarations = resource["declarations"]
     return {**resource, **(declarations[0] if declarations else {})}

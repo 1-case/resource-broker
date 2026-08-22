@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -268,28 +269,28 @@ def test_does_not_depend_on_rb_being_installed(tmp_path: Path) -> None:
     assert "rb 無しでも読める" in text
 
 
-def test_a_display_name_does_not_hide_which_resource_is_held(tmp_path: Path) -> None:
-    """``display`` にジョブ名が入っても、通知から資源 ID が消えない。
+def test_a_legacy_display_field_does_not_leak_into_the_notice(tmp_path: Path) -> None:
+    """掲示板に残っている旧い ``display`` フィールドは、通知の見出しに使わない。
 
-    実運用で display が ``malm E017 学習`` になり、GPU0 が押さえられていることが
-    全セッションの通知から見えなくなった。取得の排他は資源 ID で効くので衝突
-    そのものは起きないが、**掲示板は読まれて初めて意味を持つ**。GPU を使おうと
-    する側は見覚えのないジョブ名しか見えず、空きだと誤読しうる状態だった。
+    別名を併記する仕組み（``display`` / ``naming.label()``）は廃止した——実運用で
+    2 度ともジョブ名が入り、通知から資源 ID が読み取れなくなった。しかも資源 ID は
+    自由記述で括弧を含む ID が実在するため、合成した見出しと本物の資源 ID が書式で
+    区別できず、逆向きの誤読も生んだ（issue #9）。既存の掲示板に残った ``display``
+    は読まず、消さず、特別な処理もしない——見出しは常に資源 ID だけになる。
     """
     board = Board(tmp_path)
-    assert board.declare(
-        build_entry(
-            normalize("GPU0"),
-            job="E017 A/B 学習 10 本",
-            session="malm",
-            display="malm E017 学習",
-        )
+    board.entries_dir.mkdir(parents=True)
+    entry = build_entry(normalize("GPU0"), job="E017 A/B 学習 10 本", session="malm")
+    payload = entry.to_dict()
+    payload["display"] = "malm E017 学習"  # 旧い版が書いた形を模す
+    (board.entries_dir / f"{entry.nonce}.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
     )
 
     text = run_hook(tmp_path).decode("utf-8")
 
     assert "GPU0" in text
-    assert "malm E017 学習" in text
+    assert "malm E017 学習" not in text
 
 
 def test_a_newline_becomes_a_space_not_nothing(tmp_path: Path) -> None:

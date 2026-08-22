@@ -253,7 +253,6 @@ def _describe(entry: Entry) -> dict[str, object]:
     """1 つの宣言を機械可読な形にする。**全ての宣言が同じ形である。**"""
     return {
         "holder": entry.holder,
-        "display": entry.display,
         "held_for_seconds": _held_seconds(entry),
         "job": entry.job,
         "since": entry.since,
@@ -284,11 +283,17 @@ def _report_unreadable(board: Board) -> None:
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
+    """全件を表示する。**資源 ID を引数に取らない。**
+
+    かつては資源 ID を指定できたが、``normalize()`` は大文字小文字を保持するため
+    ``GPU0`` と ``gpu0`` は別の資源になり、名指しで聞くと相手の宣言が見えず
+    「空き」と誤って答えていた（issue #9。実運用で `gpu0` が 7.3 時間押さえられ、
+    その間 `rb status GPU0` は空きと答えた）。本ツール自身が 3 か所で「資源名を
+    指定するな」と案内していたのに機能として残すのは、注意書きで防ごうとして
+    いるのと同じであり、機能ごと消して全件表示だけにする。
+    """
     board = Board(args.home)
-    if args.resource:
-        targets, unreadable = [naming.normalize(r) for r in args.resource], False
-    else:
-        targets, unreadable = _known_resources_detailed(board)
+    targets, unreadable = _known_resources_detailed(board)
 
     rows = []
     for resource_id in targets:
@@ -299,13 +304,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
         # 「主宣言の枠は空いているが相乗りがいる」という状態があり、そこが
         # 「空き」に見えることが事故の元だった。
         occupied = bool(living)
-        first = living[0] if living else None
         rows.append(
             {
                 "resource": resource_id,
-                "display": (first.display if first else "") or naming.display_default(resource_id),
-                # 一覧の見出し。**資源 ID を必ず含める**（display による置き換えを許さない）。
-                "label": naming.label(resource_id, first.display if first else ""),
+                # 一覧の見出しは資源 ID だけである（display による別名の併記は廃止した。
+                # issue #9 — 合成した見出しと資源 ID そのものが書式で区別できなかった）。
+                "label": naming.display_default(resource_id),
                 "occupied": occupied,
                 "holders": len(living),
                 # **幽霊も載せる。** 掲示板にあるものを一覧から消してはならない——
@@ -412,7 +416,6 @@ def acquire(
     peak: str = "",
     avg: str = "",
     sharing: str = "",
-    display: str = "",
     log: str | None = None,
     force: bool = False,
     share: bool = False,
@@ -477,7 +480,12 @@ def acquire(
                 if not liveness.is_free(verdict):
                     continue
                 reason = "強制取得" if force else "幽霊と判定した"
-                removal = board.remove_confirmed(selection, reason=reason)
+                # **force=True で渡す。** ここは既に `assess_detailed` が幽霊と判定した
+                # 個体を、完全性を確認した列挙からそのまま消す場面であり、``--force``
+                # と同じ「個体を選ぶ責任は呼び出し側が持ち、CAS は実体の入れ替わりだけを
+                # 見る」形である。nonce を持たない旧形式の幽霊だけを除外すると、それだけ
+                # が退去されずに残り続け、幽霊判定が資源ごとに不揃いになる。
+                removal = board.remove_confirmed(selection, reason=reason, force=True)
                 if removal not in (RemovalResult.REMOVED, RemovalResult.ABSENT):
                     # **消せなかったことを「使用中」に化けさせない。** 掲示板のファイルを
                     # 消せなかっただけで、資源の保持者を確認したわけではない。平坦化で
@@ -510,7 +518,7 @@ def acquire(
                     selection = living_selections.get(entry.nonce)
                     if selection is None:
                         continue  # 理論上起きない（living は living_listing.pairs の部分集合）
-                    removal = board.remove_confirmed(selection, reason="強制取得")
+                    removal = board.remove_confirmed(selection, reason="強制取得", force=True)
                     if removal is RemovalResult.REMOVED:
                         living.remove(entry)
 
@@ -524,7 +532,7 @@ def acquire(
         # **自分で busy と申告したときも断る。** 掲示板が空でも同じ——誰かが宣言せずに
         # 使っている、という状態であり、実測は単独で確定する（DESIGN.md「実測の非対称性」）。
         if (living or found == "busy") and not share and not force:
-            label = naming.label(resource_id, living[0].display if living else "")
+            label = naming.display_default(resource_id)
             if living:
                 notices.append(
                     f"[rb] {label} は使用中です（既に {len(living)} 件の宣言があります）"
@@ -561,7 +569,6 @@ def acquire(
         new_entry = build_entry(
             resource_id,
             job=job,
-            display=display,
             log=log,
             pid=pid,
             observed={"note": observation.note, "found": found},
@@ -671,7 +678,6 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         peak=args.peak or "",
         avg=args.avg or "",
         sharing=args.sharing or "",
-        display=args.display or "",
         log=args.log,
         force=args.force,
         share=args.share,
@@ -683,7 +689,7 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         _warn_not_declared()
         return result.code
 
-    print(f"宣言しました: {result.entry.display} / {result.entry.job}")
+    print(f"宣言しました: {naming.display_default(result.entry.resource)} / {result.entry.job}")
     return EXIT_OK
 
 
@@ -740,7 +746,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
         peak=args.peak or "",
         avg=args.avg or "",
         sharing=args.sharing or "",
-        display=args.display or "",
         log=str(log_path),
         force=args.force,
         share=args.share,
@@ -821,7 +826,7 @@ def _release_after_run(
         selection = board.confirm_own_declaration(entry)
         result = board.remove_confirmed(selection, reason=reason)
         if result is RemovalResult.REMOVED:
-            _say(f"解放しました: {naming.label(resource_id, entry.display)}")
+            _say(f"解放しました: {naming.display_default(resource_id)}")
         elif result is RemovalResult.NOT_OWNED:
             _say("宣言が入れ替わりました（解放していません）", err=True)
         elif result is RemovalResult.UNCONFIRMED:
@@ -906,8 +911,7 @@ def _cmd_wait(args: argparse.Namespace) -> int:
         print(f"待機します: {naming.display_default(resource_id)}")
     else:
         print(
-            f"待機します: {naming.label(resource_id, entry.display)}"
-            f" <- {entry.session} / {entry.job}"
+            f"待機します: {naming.display_default(resource_id)} <- {entry.session} / {entry.job}"
         )
         held = _held_for(entry)
         print(f"  since {entry.since}{f'（{held} 経過）' if held else ''}")
@@ -1400,7 +1404,7 @@ def _update_locked(board: Board, resource_id: str, args: argparse.Namespace) -> 
         print("更新できませんでした（掲示板に書けません。監査ログを参照）", file=sys.stderr)
         return EXIT_OK
 
-    print(f"更新しました: {entry.display} / {entry.job}")
+    print(f"更新しました: {naming.display_default(entry.resource)} / {entry.job}")
     return EXIT_OK
 
 
@@ -1623,7 +1627,9 @@ def _release_by_nonce(
         # 非強制路とは違い、ここでは公開の削除入口（`remove_confirmed`）を
         # 選択した実体に対して直接使う——再列挙しないので、選択時に確認した
         # 完全性を削除の直前で捨て直さない（issue #17 指摘 2・3）。
-        removal = board.remove_confirmed(selection, reason="release --nonce --force コマンド")
+        removal = board.remove_confirmed(
+            selection, reason="release --nonce --force コマンド", force=True
+        )
         if removal is RemovalResult.REMOVED:
             _say(
                 f"強制解放しました: {naming.display_default(entry.resource)}"
@@ -1946,7 +1952,6 @@ def _add_declaration_options(parser: argparse.ArgumentParser, *, with_force: boo
         ),
     )
     parser.add_argument("--log", default=None, help="進捗が読めるログのパス")
-    parser.add_argument("--display", default=None, help="表示名")
     # **承知で並ぶ意思表示。掲示板には役割として記録されない。**
     # かつての `rb join` が作っていた「相乗り」という種類の記録は無い。
     parser.add_argument(
@@ -1973,8 +1978,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--home", default=None, help="掲示板のルート（既定は環境依存）")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    status = sub.add_parser("status", help="資源の状態を表示する")
-    status.add_argument("resource", nargs="*", help="対象の資源 ID（省略時は宣言のある全件）")
+    status = sub.add_parser(
+        "status",
+        help="資源の状態を表示する（常に全件）",
+        description=(
+            "宣言のある全資源を表示する。資源 ID は受け取らない——名指しで絞ると、"
+            "表記の揺れ（大文字小文字は別資源）で相手の宣言が見えず「空き」と誤って"
+            "答えることがあるため（issue #9）。"
+        ),
+    )
     status.add_argument("--json", action="store_true", help="JSON で出力する")
     status.set_defaults(func=_cmd_status)
 

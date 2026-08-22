@@ -252,16 +252,17 @@ def read_entries_directly() -> list[dict[str, object]] | None:
                 found.append(data)
         return found
 
-    # **旧い置き場も同じ宣言として読む。** 形式を変えた瞬間に、稼働中のセッションの
-    # 宣言を見失わないためである。主宣言と相乗りという区別は掲示板が持たないので、
-    # ここにも無い。1 資源に宣言が N 件並ぶだけである。
-    for data in load(board) + load(board / "joins"):
+    # **``board/joins/`` はもう走査しない。** 旧形式の相乗りを見失わないための
+    # 経路だったが、監査ログで宣言の寿命を実測すると中央値 5.4 分・最長 2.1 時間
+    # だった（issue #9）。とうにその窓を過ぎている旧ディレクトリを読み続ける理由が
+    # 無い。主宣言と相乗りという区別は掲示板が持たないので、ここにも無い——
+    # 1 資源に宣言が N 件並ぶだけである。
+    for data in load(board):
         key = data.get("resource")
         row = by_resource.get(key) if isinstance(key, str) else None
         if row is None:
             row = {
                 "resource": key,
-                "display": data.get("display"),
                 "occupied": True,
                 "declarations": [],
             }
@@ -383,29 +384,19 @@ HOST_SEP = "::"
 
 
 def board_label(resource: dict[str, object]) -> str:
-    """通知に出す見出し。**資源 ID を必ず含める。**
+    """通知に出す見出し。**資源 ID だけである。**
 
-    ``display`` は「UUID を読みやすくするための資源の別名」であって、資源の
-    同一性を置き換えるものではない。置き換えを許すと、``display`` にジョブ名が
-    入った瞬間に「どの資源が押さえられているか」が通知から消える。
-
-    実運用で ``display`` が ``malm E017 学習`` になり、GPU0 が押さえられている
-    ことが全セッションの通知から見えなくなった。取得の排他は資源 ID で効くので
-    衝突そのものは起きないが、**掲示板は読まれて初めて意味を持つ**。読めない通知は
-    通知が無いのと変わらない。
+    別名を併記する仕組み（``display``）はかつて存在したが、実運用で 2 度とも
+    ジョブ名が入り、通知から資源 ID が読み取れなくなった。しかも資源 ID は
+    自由記述で括弧を含む ID が実在するため、合成した見出しと本物の資源 ID が
+    書式で区別できず、逆向きの誤読も生んだ（issue #9）。仕組みごと廃止し、
+    見出しは資源 ID だけにする。
 
     :func:`clip` と同じく、この関数は各フックへ意図的に重複させてある。
-    ``rb status --json`` が返す ``label`` を使わないのは、フックと ``rb`` の
-    版が食い違っても壊れないようにするためである。
     """
     resource_id = resource.get("resource")
     base = clip(str(resource_id).split(HOST_SEP, 1)[-1] if resource_id else "", MAX_NAME_BYTES)
-    display = clip(resource.get("display"), MAX_NAME_BYTES)
-    if not base:
-        return display or "?"
-    if not display or display == base:
-        return base
-    return f"{base}（{display}）"
+    return base or "?"
 
 
 def describe(resource: dict[str, object]) -> list[str]:
@@ -415,7 +406,7 @@ def describe(resource: dict[str, object]) -> list[str]:
     なり、1 つの型に押し込めると ``GPU0 <- ? / (ジョブ未記入)`` という行になった。
     区別が無くなったので、その壊れ方も無い。
     """
-    display = board_label(resource)
+    label = board_label(resource)
     declarations = resource.get("declarations")
     declarations = (
         [d for d in declarations if isinstance(d, dict)] if isinstance(declarations, list) else []
@@ -424,7 +415,7 @@ def describe(resource: dict[str, object]) -> list[str]:
     # 資源名も申告された文字列である（本ツールは資源を知らないので検査できない）。
     # ここだけ印を外すと、資源名を装った行がフックの文言のように見える。
     count = f"  （宣言 {len(declarations)} 件）" if len(declarations) > 1 else ""
-    lines = [f"{DATA_MARK}{display}{count}"]
+    lines = [f"{DATA_MARK}{label}{count}"]
     for declaration in declarations:
         lines.extend(describe_declaration(declaration))
     return lines

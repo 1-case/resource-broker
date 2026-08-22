@@ -87,39 +87,23 @@ def test_normalize_rejects_empty_id() -> None:
         naming.normalize("   ")
 
 
-# --- 見出しは資源 ID を隠さない ---------------------------------------------------
+# --- 見出しは資源 ID だけである（表示名を併記する仕組みは廃止した） -----------------
 
 
-def test_label_keeps_the_resource_id_when_a_display_name_is_given() -> None:
-    """``--display`` は資源 ID を**置き換えない**。
+def test_label_no_longer_exists() -> None:
+    """``naming.label()``（資源 ID と表示名を合成する関数）は存在しない。
 
-    display は「UUID を読みやすくするための資源の別名」であって、資源の同一性を
-    置き換えるものではない。実運用で display にジョブ名（``malm E017 学習``）が
-    入り、GPU0 が押さえられていることが一覧とフックの通知から消えた。
+    184 件の宣言中、文書化していた用途（読みにくい ID の別名）での使用は 0 件で、
+    実際に入れられたのは 2 度ともジョブ名だった。しかも資源 ID は自由記述で
+    括弧を含む ID が実在するため、合成した見出しと本物の資源 ID が書式で
+    区別できず、2 度とも誤読を生んだ（issue #9）。仕組みごと廃止したので、
+    見出しは常に :func:`naming.display_default` が返す資源 ID だけになる。
     """
+    assert not hasattr(naming, "label")
+
+
+def test_display_default_is_the_only_header_source() -> None:
+    """一覧・通知の見出しは、表示名の併記なしに資源 ID だけを返す。"""
     resource_id = naming.normalize("GPU0")
 
-    assert naming.label(resource_id, "malm E017 学習") == "GPU0（malm E017 学習）"
-
-
-def test_label_falls_back_to_the_resource_id() -> None:
-    """表示名が無ければ資源 ID だけを出す。"""
-    resource_id = naming.normalize("COM5")
-
-    assert naming.label(resource_id, "") == "COM5"
-    assert naming.label(resource_id, None) == "COM5"
-
-
-def test_label_does_not_repeat_a_redundant_display_name() -> None:
-    """表示名が資源 ID と同じなら括弧を付けない（既定はこの形になる）。"""
-    resource_id = naming.normalize("GPU0")
-
-    assert naming.label(resource_id, "GPU0") == "GPU0"
-    assert naming.label(resource_id, resource_id) == "GPU0"
-
-
-def test_label_ignores_a_whitespace_only_display_name() -> None:
-    """空白だけの表示名で括弧を作らない。"""
-    resource_id = naming.normalize("GPU0")
-
-    assert naming.label(resource_id, "   ") == "GPU0"
+    assert naming.display_default(resource_id) == "GPU0"
