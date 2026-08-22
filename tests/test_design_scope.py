@@ -31,7 +31,11 @@ DESIGN = ROOT / "docs" / "DESIGN.md"
 #: 620 へ上げたのは、公開 API（``RESOURCE_BROKER_DISABLE``）と保持期限、そして
 #: 受け入れた残余 3 件を書く場所が無くなったためである。**必要な仕様を番人が
 #: 塞ぐなら、番人のほうが間違っている。**
-MAX_LINES = 620
+#:
+#: 621 へ上げたのは、``EXIT_BROKEN``（値 3）を Exit Codes の表へ 1 行足すため
+#: である（issue #15 #5 の修正で追加した終了コード。表の抜けを埋める仕様の追加
+#: であり、散文ではない）。
+MAX_LINES = 621
 
 #: 公開しない文書。**公開物からここへリンクすると参照切れになる。**
 PRIVATE_DOCS = ("EXPERIMENTS.md", "STATUS.md", "tools/speak.py", "tools/speak_dict.json")

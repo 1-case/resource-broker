@@ -496,9 +496,29 @@ def test_a_broken_wait_is_distinguishable_from_a_timeout(
     hold_gpu(tmp_path) if not Board(tmp_path).list_for(RESOURCE) else None
     timed_out = main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0"])
 
-    assert broken == cli.EXIT_WAIT_BROKEN
+    assert broken == cli.EXIT_BROKEN
     assert timed_out == cli.EXIT_BUSY
     assert broken != timed_out
+
+
+def test_exit_broken_keeps_its_original_value_after_the_rename() -> None:
+    """``EXIT_WAIT_BROKEN`` → ``EXIT_BROKEN`` への改名は**値を変えていない**。
+
+    値 3 は ``wait`` 専用だった頃から外部（呼び出し側のシェルスクリプト等）が
+    見ている可能性がある。カテゴリを一般化する（``release --nonce`` にも使う）
+    のは値の意味を広げるだけであり、既存の値そのものを変えてはならない。
+    シンボル名だけを比較するテストは、両方が一緒に動いてしまえば検出力を
+    持たない——ここでは文字どおりの値を固定する。
+    """
+    from resource_broker import cli
+
+    assert cli.EXIT_BROKEN == 3
+    assert cli.EXIT_BROKEN not in (
+        cli.EXIT_OK,
+        cli.EXIT_BUSY,
+        cli.EXIT_USAGE,
+        cli.EXIT_INTERRUPTED,
+    )
 
 
 def test_a_reboot_ghost_does_not_keep_wait_running(
@@ -537,7 +557,7 @@ def test_a_release_and_a_shrink_both_exit_zero_through_the_cli(
 
     「全部消えた」も「1 つ減った」も待機としては成功で、呼び出し側への合図は同じ
     **「もう一度自分で調べろ」**である。上限到達（``EXIT_BUSY``）や内部エラー
-    （``EXIT_WAIT_BROKEN``）と畳まない——対処が違う。
+    （``EXIT_BROKEN``）と畳まない——対処が違う。
     """
     from resource_broker import cli
 
@@ -557,4 +577,4 @@ def test_a_release_and_a_shrink_both_exit_zero_through_the_cli(
 
     assert released == cli.EXIT_OK
     assert shrank == cli.EXIT_OK, "宣言が減っただけの復帰を成功として扱っていない"
-    assert cli.EXIT_OK not in (cli.EXIT_BUSY, cli.EXIT_WAIT_BROKEN)
+    assert cli.EXIT_OK not in (cli.EXIT_BUSY, cli.EXIT_BROKEN)

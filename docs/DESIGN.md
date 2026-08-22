@@ -89,6 +89,7 @@ uv run rb run --res GPU0 --job "E009 学習" --observed "..." --eta 40m -- uv ru
 | 0 | `EXIT_OK` | 成功。フックは**常にこれ**を返す |
 | 1 | `EXIT_BUSY` | 資源が使用中で取得できなかった。`rb run` が実行しなかった場合も 1 |
 | 2 | `EXIT_USAGE` | 引数の不備。解放対象が曖昧なときもこれ（資源の競合ではない） |
+| 3 | `EXIT_BROKEN` | 内部の故障でその操作を完了できなかった（掲示板が読めない等）。`EXIT_BUSY`（正常に読めた上で使用中）とも `EXIT_OK`（完了した）とも分ける |
 | 126 / 127 | `EXIT_CANNOT_EXECUTE` / `EXIT_COMMAND_NOT_FOUND` | 子を起動できなかった / コマンドが無い |
 | 130 | `EXIT_INTERRUPTED` | Ctrl+C による中断 |
 

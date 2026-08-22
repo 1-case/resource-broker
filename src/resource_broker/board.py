@@ -917,7 +917,16 @@ class Board:
         result, error = _unlink_with_retry(tombstone)
         if result is RemovalResult.FAILED:
             self.audit("tombstone_left", resource=expected.resource, error=error)
-        self.audit("removed", resource=expected.resource, job=captured.job, reason=reason)
+        # **nonce を持たない旧形式の宣言である。** `captured.nonce` は空文字列のまま
+        # 残す（無いことを隠さない）。`rb history` の対応付けは nonce が空なら
+        # 資源 + job へフォールバックするので、ここで書かなくても壊れない。
+        self.audit(
+            "removed",
+            resource=expected.resource,
+            job=captured.job,
+            nonce=captured.nonce,
+            reason=reason,
+        )
         return RemovalResult.REMOVED
 
     def _capture_and_remove(
@@ -968,10 +977,18 @@ class Board:
         # 閉じてしまい、まだ走っている宣言が「解放済み」に見える（掲示板は正しいのに
         # 監査だけが嘘をつく）。呼び出し側が join_removed を書くのでここは黙る。
         if audit_as:
-            # **job も残す。** `rb history` は宣言と解放を (資源, job) で突き合わせる。
-            # 資源だけで対応させると、同じ資源に並ぶ別の作業の解放を自分の宣言に
-            # 結び付けてしまい、実所要が無関係な値になる。
-            self.audit(audit_as, resource=resource_id, job=captured.job, reason=reason)
+            # **job も nonce も残す。** `rb history` は宣言と解放を突き合わせるとき、
+            # 両方が nonce を持てば nonce だけで確実に対応させる。資源 + job だけで
+            # 対応させると、同じ資源・同じ job の宣言が並行したとき別の宣言の解放を
+            # 自分の宣言に結び付けてしまう——`--nonce` で片方だけ消しても、履歴は
+            # 時刻順で先に来た方（消していない方）に解放を割り当ててしまう。
+            self.audit(
+                audit_as,
+                resource=resource_id,
+                job=captured.job,
+                nonce=captured.nonce,
+                reason=reason,
+            )
         return RemovalResult.REMOVED
 
     def _restore(self, tombstone: Path, path: Path, resource_id: str) -> None:
@@ -1115,10 +1132,15 @@ class Board:
 
         # 見積もりも残す。次に同じ資源を使うとき、前回どう見積もったかを振り返れる
         # ようにするためである（`rb history`）。精度は回ごとに上げていくしかない。
+        # **nonce も残す。** `rb history` は資源 + job で宣言と解放を対応付けるが、
+        # 同じ資源・同じ job の宣言が並行すると job だけでは取り違える。nonce は
+        # 宣言ごとに一意なので、両方が持っていれば nonce だけで確実に対応が付く
+        # （`_pair_key` 参照）。nonce を持たない古いログとの互換のため、job も残す。
         self.audit(
             "claimed",
             resource=entry.resource,
             job=entry.job,
+            nonce=entry.nonce,
             pid=entry.pid,
             eta=entry.eta,
             usage=entry.usage,
@@ -1258,7 +1280,13 @@ class Board:
             result, error = _unlink_with_retry(path)
             if result is RemovalResult.REMOVED:
                 removed += 1
-                self.audit("removed", resource=resource_id, job=entry.job, reason=reason)
+                self.audit(
+                    "removed",
+                    resource=resource_id,
+                    job=entry.job,
+                    nonce=entry.nonce,
+                    reason=reason,
+                )
             elif result is RemovalResult.FAILED:
                 self.audit("remove_failed", resource=resource_id, error=error)
         return removed

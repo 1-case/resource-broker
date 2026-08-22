@@ -325,6 +325,70 @@ def test_history_does_not_reuse_one_release_for_two_claims(
     assert second["elapsed_seconds"] is None
 
 
+# --- nonce による対応付け（issue #15 #6） -----------------------------------------
+
+
+def test_history_pairs_by_nonce_when_two_declarations_share_resource_and_job(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同じ資源・同じ job の宣言が並んでいても、``--nonce`` で消した方に解放が付く。
+
+    以前の監査ログは nonce を持たず、``rb history`` は (資源, job) と時刻順だけで
+    対応付けていた。同じ資源・同じ job の宣言 A・B が並び ``--nonce`` で B だけを
+    消すと、時刻順で先に来た A（まだ生きている方）に解放が誤って割り当たっていた
+    ——「消していない A を消したことにし、消した B には解放の記録が無い」という
+    嘘を履歴が語ることになる。
+    """
+    base = clock.now()
+    monkeypatch.setattr(clock, "now", lambda: base)
+    claim(tmp_path)  # A: since = base
+    monkeypatch.setattr(clock, "now", lambda: base + timedelta(minutes=1))
+    claim(tmp_path, "--share")  # B: since = base + 1m。A と同じ資源・同じ job
+
+    board = Board(tmp_path)
+    a, b = board.list_for(normalize("GPU0"))  # since 昇順 = 宣言順
+    assert a.job == b.job == "E059 eval"
+
+    # B だけを --nonce で消す。A は生きたまま残る。
+    monkeypatch.setattr(clock, "now", lambda: base + timedelta(minutes=10))
+    assert run(tmp_path, "release", "--nonce", b.nonce[:8]) == 0
+    capsys.readouterr()
+
+    assert run(tmp_path, "history", "GPU0", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    by_nonce = {c["nonce"]: c for c in payload["claims"]}
+    assert by_nonce[a.nonce]["released_at"] is None, "まだ生きている A に解放が付いた"
+    assert by_nonce[b.nonce]["elapsed_seconds"] == 540, "消した B に解放が対応付かない"
+
+
+def test_history_falls_back_to_job_pairing_for_audit_logs_without_nonce(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """nonce を持たない古い監査ログでも ``rb history`` は壊れない。
+
+    この対応付けより前に書かれたログには ``nonce`` フィールドが無い。対応付けの鍵を
+    nonce 必須にすると、過去のログが一切読めなくなる。資源 + job へフォールバック
+    することを、nonce を書かずに直接監査ログへ追記して確かめる。
+    """
+    board = Board(tmp_path)
+    base = clock.now()
+    monkeypatch.setattr(clock, "now", lambda: base)
+    board.audit("claimed", resource=normalize("GPU0"), job="旧形式のジョブ", eta={"stated": "40m"})
+    monkeypatch.setattr(clock, "now", lambda: base + timedelta(minutes=5))
+    board.audit(
+        "removed", resource=normalize("GPU0"), job="旧形式のジョブ", reason="release コマンド"
+    )
+    capsys.readouterr()
+
+    assert run(tmp_path, "history", "GPU0", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    (record,) = payload["claims"]
+    assert record.get("nonce") is None
+    assert record["elapsed_seconds"] == 300
+
+
 # --- はじいたときに次の一手を示す -------------------------------------------------
 
 

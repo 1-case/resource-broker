@@ -28,7 +28,7 @@ import pytest
 
 from resource_broker import cli
 from resource_broker.board import Board, build_entry
-from resource_broker.cli import EXIT_OK, EXIT_USAGE, main
+from resource_broker.cli import EXIT_BROKEN, EXIT_BUSY, EXIT_OK, EXIT_USAGE, main
 from resource_broker.naming import normalize
 
 RESOURCE = normalize("GPU0")
@@ -127,6 +127,85 @@ def test_release_still_removes_a_single_own_declaration(tmp_path: Path) -> None:
     assert Board(tmp_path).list_for(RESOURCE) == []
 
 
+# --- 消す前に止める: 数えてから消すまでの TOCTOU（issue #15 #3） ------------------
+
+
+def test_release_own_does_not_sweep_a_declaration_that_appears_after_counting_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_release_own`` は「1 件」と数えた宣言だけを消す。数えた後に現れた宣言は消さない。
+
+    以前の実装は、1 件と数えたあとに ``nonce`` を固定せず ``remove_own`` を無条件
+    （nonce 無し）で呼んでいた。``remove_own`` は自分の宣言をそのとき読み直して
+    **全部**消すので、数えてから呼ぶまでの間に自分の 2 件目が現れると、両方とも
+    消えていた——「消す前に止める」がまさに防ごうとした事故が競合下でそのまま
+    成立していた。``Board.list_for`` をフックし、数え終えた直後に割り込ませる。
+    """
+    assert claim(tmp_path, "GPU0", "先に数えられる方") == EXIT_OK
+
+    board = Board(tmp_path)
+    original_list_for = Board.list_for
+    injected = {"done": False}
+
+    def _list_for_with_race(self: Board, resource_id: str) -> list:
+        result = original_list_for(self, resource_id)
+        # **数え終えた直後、1 回だけ割り込ませる。** ここでもう 1 件、自分の宣言を
+        # 作る——`_release_own` が「1 件」と判定した直後の状態を再現する。
+        if not injected["done"] and resource_id == RESOURCE:
+            injected["done"] = True
+            assert claim(tmp_path, "GPU0", "数えたあとに現れた方", "--share") == EXIT_OK
+        return result
+
+    monkeypatch.setattr(Board, "list_for", _list_for_with_race)
+
+    assert run(tmp_path, "release", "GPU0") == EXIT_OK
+
+    # **割り込ませた宣言は残っていなければならない。** 数えた対象（1 件目）だけが
+    # 消え、数えた時点に存在しなかった 2 件目には触れていないことを確かめる。
+    remaining = board.list_for(RESOURCE)
+    assert [e.job for e in remaining] == ["数えたあとに現れた方"]
+
+
+def test_release_own_does_not_proceed_when_the_count_is_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """自分の宣言を「0 件」と数えたら、削除処理そのものへ進まない。
+
+    以前の実装は 0 件のときも ``remove_own`` を無条件（nonce 無し）で呼んでいた。
+    数えてから呼ぶまでの間に自分の宣言が新しく現れると、それを「数えた 1 件」と
+    取り違えて消していた——数えた時点には存在しなかった宣言である。
+    """
+    board = Board(tmp_path)
+    plant_with_nonce(
+        board,
+        RESOURCE,
+        "f" * 32,
+        job="他人の仕事",
+        cwd=FOREIGN_CWD,
+        session="theirs",
+        session_id="theirs",
+    )
+
+    original_list_for = Board.list_for
+    injected = {"done": False}
+
+    def _list_for_with_race(self: Board, resource_id: str) -> list:
+        result = original_list_for(self, resource_id)
+        if not injected["done"] and resource_id == RESOURCE:
+            injected["done"] = True
+            # 「0 件」と数えた直後に、自分の宣言を割り込ませる。
+            assert claim(tmp_path, "GPU0", "数えた後に現れた自分の宣言", "--share") == EXIT_OK
+        return result
+
+    monkeypatch.setattr(Board, "list_for", _list_for_with_race)
+
+    assert run(tmp_path, "release", "GPU0") == EXIT_BUSY
+
+    # **割り込ませた宣言も、元からあった他人の宣言も、両方残っている。**
+    remaining = {e.job for e in board.list_for(RESOURCE)}
+    assert remaining == {"他人の仕事", "数えた後に現れた自分の宣言"}
+
+
 # --- --nonce: 資源 ID 不要で 1 本だけ消す -----------------------------------------
 
 
@@ -172,6 +251,81 @@ def test_release_by_nonce_with_no_match_is_refused(
     assert run(tmp_path, "release", "--nonce", "ffffffff") == EXIT_USAGE
     assert "見つかりません" in capsys.readouterr().err
     assert len(Board(tmp_path).list_for(RESOURCE)) == 1
+
+
+# --- --nonce: 掲示板が読めないとき「見つからない」も「一意」も断定しない（issue #15 #5） --
+
+
+def test_release_by_nonce_does_not_confirm_release_when_the_whole_board_is_unreadable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """掲示板全体が読めないとき、``--nonce`` は「見つからない」と断定しない。
+
+    以前の実装は ``board.list_all()`` を使っていた。docstring どおり読めなかった
+    ものを黙って飛ばすので、掲示板全体が読めなくても ``matches == []`` になり、
+    利用者の入力ミスを意味する ``EXIT_USAGE`` を返していた——実際には読めなかった
+    だけで、一致する宣言が本当に無いとは限らない。
+
+    **終了コードは ``EXIT_BROKEN``（3）。** ``EXIT_OK`` にすると「解放は未確認」で
+    0 を返すことになり、走らなかった操作を成功と報告する形になる——
+    ``rb release --nonce X && 次の手順`` と書いた呼び出し側は、解放されていない
+    のに次へ進む（cli.py 冒頭「終了コードで嘘をつかない」）。``EXIT_BUSY`` も
+    使わない——「掲示板が正常に読めた上で使用中」ではなく、読めなかっただけである。
+    """
+    (tmp_path / "board").write_text("これはディレクトリではない", encoding="utf-8")
+
+    code = run(tmp_path, "release", "--nonce", "aaaaaaaa")
+
+    assert code == EXIT_BROKEN
+    assert code not in (EXIT_OK, EXIT_BUSY)
+    err = capsys.readouterr().err
+    assert "未確認" in err
+    assert "見つかりません" not in err
+
+
+def test_release_by_nonce_does_not_treat_a_partially_readable_board_as_unique(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """部分的にしか読めないとき、見えている 1 件を「一意」と誤認して消さない。
+
+    以前の実装は、部分的に読めた場合でも見えている件数だけで一意性を判定して
+    いた。読めなかった側に同じ prefix を持つ宣言が隠れていれば、実際には曖昧
+    かもしれないし、見えている 1 件が自分のものでなければ「見つからない」が
+    正しいかもしれない——どちらも確定できないまま削除まで進んでいた。
+    """
+    assert claim(tmp_path, "GPU0", "見える宣言") == EXIT_OK
+
+    board = Board(tmp_path)
+    prefix = board.list_for(RESOURCE)[0].nonce[:8]
+
+    # 読めないファイルをもう 1 つ仕込む（Windows の共有違反を模す）。
+    (tmp_path / "board" / "読めない.json").write_text("{}", encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def flaky(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name == "読めない.json":
+            raise PermissionError("共有違反")
+        return real_read_text(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", flaky)
+
+    assert run(tmp_path, "release", "--nonce", prefix) == EXIT_BROKEN
+
+    err = capsys.readouterr().err
+    assert "未確認" in err
+    # **何も消えていないことを掲示板で確認する。**
+    assert len(board.list_for(RESOURCE)) == 1
+
+
+def test_release_by_nonce_unconfirmed_release_is_audited(tmp_path: Path) -> None:
+    """未確認で終えたことも監査ログに残す（拒否と対称）。"""
+    (tmp_path / "board").write_text("これはディレクトリではない", encoding="utf-8")
+
+    assert run(tmp_path, "release", "--nonce", "aaaaaaaa") == EXIT_BROKEN
+
+    events = audit_events(tmp_path)
+    unconfirmed = [r for r in events if r.get("event") == "release_nonce_unconfirmed"]
+    assert unconfirmed, f"release_nonce_unconfirmed が監査ログに無い: {events}"
 
 
 # --- --nonce: 空文字列は「未指定」であって「全件一致」ではない ---------------------
@@ -277,6 +431,49 @@ def test_release_by_nonce_rejection_is_audited(tmp_path: Path) -> None:
     rejected = [r for r in events if r.get("event") == "release_nonce_rejected"]
     assert rejected, f"release_nonce_rejected が監査ログに無い: {events}"
     assert rejected[-1].get("reason")
+
+
+# --- --nonce: 一意性は所有で絞る前に見る（issue #15 #4） -------------------------
+
+
+def test_release_by_nonce_refuses_when_prefix_matches_mine_and_a_foreign_declaration(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """prefix が「自分 1 件＋他人 1 件」に当たるとき、何も消さずに拒否する。
+
+    以前の実装は、前方一致した候補を先に「自分が所有するものだけ」へ絞ってから
+    一意性を判定していた。この構成では自分の 1 件だけが残って「一意」に見え、
+    利用者が他人側を指して打っていても検討にすら上らないまま**自分の宣言が
+    黙って消えて**いた——Codex が指摘した事故そのものである。
+
+    「他人」は cwd の祖先フォールバックが効く経路（``session_id`` を空にして
+    ``Board.owns`` の判定を cwd 比較へ落とす）で作る。既存のテストはすべて
+    cwd 無関係・``session_id`` 双方非空の組み合わせだけを使っており、
+    ``Board.owns`` がこの経路（cwd 比較）を通るケースは未検証だった。
+    """
+    board = Board(tmp_path)
+    shared_prefix = "c0ffee12"
+    plant_with_nonce(board, RESOURCE, shared_prefix + "1" * 24, job="自分の仕事")
+    plant_with_nonce(
+        board,
+        RESOURCE,
+        shared_prefix + "2" * 24,
+        job="他人の仕事",
+        cwd=FOREIGN_CWD,
+        session="other-session",
+        session_id="",  # 空にする——cwd 比較（祖先フォールバック）の経路を通す
+    )
+
+    assert run(tmp_path, "release", "--nonce", shared_prefix) == EXIT_USAGE
+
+    err = capsys.readouterr().err
+    assert "2 件" in err
+    # **何も消えていないことを掲示板で確認する。** 自分の宣言・他人の宣言のどちらも
+    # 残っている——狙いすら決まらない「曖昧」な状態であって、片方だけが黙って
+    # 消える状態ではない。
+    remaining = board.list_for(RESOURCE)
+    assert len(remaining) == 2
+    assert {e.job for e in remaining} == {"自分の仕事", "他人の仕事"}
 
 
 # --- --nonce: 所有を尊重する / --force が個体指定で他人を消す唯一の道 ------------

@@ -46,11 +46,20 @@ EXIT_USAGE = 2
 #: Ctrl+C で中断されたときの終了コード（シェルの慣習に合わせる）。
 EXIT_INTERRUPTED = 130
 
-#: ``wait`` が内部エラーで待てなかったときの終了コード。
+#: 内部の故障で、その操作を完了できなかったときの終了コード。
 #:
-#: **上限到達（``EXIT_BUSY``）と分ける。** どちらも 1 にすると、呼び出し側が
-#: 「上限まで待った」と「1 度も待っていない」を区別できない。対処が違う。
-EXIT_WAIT_BROKEN = 3
+#: **``EXIT_BUSY``（正常に読めた上で使用中）とも ``EXIT_OK``（完了した）とも分ける。**
+#: fail-open は「資源アクセスを止めない」原則であって「走らなかった操作を成功と
+#: 報告してよい」ではない（cli.py 冒頭の「終了コードの方針」）。掲示板が読めない・
+#: 壊れているなど、**判定材料が無くて操作を完了できなかった**ことを表す。
+#:
+#: 元は ``wait`` 専用の ``EXIT_WAIT_BROKEN`` として導入した（上限到達
+#: ``EXIT_BUSY`` と畳むと「上限まで待った」と「1 度も待っていない」を区別できない
+#: ため）。同じ構造の故障が ``release --nonce``（掲示板の一部が読めない）にも
+#: 現れたため、値 3 はそのままにこのカテゴリ全体へ一般化した——終了コードの
+#: 空間が増えるほど呼び出し側の分岐が複雑になる（issue #15 #8）ので、4 つ目の
+#: 値を新設せず既存の意味を広げる側を取った。
+EXIT_BROKEN = 3
 
 #: ``--found`` の受け付ける値と、それが表す実測の結論。
 FOUND_CHOICES: dict[str, bool | None] = {"busy": True, "free": False, "unknown": None}
@@ -824,10 +833,21 @@ def _format_duration(seconds: float) -> str:
 def _pair_key(record: dict) -> tuple[str, str, str]:
     """対応付けの鍵。資源ごとに、宣言と解放を突き合わせる。
 
-    同じ資源に何件でも宣言が並ぶので、資源だけでは**別セッションの解放を自分の宣言に
-    結び付ける**。job も鍵に入れて、同じ資源の別の作業と混ざらないようにする。
+    **nonce が両方にあれば nonce で決め打つ。** nonce は宣言ごとに一意なので、
+    同じ資源・同じ job の宣言が並行して走っていても取り違えない——job だけを鍵に
+    すると、``--nonce`` で片方だけを消したときに、時刻順で先に来た**別の宣言**
+    （まだ生きているほう）に解放が結び付いてしまう（「消していない方が消えたことに
+    なり、消した方には解放の記録が無い」という嘘を履歴が語る）。
+
+    **nonce を持たない古い監査ログは、資源 + job のフォールバックへ落とす。**
+    この対応付けより前に書かれたログは ``nonce`` フィールドを持たないため、
+    ここを nonce 必須にすると過去のログが一切読めなくなる（CLAUDE.md
+    「後方互換」に反する）。
     """
     resource = str(record.get("resource", ""))
+    nonce = record.get("nonce")
+    if isinstance(nonce, str) and nonce:
+        return ("nonce", resource, nonce)
     return ("declaration", resource, str(record.get("job", "")))
 
 
@@ -1179,13 +1199,14 @@ def _release_by_nonce(
 ) -> int:
     """``--nonce``: 資源 ID を指定せず、nonce の前方一致で 1 本だけを消す。
 
-    **所有は既定で尊重する。** ``Board.owns`` の nonce 規則（一致すれば確実に自分の
-    ものと見なす）は「nonce を知っているのはラッパーが自分で作った宣言だけ」という
-    前提に乗っていた。だが ``rb status`` は今や nonce の先頭 8 桁を**全セッション**へ
-    見せるので、その前提はもう成立しない。したがって前方一致した候補は、ここでいったん
-    **自分が本当に所有するものだけ**（cwd / session_id）に絞ってから使う——nonce の
-    一致そのものを所有の証明として使い回さない。他人の宣言にしか当たらなければ、
-    「見つからない」とは区別して拒否し、``--force`` を案内する（対処が違う）。
+    **一意性は、所有で絞る前の生の一致件数で判定する。** 先に「自分が本当に所有する
+    ものだけ」（cwd / session_id）へ絞ってから一意性を見ると、prefix が「自分 1 件＋
+    他人 1 件」に当たったとき、自分の 1 件だけが残って「一意」に見え、利用者が
+    他人側を指して打っていても検討にすら上らないまま自分の宣言が黙って消える。
+    しかも拒否できないので「``--force`` を使え」という案内も出せない——``--force``
+    にすれば今度は 2 件とも所有を問わず候補に入り、改めて曖昧で拒否されるので、
+    案内していた道自体が通らない。だから**2 件以上に当たった時点で、所有に関係なく
+    曖昧として拒否する**。所有判定は、一意に決まった 1 件についてだけ行う。
 
     ``force=True`` のときだけ所有を問わない。個体指定で他人の宣言を消せる唯一の道が
     これになるので、``_release_forced`` と同じく**何を消したか必ず言う**（黙って
@@ -1201,6 +1222,22 @@ def _release_by_nonce(
     「見つからない」（0 件一致）とは別の理由として拒否する。桁数の下限は設けない。
     1 桁でも一意に決まれば指定として成立する——短いことは問題ではなく、**空である
     ことだけ**が「何も指定していない」に当たる。
+
+    **掲示板の一部が読めないときは、「見つからない」も「一意」も確定させない。**
+    ``list_all`` は読めなかったものを黙って飛ばすので使わない——掲示板全体が読めない
+    ときも ``matches == []`` になり「見つからない」と断定してしまうし、部分的に
+    読めた場合は隠れた候補があっても「一意」と誤認して削除まで進んでしまう
+    （このプロジェクトは同種の欠陥を 2 度直している。``c7debaf`` / ``f662e01``）。
+    ``list_all_detailed`` で読めなかった事実を受け取り、そのときは削除まで進まず
+    ``EXIT_BROKEN`` で「解放は未確認」だと明示する。**``EXIT_OK`` は使わない。**
+    「解放は未確認」で 0 を返すのは、走らなかった操作を成功と報告する形そのもの
+    であり、cli.py 冒頭の「終了コードで嘘をつかない」に反する
+    （``rb release --nonce X && 次の手順`` のように使われれば、呼び出し側は
+    解放されていないまま次へ進む）。``EXIT_USAGE`` は利用者の入力ミスの意味であって
+    掲示板の破損の表現ではなく、``EXIT_BUSY`` は「掲示板が正常に読めた上で使用中と
+    判定できた」ときだけに使う（cli.py 冒頭の「終了コードの方針」）。``EXIT_BROKEN``
+    は「内部の故障で操作を完了できなかった」という、このどちらでもない第 3 の
+    カテゴリで、``wait`` の内部エラーと同じ値・同じ意味を共有する。
     """
     prefix = prefix.strip()
     if not prefix:
@@ -1210,62 +1247,63 @@ def _release_by_nonce(
         board.audit("release_nonce_rejected", reason="nonce が空である")
         return EXIT_USAGE
 
-    matches = [entry for entry in board.list_all() if entry.nonce.startswith(prefix)]
+    all_entries, unreadable = board.list_all_detailed()
+    if unreadable:
+        _say(
+            "掲示板の一部を読めませんでした。解放は未確認です"
+            "（読めなかった側に一致する宣言が隠れているかもしれません）",
+            err=True,
+        )
+        board.audit("release_nonce_unconfirmed", reason="掲示板の一部が読めない", prefix=prefix)
+        return EXIT_BROKEN
+
+    matches = [entry for entry in all_entries if entry.nonce.startswith(prefix)]
 
     if not matches:
         _say(f"nonce '{prefix}' に一致する宣言が見つかりませんでした", err=True)
         board.audit("release_nonce_rejected", reason="一致する宣言が無い", prefix=prefix)
         return EXIT_USAGE
 
-    if force:
-        # **所有を問わない。** 絞り込みは前方一致だけで行う。
-        candidates = matches
-    else:
-        cwd = os.getcwd()
-        session_id = platform_info.session_id()
-        mine = [entry for entry in matches if board.owns(entry, cwd=cwd, session_id=session_id)]
-        if not mine:
-            # **「無い」と「あなたのものではない」を混ぜない。** 前者は打ち直し、
-            # 後者は --force を使うかどうかの判断が要る。対処が違う。
-            _say(
-                f"nonce '{prefix}' は自分の宣言ではありません"
-                f"（{len(matches)} 件、他セッションのもの）",
-                err=True,
-            )
-            for entry in matches:
-                _say(
-                    f"  nonce {entry.nonce[:8]}  {naming.display_default(entry.resource)}"
-                    f"  {entry.session} / {entry.job}（since {entry.since}）",
-                    err=True,
-                )
-            _say(f"  他セッションの宣言を消すなら rb release --nonce {prefix} --force", err=True)
-            board.audit(
-                "release_nonce_rejected",
-                reason="自分の宣言ではない",
-                prefix=prefix,
-                count=len(matches),
-            )
-            return EXIT_USAGE
-        candidates = mine
-
-    if len(candidates) > 1:
+    if len(matches) > 1:
+        # **一意性は所有で絞る前に見る。** 所有で絞ってから一意性を見ると、
+        # 「自分 1 件＋他人 1 件」を自分の 1 件だけの「一意」だと誤認し、
+        # 狙った他人の宣言ではなく自分の宣言が黙って消える（docstring 参照）。
         _say(
-            f"nonce '{prefix}' が {len(candidates)} 件に一致します。"
-            "もっと長い桁数を指定してください",
+            f"nonce '{prefix}' が {len(matches)} 件に一致します。もっと長い桁数を指定してください",
             err=True,
         )
-        for entry in candidates:
+        for entry in matches:
             _say(
                 f"  nonce {entry.nonce[:8]}  {naming.display_default(entry.resource)}"
                 f"  {entry.session} / {entry.job}（since {entry.since}）",
                 err=True,
             )
         board.audit(
-            "release_nonce_rejected", reason="前方一致が曖昧", prefix=prefix, count=len(candidates)
+            "release_nonce_rejected", reason="前方一致が曖昧", prefix=prefix, count=len(matches)
         )
         return EXIT_USAGE
 
-    entry = candidates[0]
+    entry = matches[0]
+    cwd = os.getcwd()
+
+    # **一意に決まった 1 件についてだけ、所有を確かめる。** force のときだけ問わない。
+    if not force:
+        session_id = platform_info.session_id()
+        if not board.owns(entry, cwd=cwd, session_id=session_id):
+            # **「無い」と「あなたのものではない」を混ぜない。** 前者は打ち直し、
+            # 後者は --force を使うかどうかの判断が要る。対処が違う。
+            _say(
+                f"nonce '{prefix}' は自分の宣言ではありません（{entry.session} / {entry.job}）",
+                err=True,
+            )
+            _say(f"  他セッションの宣言を消すなら rb release --nonce {prefix} --force", err=True)
+            board.audit(
+                "release_nonce_rejected",
+                reason="自分の宣言ではない",
+                prefix=prefix,
+                count=1,
+            )
+            return EXIT_USAGE
 
     if resource is not None:
         wanted = naming.normalize(resource)
@@ -1377,16 +1415,28 @@ def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> i
     **自分の宣言が 2 件以上あるときは、``--all`` が無ければ何も消さずに拒否する。**
     曖昧なまま 1 件を選ぶと、黙って間違った方を消すことになり、2 件とも消すより悪い
     （DESIGN.md「採らなかった案」）。1 件のときは摩擦を足さない——曖昧なときだけの保険である。
+
+    **数える区間と消す区間の間には TOCTOU の窓がある。** ``list_for`` はこの関数の
+    先頭で一度だけ、ロックの外で読む。ここで数えた「1 件」をそのまま
+    ``remove_own`` の無条件削除（nonce 無し）へ渡すと、数えてから呼ぶまでの間に
+    2 件目が現れたとき ``remove_own`` は**その時点で自分のもの全部**を読み直して
+    消す——「消す前に止める」がまさに防ごうとした事故が、競合下でそのまま成立する。
+    数える区間と消す区間を 1 つの ``Board.locked`` に寄せる案も検討したが、
+    取得（``declare``）はロックが取れなくても続行する（fail-open。DESIGN.md
+    「Per-Resource Lock」）ため、ロックで囲っても「ロックを尊重しない書き手」が
+    割り込む窓は閉じない。窓を閉じる手段は対象を**個体（nonce）で固定する**ことだけ
+    であり、CAS（:meth:`Board.remove_if_nonce`）は「読んだ宣言以外を消さない」を
+    ロックの有無に関係なく保証する。だから 1 件のときはその nonce を渡し、
+    0 件のときは削除処理そのものへ進まない（同じ理由——その間に現れた宣言を
+    「数えた 1 件」と取り違えて消しうる）。
     """
     cwd = os.getcwd()
     session_id = platform_info.session_id()
 
+    nonce: str | None = None
     if not take_all:
-        mine = [
-            entry
-            for entry in board.list_for(resource_id)
-            if board.owns(entry, cwd=cwd, session_id=session_id)
-        ]
+        declared = board.list_for(resource_id)
+        mine = [entry for entry in declared if board.owns(entry, cwd=cwd, session_id=session_id)]
         if len(mine) > 1:
             # **消す前に止める。** 曖昧なまま 1 件選ぶと、黙って間違った方を消すのが
             # 「2 件とも消す」より悪い（DESIGN.md「採らなかった案」）。
@@ -1403,8 +1453,28 @@ def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> i
             )
             board.audit("release_ambiguous", resource=resource_id, count=len(mine))
             return EXIT_USAGE
+        if not mine:
+            # **0 件のときは削除処理へ進まない。** ここで `remove_own` を nonce 無しで
+            # 呼ぶと、数えてから呼ぶまでの間に現れた「新しい自分の宣言」——数えた
+            # 時点にはまだ存在しなかったもの——まで拾って消してしまう。この関数の
+            # 役目は「いま数えた自分の宣言を消す」ことであって、「これから現れるかも
+            # しれない宣言まで待ち構えて消す」ことではない。
+            mine_nonces = {entry.nonce for entry in mine}
+            foreign = [entry for entry in declared if entry.nonce not in mine_nonces]
+            if not foreign:
+                _say(f"宣言はありませんでした: {naming.display_default(resource_id)}")
+                return EXIT_OK
+            _say(f"自分の宣言はありません: {naming.display_default(resource_id)}", err=True)
+            for entry in foreign:
+                _say(f"  {entry.session} / {entry.job}（since {entry.since}）", err=True)
+            _say(f"  他セッションの宣言を消すなら rb release {resource_id} --force", err=True)
+            return EXIT_BUSY
+        # **1 件だけなら nonce を固定して渡す。** 数えたあとに 2 件目が現れても、
+        # `remove_own` は渡した nonce と一致する宣言だけを対象にする（CAS）ので、
+        # 新しく現れた宣言には触れない——ここが「消す前に止める」の実体である。
+        nonce = mine[0].nonce
 
-    result = board.remove_own(resource_id, reason="release コマンド", cwd=cwd)
+    result = board.remove_own(resource_id, reason="release コマンド", cwd=cwd, nonce=nonce)
     if result.removed:
         _say(f"解放しました: {naming.display_default(resource_id)}（{len(result.removed)} 件）")
         for entry in result.removed:
@@ -1717,7 +1787,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # **上限到達（EXIT_BUSY）とも分ける。** どちらも 1 にすると、呼び出し側が
             # 「上限まで待った」と「1 度も待っていない」を区別できない。前者は待ち直す
             # 価値があり、後者は原因を調べる必要がある。対処が違うものを畳まない。
-            return EXIT_WAIT_BROKEN
+            return EXIT_BROKEN
         return EXIT_OK
 
 
