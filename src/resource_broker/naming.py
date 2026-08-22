@@ -85,38 +85,13 @@ def safe_filename(resource_id: str) -> str:
 
 
 def display_default(resource_id: str) -> str:
-    """表示名が与えられていないときの既定表示名を返す（ホスト名プレフィックスを外す）。"""
-    return resource_id.split(HOST_SEP, 1)[-1]
+    """一覧・通知に出す見出し（ホスト名プレフィックスを外す）。
 
-
-def label(resource_id: str, display: str | None = None) -> str:
-    """掲示板の一覧に出す見出し。**資源 ID を必ず含める。**
-
-    ``--display`` は「UUID を読みやすくするための資源の別名」であって
-    （DESIGN.md の例: ``GPU0 / RTX 4060 Laptop 8GB``）、資源の同一性を
-    置き換えるものではない。置き換えを許すと、掲示板を読んだ側が
-    **その宣言がどの資源を押さえているのか判断できなくなる。**
-
-    実運用で ``display`` にジョブ名（``E017 学習``）が入り、一覧と
-    フックの通知から ``GPU0`` の文字が消えた。取得の排他は資源 ID で効いていたため
-    衝突は起きなかったが、GPU を使おうとする側は「見覚えのないジョブ名」しか
-    見えず、空きだと誤読しうる状態だった。掲示板は読まれて初めて意味を持つので、
-    読める形を保つことは排他が効いていることと同じだけ重要である。
-
-    Parameters
-    ----------
-    resource_id : str
-        正規化済みの資源 ID。
-    display : str, optional
-        申告された表示名。空・既定値と同じ・資源 ID そのものなら添えない。
-
-    Returns
-    -------
-    str
-        ``GPU0`` または ``GPU0（E017 学習）``。
+    **見出しは資源 ID だけである。** 別名を併記する仕組み（``--display`` /
+    ``naming.label()``）はかつて存在したが、184 件の宣言中、文書化していた用途
+    （読みにくい ID の別名）での使用は 0 件で、実際に入れられたのは 2 度とも
+    ジョブ名だった。しかも資源 ID は自由記述であり括弧を含む ID が実在するため
+    （例: ``daid.exe (C:\\Program Files (x86)\\DesignAid)``）、合成した見出しと
+    本物の資源 ID が書式で区別できず、2 度とも誤読を生んだ（issue #9）。
     """
-    base = display_default(resource_id)
-    text = (display or "").strip()
-    if not text or text == base or text == resource_id:
-        return base
-    return f"{base}（{text}）"
+    return resource_id.split(HOST_SEP, 1)[-1]

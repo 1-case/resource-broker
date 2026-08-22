@@ -31,7 +31,37 @@ DESIGN = ROOT / "docs" / "DESIGN.md"
 #: 620 へ上げたのは、公開 API（``RESOURCE_BROKER_DISABLE``）と保持期限、そして
 #: 受け入れた残余 3 件を書く場所が無くなったためである。**必要な仕様を番人が
 #: 塞ぐなら、番人のほうが間違っている。**
-MAX_LINES = 620
+#:
+#: 621 へ上げたのは、``EXIT_BROKEN``（値 3）を Exit Codes の表へ 1 行足すため
+#: である（issue #15 #5 の修正で追加した終了コード。表の抜けを埋める仕様の追加
+#: であり、散文ではない）。
+#:
+#: 640 へ上げたのは、破壊的操作の族全体に「候補集合は完全か」を通した修正
+#: （issue #17）で、Exit Codes に**コマンド × 結果**の対応表を足し、
+#: Corrupt Entries と Waiting に完全性を見る／見ない経路の仕様を 1 段落ずつ
+#: 足し、History の対応付けの鍵を 2 段階（nonce 優先・job フォールバック）へ
+#: 更新したためである。いずれも「今後も真であり続ける仕様」であって経緯では
+#: ない。
+#:
+#: 680 へ上げたのは、issue #18（型で強制する削除）の修正で、削除の公開入口が
+#: ``ConfirmedEntry`` を要求する設計を Conditional Writes に 1 段落足し、
+#: `OwnRemoval` / `ForcedRemoval` の `unconfirmed` を Releasing の表へ、
+#: `--clean` の完全性判定を Corrupt Entries へ、幽霊退去の完全性ゲートを
+#: Ghost Detection へ、`rb run` 後始末の再列挙しない仕様を Wrapper Spec へ、
+#: `wait` の「その時点のポーリング」判定を Waiting へ、監査対応付けの
+#: nonce 不一致除外を History へ、それぞれ 1 段落ずつ足したためである。
+#: いずれも「今後も真であり続ける仕様」であって経緯ではない。
+#:
+#: 678 へ下げたのは、issue #9 の指摘を受けて 3 つの機能を削除したためである
+#: （`rb status` の資源 ID 引数、`--display` と表示名の併記、`_remove_matching`
+#: と旧い置き場 ``board/joins/`` の走査）。Resource Naming の表から表示名の列を、
+#: Board Schema の例から ``display`` フィールドを、Declaration Fields から
+#: `--display` を、それぞれ落とした。代わりに、nonce を持たない宣言をどう
+#: 扱うか（``rb status`` には出すが、消せるのは ``--force`` と ``--clean``
+#: だけ）を Conditional Writes に 1 段落足した——これも「今後も真であり
+#: 続ける仕様」であって経緯ではない。**上げっぱなしにしない**：機能を消せば
+#: 文書も軽くなるはずなので、実測に合わせて下げる。
+MAX_LINES = 678
 
 #: 公開しない文書。**公開物からここへリンクすると参照切れになる。**
 PRIVATE_DOCS = ("EXPERIMENTS.md", "STATUS.md", "tools/speak.py", "tools/speak_dict.json")
@@ -291,7 +321,19 @@ def test_public_documents_do_not_mention_removed_machinery() -> None:
     のは看板の問題である。実装の関数名と突き合わせるより、消した名前の禁止のほうが
     保守が楽で、実際に起きた取り残しは全部これで拾える。
     """
-    gone = ("try_claim", "rb join", "--primary", "add_join", "find_own_join", "JoinResult")
+    gone = (
+        "try_claim",
+        "rb join",
+        "--primary",
+        "add_join",
+        "find_own_join",
+        "JoinResult",
+        # issue #9: 資源引数を受け取る `rb status`、表示名を併記する仕組み、
+        # 中身の照合で消す旧形式の削除経路（消した理由は本文が別に説明する）。
+        "--display",
+        "naming.label",
+        "_remove_matching",
+    )
     for name in ("docs/DESIGN.md", "README.md", "README.en.md"):
         text = (ROOT / name).read_text(encoding="utf-8")
         for word in gone:

@@ -50,6 +50,23 @@ SHRANK = "shrank"
 """宣言の数が減った（誰かが解放した）。まだ他の宣言は残っている。"""
 
 TIMEOUT = "timeout"
+"""上限まで待った。**上限に達した、まさにその時点のポーリングで掲示板を完全に
+読めている**——だから「正常に読めた上でまだ使用中」と言い切れる。"""
+
+BROKEN = "broken"
+"""上限に達した、**その時点のポーリングで掲示板を完全に読めなかった**。
+
+``TIMEOUT`` と畳んではならない。``TIMEOUT`` は「（いま）確認した上でまだ使用中」
+だが、こちらは（いま）確認そのものが取れていない——「使用中」と「読めない」を
+混同すると、読めない掲示板を待ち続けた末に、確認していない使用中を報告する
+ことになる（issue #17 指摘 4）。
+
+**「過去に一度でも読めたか」は判定に使わない。** 待機の序盤だけ読めて、
+以後ずっと読めなくても上限に達したときの状態が未確認なら ``BROKEN`` を返す
+——最初の 1 回だけ読めたことを盾に「確認済みでまだ使用中」と答え続けるのは、
+確認できていない使用中を確認済みと偽ることになる（issue #18 指摘 7）。過去に
+確認できていた事実は捨てない——``wait_unconfirmed`` の監査ログに
+``previously_confirmed`` として残す。"""
 
 
 @dataclass(frozen=True)
@@ -91,6 +108,17 @@ class WaitResult:
 def holder_keys(board: Board, resource_id: str) -> set[str]:
     """その資源を宣言している者の集合を返す。**宣言は全て対等に数える。**
 
+    **完全性は捨てる。** 読めなかったものがあっても黙って飛ばす。``rb wait`` の
+    ように「空集合を積極的な成功（解放済み）と読む」場面では、必ず
+    :func:`holder_keys_detailed` を使うこと——読めない掲示板を「宣言が無い」に
+    畳むと、実際には使用中の資源を「解放済み」と答えてしまう（issue #17 指摘 4）。
+    """
+    return holder_keys_detailed(board, resource_id)[0]
+
+
+def holder_keys_detailed(board: Board, resource_id: str) -> tuple[set[str], bool]:
+    """:func:`holder_keys` と同じだが、**掲示板を完全に読めたか**も返す。
+
     **中身は見ない。** 誰が何人いるかだけを数える。増減が分かれば資源が空く方向に
     動いたかは判断でき、使用量の数値を解釈する必要がない。
 
@@ -98,10 +126,17 @@ def holder_keys(board: Board, resource_id: str) -> set[str]:
     宣言者が別セッションへ**交代しただけ**で「1 人消えた」に見える。件数は変わって
     いないのに ``rb wait`` が戻り、待っている側は入れないまま起こされる。
     nonce を持たない古い宣言だけ従来のキーで代替する。
+
+    Returns
+    -------
+    tuple of (set of str, bool)
+        キーの集合と、**掲示板を完全に読めたか**。``False`` のとき、返した集合は
+        過小である可能性がある——読めなかった側に宣言が隠れているかもしれない。
     """
+    listing = board.pairs_for_detailed(resource_id)
     boot = platform_info.boot_time()
     keys: set[str] = set()
-    for entry in board.list_for(resource_id):
+    for _, entry in listing.pairs:
         # **再起動をまたいだ宣言は数えない。** 確定的な幽霊であり、`rb claim` なら
         # 即座に退けて取れる。ここで数えると `rb wait` だけが上限まで待ち切って
         # 「まだ使用中です」と答える——同じ掲示板を見て 2 つのコマンドが逆のことを言う。
@@ -112,7 +147,7 @@ def holder_keys(board: Board, resource_id: str) -> set[str]:
         if boot is not None and since is not None and since < boot - liveness.BOOT_MARGIN:
             continue
         keys.add(entry.nonce or f"{entry.since}:{entry.session}")
-    return keys
+    return keys, listing.complete
 
 
 def wait_for_room(
@@ -151,17 +186,61 @@ def wait_for_room(
 
     Notes
     -----
-    掲示板が読めないときは「宣言が無い」とみなして解放扱いにする。
-    インフラの故障で永久に待たせるより通すほうがよい（fail-open）。
+    **掲示板が読めないことを「宣言が無い」に畳まない。** 以前はここで畳んでいた
+    ——インフラの故障で永久に待たせるより通すほうがよい、という判断自体は
+    正しいが、「通す」の中身が「解放済みという積極的な成功表現を返す」になって
+    いたのが誤りだった。読めない・部分的にしか読めない場合は**このポーリングを
+    無かったことにして次へ回す**（起こさない。件数が減った証拠を持たないため）。
+    **上限に達した、その時点のポーリングが読めていなければ** ``BROKEN`` で
+    区別する（issue #17 指摘 4）。序盤に一度読めていたことは判定に使わない
+    ——上限到達の直前でずっと読めなくなっていれば、それは未確認である
+    （issue #18 指摘 7）。fail-open は「待ち続ける」側であって「解放したと嘘を
+    つく」側ではない。
     """
     started = now()
     polls = 0
     baseline: set[str] | None = None
+    ever_confirmed = False  # **表示・監査用。** 過去に一度でも完全に読めたか。
+    # 「上限到達時の判定」には使わない——直近が読めていなければ、過去に読めた
+    # 事実は「いま使用中だと確認できている」ことの根拠にならない（issue #18 指摘 7）。
 
     while True:
-        keys = holder_keys(board, resource_id)
+        keys, complete = holder_keys_detailed(board, resource_id)
         polls += 1
         elapsed = (now() - started).total_seconds()
+
+        if not complete:
+            # **読めない・部分的にしか読めないポーリングは「変化なし」として扱う。**
+            # ここで空集合を信じて RELEASED を返すと、読めなかった側に生きた宣言が
+            # 隠れているかもしれないのに「解放済み」と積極的に言うことになる
+            # ——このツールが最も避けるべき「使用中を空きと言う」誤りである。
+            audit.append(
+                board.root,
+                "wait_unconfirmed",
+                resource=resource_id,
+                polls=polls,
+                elapsed_s=round(elapsed, 3),
+                previously_confirmed=ever_confirmed,
+            )
+            if elapsed >= timeout_s:
+                # **「一度でも読めたか」ではなく「いま読めているか」で判定する。**
+                # `confirmed` を一度立ったら戻らないフラグのままにすると、最初の
+                # 1 回だけ読めてそれ以降ずっと読めなくても `TIMEOUT`（＝確認済みで
+                # まだ使用中）と答えてしまう——上限到達の直前の窓で掲示板が壊れて
+                # いれば、それは「未確認」であって「確認済みで使用中」ではない
+                # （issue #18 指摘 7。過去に確認できていた事実は
+                # `previously_confirmed` として監査ログにだけ残す）。
+                return WaitResult(
+                    reason=BROKEN,
+                    polls=polls,
+                    waited_s=elapsed,
+                    last=first_declaration(board, resource_id),
+                    holders=len(keys),
+                )
+            sleep(min(interval_s, max(0.0, timeout_s - elapsed)))
+            continue
+
+        ever_confirmed = True
         if baseline is None:
             baseline = set(keys)
 

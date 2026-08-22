@@ -72,6 +72,32 @@ def join(board: Board, cwd: str) -> None:
     assert board.declare(entry)
 
 
+def wipe(board: Board, resource_id: str = RESOURCE, *, reason: str = "テストで解放") -> None:
+    """テストの後始末用: その資源の宣言を全部消す（``--force`` 相当）。
+
+    ``Board.remove_all`` は廃止した——資源名だけで何件消えるか決まる公開入口は
+    持たない（型で強制する設計）。テストは列挙してから
+    :meth:`Board.remove_selected` へ渡す形に合わせる。
+    """
+    selections = board.pairs_for_detailed(resource_id).confirmed()
+    board.remove_selected(resource_id, selections, reason=reason)
+
+
+def release_one(board: Board, cwd: str, *, reason: str) -> None:
+    """テストの後始末用: 特定の場所から出された宣言だけを消す。
+
+    ``Board.remove_own`` は ``declared``（完全性を確認済みの選択）が必須になった
+    ——``pairs_for_detailed().confirmed()`` から作って渡す。
+    """
+    board.remove_own(
+        RESOURCE,
+        cwd=cwd,
+        reason=reason,
+        nonce=_joined_nonce(board, cwd),
+        declared=board.pairs_for_detailed(RESOURCE).confirmed(),
+    )
+
+
 def audit_events(root: Path) -> list[dict[str, object]]:
     records = []
     for path in sorted((root / "audit").glob("*.jsonl")):
@@ -115,7 +141,7 @@ def test_returns_when_the_primary_is_released(tmp_path: Path) -> None:
         calls["n"] += 1
         fake.sleep(seconds)
         if calls["n"] == 3:
-            board.remove_all(RESOURCE, reason="テストで解放")
+            wipe(board)
 
     result = waiting.wait_for_room(
         board, RESOURCE, interval_s=5, timeout_s=1000, sleep=sleep, now=fake.now
@@ -140,12 +166,7 @@ def test_returns_when_a_joiner_leaves(tmp_path: Path) -> None:
         calls["n"] += 1
         fake.sleep(seconds)
         if calls["n"] == 2:
-            board.remove_own(
-                RESOURCE,
-                cwd=JOINER_CWD,
-                reason="テストで離脱",
-                nonce=_joined_nonce(board, JOINER_CWD),
-            )
+            release_one(board, JOINER_CWD, reason="テストで離脱")
 
     result = waiting.wait_for_room(
         board, RESOURCE, interval_s=5, timeout_s=1000, sleep=sleep, now=fake.now
@@ -199,7 +220,7 @@ def test_holder_replacement_is_not_a_shrink(tmp_path: Path) -> None:
         calls["n"] += 1
         fake.sleep(seconds)
         if calls["n"] == 2:
-            board.remove_all(RESOURCE, reason="テストで交代")
+            wipe(board, reason="テストで交代")
             assert board.declare(build_entry(RESOURCE, job="別のジョブ", session="malm"))
 
     result = waiting.wait_for_room(
@@ -226,15 +247,10 @@ def test_shrink_after_a_replacement_still_wakes(tmp_path: Path) -> None:
         calls["n"] += 1
         fake.sleep(seconds)
         if calls["n"] == 1:
-            board.remove_all(RESOURCE, reason="テストで交代")
+            wipe(board, reason="テストで交代")
             assert board.declare(build_entry(RESOURCE, job="別のジョブ", session="malm"))
         if calls["n"] == 3:
-            board.remove_own(
-                RESOURCE,
-                cwd=JOINER_CWD,
-                reason="テストで離脱",
-                nonce=_joined_nonce(board, JOINER_CWD),
-            )
+            release_one(board, JOINER_CWD, reason="テストで離脱")
 
     result = waiting.wait_for_room(
         board, RESOURCE, interval_s=5, timeout_s=1000, sleep=sleep, now=fake.now
@@ -260,12 +276,7 @@ def test_growth_then_shrink_still_wakes(tmp_path: Path) -> None:
         if calls["n"] == 1:
             join(board, JOINER_CWD)
         if calls["n"] == 3:
-            board.remove_own(
-                RESOURCE,
-                cwd=JOINER_CWD,
-                reason="テストで離脱",
-                nonce=_joined_nonce(board, JOINER_CWD),
-            )
+            release_one(board, JOINER_CWD, reason="テストで離脱")
 
     result = waiting.wait_for_room(
         board, RESOURCE, interval_s=5, timeout_s=1000, sleep=sleep, now=fake.now
@@ -346,13 +357,187 @@ def test_release_is_audited(tmp_path: Path) -> None:
 
 
 def test_unreadable_board_is_treated_as_released(tmp_path: Path) -> None:
-    """掲示板が読めないときは通す。
+    """**ディレクトリがまだ無い**（＝誰も宣言していない）ときは通す。
 
-    インフラの故障で永久に待たせるより、通すほうがよい（fail-open）。
+    ``Board.declarations_detailed`` は ``FileNotFoundError``（ディレクトリが無い）を
+    「読めない」ではなく「空」として扱う（``_json_files`` の docstring 参照）。
+    これは fail-open の対象ではなく、正規の「空の掲示板」である。
     """
     result = wait(Board(tmp_path / "存在しない"), FakeClock())
 
     assert result.reason == waiting.RELEASED
+
+
+# --- 読めない掲示板を「解放済み」と言わない（issue #17 指摘 4） --------------------
+
+
+def _make_board_unreadable(tmp_path: Path) -> Board:
+    """**本当に**読めない掲示板を作る（ディレクトリが通常ファイルになっている）。
+
+    ``存在しない`` ディレクトリ（上のテスト）とは違い、``os.scandir`` が
+    ``NotADirectoryError`` を投げる——``_json_files`` はこれを「読めない」と
+    区別して報告する。
+    """
+    (tmp_path / "board").write_text("これはディレクトリではない", encoding="utf-8")
+    return Board(tmp_path)
+
+
+def test_a_genuinely_unreadable_board_is_not_treated_as_released(tmp_path: Path) -> None:
+    """**本当に読めない**掲示板は「解放済み」と積極的に言わない。
+
+    以前は ``holder_keys``（読めなかったものを黙って飛ばす）を使っていたので、
+    掲示板全体が読めなくても空集合になり、``RELEASED``（最も積極的な成功表現）を
+    返していた。使用中の資源が「解放済み」に化ける、このツールが最も避けるべき
+    誤りである。一度も確認できないまま上限に達すれば ``BROKEN`` になる。
+    """
+    board = _make_board_unreadable(tmp_path)
+
+    result = wait(board, FakeClock(), timeout_s=25, interval_s=10)
+
+    assert result.reason != waiting.RELEASED
+    assert result.reason == waiting.BROKEN
+
+
+def test_wait_does_not_report_released_when_the_board_goes_unreadable_mid_wait(
+    tmp_path: Path,
+) -> None:
+    """**待機の途中で**読めなくなっても、直前まで使用中だったことを「解放」に変えない。
+
+    最初のポーリングで生きた宣言を確認できたのに、途中から読めなくなると
+    ``holder_keys`` は空集合を返す——それを「全部消えた」と早合点すると、
+    実際にはまだ動いているジョブの資源を奪いにいくことになる。
+
+    **上限に達した時点でも読めないままなら ``BROKEN``。** 以前のこのテストは
+    ここで ``TIMEOUT`` を期待していた——「最初の 1 回だけ読めれば、以後
+    ずっと読めなくても『確認済みでまだ使用中』と答えてよい」という**誤った
+    意味を仕様として固定していた**（issue #18 指摘 7。Codex 3 回目レビューの
+    「最も重い所見」）。``TIMEOUT`` は「（いま）確認できている」ことを意味する
+    ので、上限到達の瞬間に読めていないなら、それは未確認であって使用中の
+    確認ではない。
+    """
+    board = Board(tmp_path)
+    declare(board)
+    fake = FakeClock()
+
+    def sleep(seconds: float) -> None:
+        fake.sleep(seconds)
+        # 最初のポーリングの後、掲示板を壊す。**以後ずっと読めないままにする**
+        # ——「最初だけ読めた」事実だけを根拠に判定してはならないことを検査する。
+        if not (tmp_path / "board").is_dir():
+            return
+        import shutil
+
+        shutil.rmtree(tmp_path / "board")
+        (tmp_path / "board").write_text("壊れた", encoding="utf-8")
+
+    result = waiting.wait_for_room(
+        board, RESOURCE, interval_s=10, timeout_s=30, sleep=sleep, now=fake.now
+    )
+
+    assert result.reason != waiting.RELEASED, "読めなくなった掲示板を解放済みと言っている"
+    # 上限到達の時点で読めていないので、確認できていない使用中を「確認済み」
+    # （TIMEOUT）と偽ってはならない。
+    assert result.reason == waiting.BROKEN
+
+
+def test_wait_returns_timeout_when_the_board_recovers_before_the_deadline(
+    tmp_path: Path,
+) -> None:
+    """**上限到達の直前に読めるようになっていれば** ``TIMEOUT``（確認済みで使用中）。
+
+    ``BROKEN`` になるのは「上限に達した、その時点で読めない」場合だけであり、
+    途中で一時的に読めなくなっても、最後に読めていれば ``TIMEOUT`` に戻る
+    ことを対照として固定する（前のテストと対をなす）。
+    """
+    board = Board(tmp_path)
+    declare(board)
+    fake = FakeClock()
+    calls = {"n": 0}
+
+    def sleep(seconds: float) -> None:
+        calls["n"] += 1
+        fake.sleep(seconds)
+        if calls["n"] == 1:
+            # 2 回目のポーリングだけ読めなくする。
+            import shutil
+
+            shutil.rmtree(tmp_path / "board")
+            (tmp_path / "board").write_text("壊れた", encoding="utf-8")
+        elif calls["n"] == 2:
+            # 3 回目までに元へ戻す（回復）。
+            (tmp_path / "board").unlink()
+            declare(board)
+
+    result = waiting.wait_for_room(
+        board, RESOURCE, interval_s=10, timeout_s=30, sleep=sleep, now=fake.now
+    )
+
+    assert result.reason == waiting.TIMEOUT
+
+
+def test_wait_for_room_distinguishes_broken_from_timeout(tmp_path: Path) -> None:
+    """**一度も確認できないまま**上限に達したときだけ ``BROKEN``。
+
+    ``TIMEOUT`` は「正常に読めた上でまだ使用中」を意味する。読めたことが 1 度も
+    無ければ、その確認自体が取れていないので同じ値にしてはならない
+    （``waiting.BROKEN`` の docstring 参照）。
+    """
+    board = _make_board_unreadable(tmp_path)
+    fake = FakeClock()
+
+    result = waiting.wait_for_room(
+        board, RESOURCE, interval_s=5, timeout_s=20, sleep=fake.sleep, now=fake.now
+    )
+
+    assert result.reason == waiting.BROKEN
+    assert result.reason != waiting.TIMEOUT
+
+
+def test_wait_unconfirmed_polls_are_audited(tmp_path: Path) -> None:
+    """読めなかったポーリングも監査ログに残す（沈黙は成功ではない）。"""
+    board = _make_board_unreadable(tmp_path)
+    fake = FakeClock()
+
+    waiting.wait_for_room(
+        board, RESOURCE, interval_s=5, timeout_s=10, sleep=fake.sleep, now=fake.now
+    )
+
+    events = audit_events(tmp_path)
+    assert any(r.get("event") == "wait_unconfirmed" for r in events)
+    # **`wait_released` を書いてはならない。** 読めなかったのに「解放した」と
+    # いう積極的な事象を監査ログへ残すのは、まさに避けたい嘘である。
+    assert not any(r.get("event") == "wait_released" for r in events)
+
+
+def test_holder_keys_detailed_reports_incompleteness(tmp_path: Path) -> None:
+    """``holder_keys_detailed`` は完全性を返す。``holder_keys`` はそれを捨てるだけ。"""
+    board = _make_board_unreadable(tmp_path)
+
+    keys, complete = waiting.holder_keys_detailed(board, RESOURCE)
+
+    assert complete is False
+    assert keys == set()
+    assert waiting.holder_keys(board, RESOURCE) == set()  # 互換の後方経路も壊れていない
+
+
+def test_cmd_wait_returns_exit_broken_for_an_unreadable_board(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CLI 越しに ``rb wait`` を呼ぶと、読めない掲示板で ``EXIT_BROKEN`` を返す。
+
+    入口の近道（``holder_keys`` が空なら即座に「解放済み」と答える）を、読めない
+    ときに取っていないかも合わせて確かめる——取っていれば ``EXIT_OK`` になり、
+    メッセージに「既に解放されています」が出るはずである。
+    """
+    from resource_broker import cli
+
+    _make_board_unreadable(tmp_path)
+
+    code = main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0"])
+
+    assert code == cli.EXIT_BROKEN
+    out = capsys.readouterr().out
+    assert "既に解放されています" not in out, "読めないのに入口の近道を取っている"
 
 
 # --- 待っている側に逃げ道を示す ---------------------------------------------------
@@ -496,9 +681,29 @@ def test_a_broken_wait_is_distinguishable_from_a_timeout(
     hold_gpu(tmp_path) if not Board(tmp_path).list_for(RESOURCE) else None
     timed_out = main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0"])
 
-    assert broken == cli.EXIT_WAIT_BROKEN
+    assert broken == cli.EXIT_BROKEN
     assert timed_out == cli.EXIT_BUSY
     assert broken != timed_out
+
+
+def test_exit_broken_keeps_its_original_value_after_the_rename() -> None:
+    """``EXIT_WAIT_BROKEN`` → ``EXIT_BROKEN`` への改名は**値を変えていない**。
+
+    値 3 は ``wait`` 専用だった頃から外部（呼び出し側のシェルスクリプト等）が
+    見ている可能性がある。カテゴリを一般化する（``release --nonce`` にも使う）
+    のは値の意味を広げるだけであり、既存の値そのものを変えてはならない。
+    シンボル名だけを比較するテストは、両方が一緒に動いてしまえば検出力を
+    持たない——ここでは文字どおりの値を固定する。
+    """
+    from resource_broker import cli
+
+    assert cli.EXIT_BROKEN == 3
+    assert cli.EXIT_BROKEN not in (
+        cli.EXIT_OK,
+        cli.EXIT_BUSY,
+        cli.EXIT_USAGE,
+        cli.EXIT_INTERRUPTED,
+    )
 
 
 def test_a_reboot_ghost_does_not_keep_wait_running(
@@ -537,7 +742,7 @@ def test_a_release_and_a_shrink_both_exit_zero_through_the_cli(
 
     「全部消えた」も「1 つ減った」も待機としては成功で、呼び出し側への合図は同じ
     **「もう一度自分で調べろ」**である。上限到達（``EXIT_BUSY``）や内部エラー
-    （``EXIT_WAIT_BROKEN``）と畳まない——対処が違う。
+    （``EXIT_BROKEN``）と畳まない——対処が違う。
     """
     from resource_broker import cli
 
@@ -557,4 +762,4 @@ def test_a_release_and_a_shrink_both_exit_zero_through_the_cli(
 
     assert released == cli.EXIT_OK
     assert shrank == cli.EXIT_OK, "宣言が減っただけの復帰を成功として扱っていない"
-    assert cli.EXIT_OK not in (cli.EXIT_BUSY, cli.EXIT_WAIT_BROKEN)
+    assert cli.EXIT_OK not in (cli.EXIT_BUSY, cli.EXIT_BROKEN)

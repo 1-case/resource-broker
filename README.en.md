@@ -157,12 +157,12 @@ $ rb history GPU0
 `--eta` is mandatory **not because an accurate number is wanted, but to force one moment of
 thought**. The tool never acts on it — not for ghost detection, not for cutting off a wait.
 
-**Always check the board with bare `rb status` (all entries). Never query a single name.**
+**Always check the board with `rb status` (all entries). It does not take a resource ID.**
 A bulletin board is something you read in full; it is not an index you look names up in.
 One machine does not have many resources, so reading everything is free. Resource IDs are
 free text, so spellings drift — `GPU0` and `gpu0` are *different resources* — and a name
-lookup silently answers "free" while someone holds the other spelling. This actually happened:
-a job held `gpu0` for 7.3 hours while `rb status GPU0` reported it free.
+lookup used to silently answer "free" while someone held the other spelling. `rb status`
+used to accept a resource ID; that path is gone now, so every check reads the whole board.
 
 ## Hooks
 

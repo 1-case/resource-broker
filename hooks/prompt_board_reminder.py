@@ -42,7 +42,7 @@ IDLE_BUDGET_CHARS = 60
 
 #: 自由記述フィールドのバイト長上限。
 #:
-#: ``job`` / ``display`` / ``session`` は掲示板に**長さも改行も制御文字も制限されずに**
+#: ``job`` / ``session`` は掲示板に**長さも改行も制御文字も制限されずに**
 #: 保存され、そのまま全セッションのモデル文脈へ入る。上限が無いと、1 つのセッションが
 #: 巨大な文字列や命令文を申告するだけで、**他の全セッションへの prompt injection または
 #: 文脈の圧迫**が成立する。``MAX_ENTRIES`` は件数しか制限しない。
@@ -64,27 +64,19 @@ HOST_SEP = "::"
 
 
 def board_label(entry: dict[str, object]) -> str:
-    """通知に出す見出し。**資源 ID を必ず含める。**
+    """通知に出す見出し。**資源 ID だけである。**
 
-    ``display`` は「UUID を読みやすくするための資源の別名」であって、資源の
-    同一性を置き換えるものではない。置き換えを許すと、``display`` にジョブ名が
-    入った瞬間に「どの資源が押さえられているか」が通知から消える。
-
-    実運用で ``display`` が ``malm E017 学習`` になり、GPU0 が押さえられている
-    ことが全セッションの通知から見えなくなった。取得の排他は資源 ID で効くので
-    衝突そのものは起きないが、**掲示板は読まれて初めて意味を持つ**。読めない通知は
-    通知が無いのと変わらない。
+    別名を併記する仕組み（``display``）はかつて存在したが、実運用で 2 度とも
+    ジョブ名が入り、通知から資源 ID が読み取れなくなった。しかも資源 ID は
+    自由記述で括弧を含む ID が実在するため、合成した見出しと本物の資源 ID が
+    書式で区別できず、逆向きの誤読も生んだ（issue #9）。仕組みごと廃止し、
+    見出しは資源 ID だけにする。
 
     :func:`clip` と同じく、この関数は各フックへ意図的に重複させてある。
     """
     resource = entry.get("resource")
     base = clip(str(resource).split(HOST_SEP, 1)[-1] if resource else "", MAX_NAME_BYTES)
-    display = clip(entry.get("display"), MAX_NAME_BYTES)
-    if not base:
-        return display or "?"
-    if not display or display == base:
-        return base
-    return f"{base}（{display}）"
+    return base or "?"
 
 
 #: これを設定すると 3 つのフックとも即座に黙る（値は何でもよい。空文字は無効扱い）。
@@ -236,23 +228,24 @@ def read_entries(root: Path) -> list[dict[str, object]]:
     collected: list[dict[str, object]] = []
     unreadable = False
 
-    # 旧い置き場（``board/joins/``）も同じ宣言として読む。形式を変えた瞬間に
-    # 稼働中のセッションの宣言を見失わないためである。
-    for directory in (board, board / "joins"):
-        paths, failed = json_files(directory)
-        unreadable = unreadable or failed
-        for path in paths:
-            try:
-                text = path.read_text(encoding=ENCODING)
-            except OSError:
-                unreadable = True  # 読めないのは「壊れている」とは別の事実
-                continue
-            try:
-                data = json.loads(text)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            if isinstance(data, dict) and data.get("resource"):
-                collected.append(data)
+    # **``board/joins/`` はもう走査しない。** 旧形式の相乗りを見失わないための
+    # 経路だったが、監査ログで宣言の寿命を実測すると中央値 5.4 分・最長 2.1 時間
+    # だった（issue #9）。とうにその窓を過ぎている旧ディレクトリを読み続ける
+    # 理由が無い。
+    paths, failed = json_files(board)
+    unreadable = unreadable or failed
+    for path in paths:
+        try:
+            text = path.read_text(encoding=ENCODING)
+        except OSError:
+            unreadable = True  # 読めないのは「壊れている」とは別の事実
+            continue
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("resource"):
+            collected.append(data)
 
     collected.sort(key=lambda item: str(item.get("since") or ""))
 
@@ -291,7 +284,7 @@ def build_notice(entries: list[dict[str, object]]) -> str:
         return f"[rb] 宣言なし。{RULE}"
 
     rows: list[str] = []
-    # 見出しは board_label で作る。**資源 ID を display で置き換えない。**
+    # 見出しは board_label で作る。**資源 ID だけである。**
     for entry in entries:
         dropped = entry.get("_dropped")
         if isinstance(dropped, int):
