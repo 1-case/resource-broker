@@ -136,6 +136,9 @@ Requires [uv](https://docs.astral.sh/uv/) for this path.
 tool enforces.**
 
 ```console
+# Check which version is running, and from where (there are two install paths)
+$ rb --version
+
 # Wrapper: declares, logs, and always releases on exit (recommended)
 $ rb run --res GPU0 --job "E059 eval" --observed "nvidia-smi: 0 compute processes" \
          --eta 40m --found free -- python train.py

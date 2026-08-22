@@ -1,6 +1,6 @@
 [project]
 name = "resource-broker"
-version = "0.2.0"
+dynamic = ["version"]
 description = "複数の Claude Code セッション間で有限資源の使用状況を共有する掲示板"
 readme = "README.md"
 license = "Apache-2.0"
@@ -24,6 +24,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/resource_broker"]
+
+# 版の正本は src/resource_broker/__init__.py の __version__ である。ここに手書きの
+# version を置かない（動的版と併存させると、更新されない側が静かに腐る）。
+[tool.hatch.version]
+path = "src/resource_broker/__init__.py"
 
 [dependency-groups]
 dev = ["pytest", "ruff"]

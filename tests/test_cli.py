@@ -10,6 +10,7 @@ GPU も COM ポートも、テストから見れば単なる文字列の ID で�
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -18,6 +19,10 @@ import pytest
 from resource_broker.board import Board, build_entry
 from resource_broker.cli import main
 from resource_broker.naming import normalize
+
+#: リポジトリのルート。``__init__.py`` を正本として読み直すために使う
+#: （固定値と比較すると、正本だけ書き換えて CLI 側を取り残しても気づけない）。
+_ROOT = Path(__file__).resolve().parent.parent
 
 
 def run(tmp_path: Path, *args: str) -> int:
@@ -475,3 +480,95 @@ def test_our_output_is_utf8_regardless_of_the_console(monkeypatch: pytest.Monkey
     main(["status", "--home", "no-such-board"])
 
     assert seen == ["utf-8", "utf-8"], seen
+
+
+# --- rb --version（issue #11）------------------------------------------------------
+
+
+def _init_py_version() -> str:
+    """``__init__.py`` を直接読んで ``__version__`` を取り出す。
+
+    import すると `sys.path` 経由で入った古いビルドを掴む可能性があり、また
+    この検査自身がパッケージを import できる前提を増やす。``docs/DESIGN.md`` の
+    版一致検査（``tests/test_design_scope.py``）と同じ流儀でテキストとして読む。
+    """
+    init_py = (_ROOT / "src" / "resource_broker" / "__init__.py").read_text(encoding="utf-8")
+    match = re.search(r'^__version__ = "([^"]+)"', init_py, re.M)
+    assert match, "__init__.py に __version__ が無い"
+    return match.group(1)
+
+
+def test_version_matches_init_py(capsys: pytest.CaptureFixture[str]) -> None:
+    """``rb --version`` は ``__init__.py`` の ``__version__`` と同じ文字列を出す。
+
+    **固定値と比較しない。** 固定値だと ``__init__.py`` だけを書き換えて CLI 側の
+    参照を取り残しても検査が気づけない（版が 4 箇所目で取り残された前科がある）。
+    """
+    expected = _init_py_version()
+
+    assert main(["--version"]) == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[0] == f"resource-broker {expected}", out
+
+
+def test_version_reports_the_package_directory(capsys: pytest.CaptureFixture[str]) -> None:
+    """出力の 2 行目に実行元のパッケージディレクトリが入っている。
+
+    **版だけでは 2 経路（``uv tool install`` / プラグイン）の取り違えを解けない**
+    （issue #11）。どちらが動いているかを解くのがこのフィールドの目的である。
+    """
+    assert main(["--version"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+
+    assert len(lines) == 2, lines
+    package_dir = Path(lines[1])
+    assert package_dir.is_dir(), lines
+    assert package_dir.name == "resource_broker"
+    assert (package_dir / "cli.py").is_file()
+
+
+def test_version_works_without_a_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
+    """サブコマンド無しで動く。終了コードは 0。
+
+    サブパーサは ``required=True`` なので、``--version`` を素通しできないと
+    「the following arguments are required: command」で 2 が返る（issue #11 の再現）。
+    """
+    assert main(["--version"]) == 0
+    assert capsys.readouterr().out
+
+
+def test_version_never_reads_a_broken_board(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--home`` が壊れた掲示板を指していても版は答えられる（掲示板を読まないことの回帰）。
+
+    ``board`` の場所へディレクトリの代わりに通常ファイルを置くと、掲示板を触る経路は
+    軒並み ``OSError`` になる（``test_status_never_calls_an_unreadable_board_empty`` と
+    同じ仕掛け）。それでも ``--version`` は答えられなければならない。
+    """
+    (tmp_path / "board").write_text("これはディレクトリではない", encoding="utf-8")
+
+    assert main(["--home", str(tmp_path), "--version"]) == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[0] == f"resource-broker {_init_py_version()}", out
+
+
+def test_version_never_touches_the_board(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--version`` は ``Board`` に一切触れない（構造的な確認）。
+
+    掲示板は fail-open なので、実際に壊れたファイルを置くだけでは「触れたが黙って
+    読み流した」を見分けられない（``test_version_never_reads_a_broken_board`` は
+    それでも動くこと自体は確かめるが、触れていないことまでは証明しない）。ここは
+    ``Board`` を触れた瞬間に落ちる毒に差し替え、構造として触れていないことを確かめる。
+    """
+
+    class Poison:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("rb --version が掲示板 (Board) に触れた")
+
+    monkeypatch.setattr("resource_broker.cli.Board", Poison)
+
+    assert main(["--home", "irrelevant", "--version"]) == 0
+    assert capsys.readouterr().out.startswith("resource-broker ")

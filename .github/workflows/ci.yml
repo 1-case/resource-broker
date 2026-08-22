@@ -115,7 +115,9 @@ jobs:
       - name: Validate the plugin manifest
         run: npx --yes @anthropic-ai/claude-code plugin validate .
 
-  # 版が 4 箇所に散っている。ずれると /plugin が古い版を表示し続け、更新が届かない。
+  # 版が 3 箇所に散っている。ずれると /plugin が古い版を表示し続け、更新が届かない。
+  # 基準は __init__.py の __version__（pyproject.toml は動的版に移したので手書きの
+  # 正本ではない）。
   manifests:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -127,13 +129,15 @@ jobs:
           import json, pathlib, re, sys
           plugin = json.loads(pathlib.Path(".claude-plugin/plugin.json").read_text(encoding="utf-8"))["version"]
           market = json.loads(pathlib.Path(".claude-plugin/marketplace.json").read_text(encoding="utf-8"))["plugins"][0]["version"]
-          pyproj = re.search(r'^version = "([^"]+)"', pathlib.Path("pyproject.toml").read_text(encoding="utf-8"), re.M).group(1)
           init = re.search(
               r'^__version__ = "([^"]+)"',
               pathlib.Path("src/resource_broker/__init__.py").read_text(encoding="utf-8"),
               re.M,
           ).group(1)
-          if not plugin == market == pyproj == init:
-              sys.exit(f"version mismatch: plugin={plugin} marketplace={market} pyproject={pyproj} init={init}")
+          if not plugin == market == init:
+              sys.exit(f"version mismatch: plugin={plugin} marketplace={market} init={init}")
+          pyproject = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+          if re.search(r'^version = "', pyproject, re.M):
+              sys.exit("pyproject.toml has a hand-written version; the source of truth is __init__.py")
           print(f"version ok: {plugin}")
           PY

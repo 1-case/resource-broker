@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import clock, liveness, naming, platform_info, runner, waiting
+from . import __version__, clock, liveness, naming, platform_info, runner, waiting
 from .board import (
     Board,
     BoardListing,
@@ -129,6 +129,51 @@ FOUND_CHOICES: dict[str, bool | None] = {"busy": True, "free": False, "unknown":
 
 #: 子プロセスの起動。テストで差し替える（実プロセスを起動しないため）。
 SPAWN: runner.Spawn = runner.default_spawn
+
+
+def _version_string() -> str:
+    """``rb --version`` が出す文字列を組み立てる。
+
+    **配布経路が 2 つある**（``uv tool install`` と Claude Code プラグイン）ため、
+    版だけでは今動いている ``rb`` がどちらから来たか解けない（issue #11）。
+    実行元のパッケージディレクトリを併記し、そこを解けるようにする。
+
+    版は ``importlib.metadata`` ではなく ``__init__.py`` の ``__version__`` から
+    直接読む。プラグイン経由の実行には配布メタデータが無く、``importlib.metadata`` は
+    ``PackageNotFoundError`` になる（実測済み）。
+    """
+    package_dir = Path(__file__).resolve().parent
+    return f"resource-broker {__version__}\n{package_dir}"
+
+
+class _VersionAction(argparse.Action):
+    """``--version``: 版と実行元のパッケージディレクトリを表示して終了する。
+
+    標準の ``action="version"`` は使わない。文字列を ``HelpFormatter`` に通すため、
+    埋め込んだ改行が空白に潰されて折り返され、Windows のパス（バックスラッシュ区切り）が
+    行の途中で千切れる（実測）。ここは折り返しをかけずにそのまま出す。
+    """
+
+    def __init__(
+        self,
+        option_strings: list[str],
+        dest: str = argparse.SUPPRESS,
+        default: str = argparse.SUPPRESS,
+        help: str | None = None,  # noqa: A002 - argparse.Action の引数名に合わせる
+    ) -> None:
+        super().__init__(
+            option_strings=option_strings, dest=dest, default=default, nargs=0, help=help
+        )
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        print(_version_string())
+        parser.exit()
 
 
 def assess_detailed(
@@ -1976,6 +2021,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--home", default=None, help="掲示板のルート（既定は環境依存）")
+    # **サブコマンドより前に処理させる。** ``_VersionAction`` は出会った時点で即座に
+    # 表示して終了する（``nargs=0`` + ``parser.exit()``）ため、``required=True`` の
+    # サブパーサ検査には到達しない——``rb --version`` がサブコマンド無しで動く理由は
+    # ここにある。版だけを答えるので、掲示板（``--home``）には一切触れない（壊れていても
+    # 答えられる）。
+    parser.add_argument(
+        "--version",
+        action=_VersionAction,
+        help="版と実行元のパッケージディレクトリを表示して終了する",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     status = sub.add_parser(
