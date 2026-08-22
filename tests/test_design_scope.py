@@ -61,7 +61,10 @@ DESIGN = ROOT / "docs" / "DESIGN.md"
 #: だけ）を Conditional Writes に 1 段落足した——これも「今後も真であり
 #: 続ける仕様」であって経緯ではない。**上げっぱなしにしない**：機能を消せば
 #: 文書も軽くなるはずなので、実測に合わせて下げる。
-MAX_LINES = 678
+#:
+#: 684 へ上げたのは、``rb --version`` の仕様（版と実行元のパッケージディレクトリ
+#: を出力する仕様）を Version 節として足したためである。
+MAX_LINES = 684
 
 #: 公開しない文書。**公開物からここへリンクすると参照切れになる。**
 PRIVATE_DOCS = ("EXPERIMENTS.md", "STATUS.md", "tools/speak.py", "tools/speak_dict.json")

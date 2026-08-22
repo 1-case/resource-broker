@@ -64,7 +64,7 @@ src/resource_broker/
   board.py / liveness.py      掲示板の読み書き（O_EXCL・nonce の CAS・ロック） / 幽霊判定（純粋関数）
   audit.py / platform_info.py 監査ログの追記 / boot time・PID 生存・ホスト名（OS 依存の隔離）
   runner.py / waiting.py      子プロセスの起動とログの強制 / 宣言が減るまで待つ
-  cli.py                      status / claim / release / run / update / wait / history
+  cli.py                      status / claim / release / run / update / wait / history / --version
 hooks/  stdlib のみ・常に exit 0・何も止めない
         sessionstart_notice.py / prompt_board_reminder.py / pretooluse_notice.py / hooks.json
 bin/    rb / rb.cmd / rb-hook / rb-hook.cmd / rb.py（インストール不要の起動口）
@@ -110,7 +110,7 @@ uv run rb run --res GPU0 --job "E009 学習" --observed "..." --eta 40m -- uv ru
 ### Architecture
 
 ```
-  ┌─ CLI ────── status / claim / release / run / update / wait / history（能動的に使う）
+  ┌─ CLI ────── status / claim / release / run / update / wait / history / --version（能動的に使う）
   ├─ 掲示板（資源ごとに 1 ファイル、JSON） ← 真実の単一情報源
   └─ フック（user スコープ / プラグイン） ── 気づき（**何も止めない**。詳細は「Hook Spec」）
 ```
@@ -124,6 +124,12 @@ uv run rb run --res GPU0 --job "E009 学習" --observed "..." --eta 40m -- uv ru
 | 排他区間のロック | `board/<safe-name>.lock`。資源ごとに 1 つ |
 | 待機列 | **未実装（Phase 4 の予定）**。`<safe-name>.waiters.jsonl`（append-only）を想定する |
 | 監査ログ / ログ | `audit\` と `logs\` を同じルートに置く（他セッションから読めることが要件）。どちらも追跡対象外 |
+
+### Version (`rb --version`)
+
+**版と実行元のパッケージディレクトリ**を出す。版だけでは足りない — 配布経路が 2 つあり（プラグインと `uv tool install`）、PATH の順序でどちらかが黙って勝つため、版の一致だけでは今動いている `rb` がどちらの経路かを解けない。実行元のパスを併記して初めて取り違えを解ける。**掲示板には一切触れない** — 掲示板が壊れていても版は答えられなければならないからである。
+
+版の正本は `src/resource_broker/__init__.py` の `__version__` である。`importlib.metadata` は使わない — プラグイン経路には配布メタデータが無く `PackageNotFoundError` になる。手書きは 3 箇所（`__init__.py` / `plugin.json` / `marketplace.json`）に残る。`pyproject.toml` は動的版（`[tool.hatch.version]`、正本は `__init__.py`）へ移したので対象から外れた。**1 箇所にはできない** — `.claude-plugin/*.json` は wheel に同梱されないため `uv tool install` の実行時には存在せず読めず、逆に静的な JSON は何も実行できない。Python の実行時世界とプラグインカタログの世界は、ビルド段を挟まずには繋がらない。3 箇所の一致は機械検査で保つ。
 
 #### Conditional Writes (CAS)
 
