@@ -61,6 +61,12 @@ EXIT_INTERRUPTED = 130
 #: 値を新設せず既存の意味を広げる側を取った。
 EXIT_BROKEN = 3
 
+#: ``EXIT_BROKEN`` の旧名（``wait`` 専用だった頃の名前）。**削除しない。**
+#: 値を一般化した際にシンボルごと消すと、``from resource_broker.cli import
+#: EXIT_WAIT_BROKEN`` としていた Python 側の利用者を壊す（issue #17 指摘 7）。
+#: 新規のコードは ``EXIT_BROKEN`` を使うこと——この名前は互換のためだけに残す。
+EXIT_WAIT_BROKEN = EXIT_BROKEN
+
 #: ``--found`` の受け付ける値と、それが表す実測の結論。
 FOUND_CHOICES: dict[str, bool | None] = {"busy": True, "free": False, "unknown": None}
 
@@ -125,14 +131,14 @@ def _known_resources_detailed(board: Board) -> tuple[list[str], bool]:
     **実際には使われている資源を空きとして配る**（DESIGN.md「Liveness Judgment」の
     非対称性の裏返しであり、断定してよい側ではない）。
     """
-    entries, unreadable = board.list_all_detailed()
+    listing = board.list_all_detailed()
     resources: list[str] = []
     seen: set[str] = set()
-    for entry in entries:
+    for entry in listing.entries:
         if entry.resource not in seen:
             seen.add(entry.resource)
             resources.append(entry.resource)
-    return resources, unreadable
+    return resources, not listing.complete
 
 
 @dataclass(frozen=True)
@@ -743,7 +749,14 @@ def _cmd_wait(args: argparse.Namespace) -> int:
     # **入口の基準を本体（wait_for_room）とそろえる。** 主宣言だけを見ると、
     # 相乗りだけが残った資源で「既に解放されています」と答えてしまう。
     # 実際に使っている者がいるのに解放と報告するのが最も危ない誤りである。
-    if not waiting.holder_keys(board, resource_id):
+    #
+    # **完全に読めたときだけ、この近道を取る。** 読めなかった側に生きた宣言が
+    # 隠れているかもしれないのに「既に解放されています」と積極的な成功表現を
+    # 返していた（issue #17 指摘 4）。読めなければ近道を諦めて素直に待機へ入る
+    # ——``wait_for_room`` 自身が「読めないポーリング」を「解放済み」に取り違えない
+    # ようになっているので、待機に入れば誤りは起きない。
+    keys, complete = waiting.holder_keys_detailed(board, resource_id)
+    if complete and not keys:
         print(f"既に解放されています: {naming.display_default(resource_id)}")
         return EXIT_OK
 
@@ -786,6 +799,19 @@ def _cmd_wait(args: argparse.Namespace) -> int:
         )
         print("入れるかどうかは自分で調べて判断すること。駄目ならもう一度 rb wait すればよい")
         return EXIT_OK
+
+    if result.reason == waiting.BROKEN:
+        # **一度も掲示板を完全に読めないまま上限に達した。** `TIMEOUT`（正常に
+        # 読めた上でまだ使用中）とは違い、使用中かどうかの確認そのものが取れて
+        # いない。ここで `EXIT_BUSY` を返すと「確認した上で使用中」と偽ることに
+        # なるので、`EXIT_BROKEN` で区別する（issue #17 指摘 4）。
+        print(
+            f"掲示板を読めないまま上限に達しました（{result.polls} 回確認"
+            f" / {result.waited_s:.0f} 秒）。使用中かどうかは未確認です",
+            file=sys.stderr,
+        )
+        print(WAIT_ADVICE, file=sys.stderr)
+        return EXIT_BROKEN
 
     # **上限で戻るときこそ助言が要る。** ここで黙ると、待っている側は同じ待機を
     # 繰り返すしかない。掲示板が古いまま固まっている場合、そこから抜ける道は
@@ -830,29 +856,42 @@ def _format_duration(seconds: float) -> str:
     return f"{hours}h{rest:02d}m"
 
 
-def _pair_key(record: dict) -> tuple[str, str, str]:
-    """対応付けの鍵。資源ごとに、宣言と解放を突き合わせる。
+def _nonce_key(record: dict) -> tuple[str, str] | None:
+    """nonce による厳密な対応付けの鍵。**両方が nonce を持つときだけ**使う。
 
-    **nonce が両方にあれば nonce で決め打つ。** nonce は宣言ごとに一意なので、
-    同じ資源・同じ job の宣言が並行して走っていても取り違えない——job だけを鍵に
-    すると、``--nonce`` で片方だけを消したときに、時刻順で先に来た**別の宣言**
-    （まだ生きているほう）に解放が結び付いてしまう（「消していない方が消えたことに
-    なり、消した方には解放の記録が無い」という嘘を履歴が語る）。
-
-    **nonce を持たない古い監査ログは、資源 + job のフォールバックへ落とす。**
-    この対応付けより前に書かれたログは ``nonce`` フィールドを持たないため、
-    ここを nonce 必須にすると過去のログが一切読めなくなる（CLAUDE.md
-    「後方互換」に反する）。
+    nonce は宣言ごとに一意なので、資源 + nonce が一致すれば確実に同じ宣言である
+    ——job だけを鍵にすると、``--nonce`` で片方だけを消したときに、時刻順で先に
+    来た**別の宣言**（まだ生きているほう）に解放が結び付いてしまう（「消していない
+    方が消えたことになり、消した方には解放の記録が無い」という嘘を履歴が語る）。
     """
     resource = str(record.get("resource", ""))
     nonce = record.get("nonce")
     if isinstance(nonce, str) and nonce:
-        return ("nonce", resource, nonce)
-    return ("declaration", resource, str(record.get("job", "")))
+        return (resource, nonce)
+    return None
 
 
-def _match_releases(claims: list[dict], removals: list[dict]) -> list[dict | None]:
+def _job_key(record: dict) -> tuple[str, str]:
+    """資源 + job のフォールバック鍵。nonce を持たない側だけが使う。"""
+    return (str(record.get("resource", "")), str(record.get("job", "")))
+
+
+def _match_releases(claims: list[dict], removals: list[dict]) -> list[tuple[dict | None, bool]]:
     """時刻順に並んだ宣言へ、その直後の解放を 1 件ずつ対応させる。
+
+    **2 段階で対応付ける。**
+
+    1. **nonce が両方にあるもの同士を、厳密に**（資源 + nonce の一致）対応付ける。
+    2. **step 1 で残った未使用のレコードだけを**、従来どおり資源 + job ＋時刻順で
+       対応付ける。
+
+    2 段に分ける理由は、ローリング更新で新旧の監査ログが混在すると**単純な
+    1 種類の鍵では絶対に一致しない**ためである。古い ``claimed``（nonce 無し、
+    旧バージョンの書き込み）と新しい ``removed``（nonce 有り）が同じ宣言に
+    属していても、旧側は資源+job の鍵、新側は資源+nonce の鍵になり、鍵の種類が
+    違う以上どんな実装でも一致しえない。**片方が nonce を持たない対応付けは
+    全て step 2（時刻順のフォールバック）を経由させる**ことで、鍵の種類の違いに
+    関わらず対応が取れるようにする。
 
     掲示板は資源ごとに主宣言 1 件なので、ある宣言を閉じるのは「同じ資源で、
     その宣言より後に来た最初の解放」である。対応が付かないものは None になる
@@ -868,41 +907,64 @@ def _match_releases(claims: list[dict], removals: list[dict]) -> list[dict | Non
 
     Returns
     -------
-    list of (dict or None)
-        ``claims`` と同じ並び・同じ長さ。
+    list of (dict or None, bool)
+        ``claims`` と同じ並び・同じ長さ。2 つ目の要素は**この対応付けが
+        不確実か**——nonce の厳密な一致ではなく、資源 + job のフォールバックで
+        決めたときに ``True`` になる（片方が旧形式で nonce を持たない場合を含む）。
+        対応が付かなかった（``None``）ときは ``False``（不確実さを論じる対象が無い）。
     """
-    Key = tuple[str, str, str]
-    pending: dict[Key, list[tuple[datetime, dict]]] = {}
+    # --- step 1: nonce が両方にあるもの同士を厳密に対応付ける ---------------------
+    removals_by_nonce: dict[tuple[str, str], dict] = {}
     for record in removals:
+        key = _nonce_key(record)
+        if key is not None and key not in removals_by_nonce:
+            # 同じ nonce の removed が複数あることは想定しないが、あれば最初の
+            # 1 件を採る（監査ログの重複・再送があっても対応付けを壊さないため）。
+            removals_by_nonce[key] = record
+
+    matched: list[dict | None] = [None] * len(claims)
+    uncertain: list[bool] = [False] * len(claims)
+    used_by_id: set[int] = set()
+    remaining_claim_indices: list[int] = []
+
+    for index, claim in enumerate(claims):
+        key = _nonce_key(claim)
+        release = removals_by_nonce.get(key) if key is not None else None
+        if release is not None:
+            matched[index] = release
+            used_by_id.add(id(release))
+        else:
+            remaining_claim_indices.append(index)
+
+    # --- step 2: 残りを資源 + job ＋ 時刻順でフォールバック対応付けする -------------
+    remaining_removals = [r for r in removals if id(r) not in used_by_id]
+    Key = tuple[str, str]
+    pending: dict[Key, list[tuple[datetime, dict]]] = {}
+    for record in remaining_removals:
         when = _parse_at(record.get("at"))
         if when is None:
             continue
-        pending.setdefault(_pair_key(record), []).append((when, record))
+        pending.setdefault(_job_key(record), []).append((when, record))
     for items in pending.values():
         items.sort(key=lambda item: item[0])
 
     # 鍵ごとに「どこまで使ったか」を持ち、同じ解放を 2 つの宣言に割り当てない。
     used: dict[Key, int] = {}
-    matched: list[dict | None] = []
-    for claim in claims:
+    for index in remaining_claim_indices:
+        claim = claims[index]
         started = _parse_at(claim.get("at"))
-        key = _pair_key(claim)
-        # 相乗りの一斉取り下げ（``rb release --force``）は cwd を持たない。自分の場所の
-        # 取り下げが見つからなければ、そちらの箱も見る。
-        candidates: list[Key] = [key]
-        chosen: dict | None = None
-        for candidate in candidates:
-            items = pending.get(candidate, [])
-            index = used.get(candidate, 0)
-            while index < len(items) and started is not None and items[index][0] < started:
-                index += 1
-            used[candidate] = index
-            if index < len(items):
-                chosen = items[index][1]
-                used[candidate] = index + 1
-                break
-        matched.append(chosen)
-    return matched
+        key = _job_key(claim)
+        items = pending.get(key, [])
+        pos = used.get(key, 0)
+        while pos < len(items) and started is not None and items[pos][0] < started:
+            pos += 1
+        used[key] = pos
+        if pos < len(items):
+            matched[index] = items[pos][1]
+            uncertain[index] = True
+            used[key] = pos + 1
+
+    return list(zip(matched, uncertain, strict=True))
 
 
 def _elapsed_and_stated(record: dict, release: dict | None) -> tuple[float | None, float | None]:
@@ -982,7 +1044,7 @@ def _cmd_history(args: argparse.Namespace) -> int:
 
     if args.json:
         claims = []
-        for record, release in zip(records, releases, strict=True):
+        for record, (release, uncertain) in zip(records, releases, strict=True):
             elapsed, stated = _elapsed_and_stated(record, release)
             claims.append(
                 {
@@ -991,6 +1053,11 @@ def _cmd_history(args: argparse.Namespace) -> int:
                     "release_reason": release.get("reason") if release else None,
                     "elapsed_seconds": elapsed,
                     "stated_seconds": stated,
+                    # **片側が nonce を持たない対応付けだと表明する。** nonce の
+                    # 厳密な一致ではなく資源 + job ＋時刻順のフォールバックで決めた
+                    # ペアであり、新旧の監査ログが混在する窓では**別の宣言を誤って
+                    # 対応付けている可能性がある**（issue #17 指摘 5）。
+                    "pairing_uncertain": uncertain,
                 }
             )
         print(json.dumps({"claims": claims}, ensure_ascii=False, indent=2))
@@ -1004,7 +1071,7 @@ def _cmd_history(args: argparse.Namespace) -> int:
     # それらをまたいだ中央値や平均は意味を持たない。しかも集計値は
     # 「次は 1/4 で申告すればいい」という機械的な補正を誘い、ETA を必須にした目的
     # （一度考えさせる）と正反対に働く。突き合わせるのは同じ案件の前回である。
-    for record, release in zip(records, releases, strict=True):
+    for record, (release, _uncertain) in zip(records, releases, strict=True):
         eta = record.get("eta") or {}
         usage = record.get("usage") or {}
         eta_text = eta.get("stated") if isinstance(eta, dict) else None
@@ -1247,8 +1314,8 @@ def _release_by_nonce(
         board.audit("release_nonce_rejected", reason="nonce が空である")
         return EXIT_USAGE
 
-    all_entries, unreadable = board.list_all_detailed()
-    if unreadable:
+    listing = board.list_all_detailed()
+    if not listing.complete:
         _say(
             "掲示板の一部を読めませんでした。解放は未確認です"
             "（読めなかった側に一致する宣言が隠れているかもしれません）",
@@ -1257,7 +1324,7 @@ def _release_by_nonce(
         board.audit("release_nonce_unconfirmed", reason="掲示板の一部が読めない", prefix=prefix)
         return EXIT_BROKEN
 
-    matches = [entry for entry in all_entries if entry.nonce.startswith(prefix)]
+    matches = [(path, entry) for path, entry in listing.pairs if entry.nonce.startswith(prefix)]
 
     if not matches:
         _say(f"nonce '{prefix}' に一致する宣言が見つかりませんでした", err=True)
@@ -1272,7 +1339,7 @@ def _release_by_nonce(
             f"nonce '{prefix}' が {len(matches)} 件に一致します。もっと長い桁数を指定してください",
             err=True,
         )
-        for entry in matches:
+        for _, entry in matches:
             _say(
                 f"  nonce {entry.nonce[:8]}  {naming.display_default(entry.resource)}"
                 f"  {entry.session} / {entry.job}（since {entry.since}）",
@@ -1283,7 +1350,7 @@ def _release_by_nonce(
         )
         return EXIT_USAGE
 
-    entry = matches[0]
+    path, entry = matches[0]
     cwd = os.getcwd()
 
     # **一意に決まった 1 件についてだけ、所有を確かめる。** force のときだけ問わない。
@@ -1332,8 +1399,13 @@ def _release_by_nonce(
         # **所有チェックという概念自体が要らない場面。** `remove_own` の nonce 経路は
         # 内部で「nonce が一致すれば所有とみなす」ため、既に所有確認を終えている
         # 非強制路とは違い、ここでは素の CAS（`remove_if_nonce`）を直接使う。
+        # **`known` に選択で得た実体をそのまま渡す。** ここで再列挙すると、選択時に
+        # 確認した完全性を削除の直前で捨て直すことになる（issue #17 指摘 2・3）。
         removal = board.remove_if_nonce(
-            entry.resource, expect_nonce=entry.nonce, reason="release --nonce --force コマンド"
+            entry.resource,
+            expect_nonce=entry.nonce,
+            reason="release --nonce --force コマンド",
+            known=(path, entry),
         )
         if removal is RemovalResult.REMOVED:
             _say(
@@ -1356,8 +1428,17 @@ def _release_by_nonce(
     # 内部の所有判定を nonce 一致だけで済ませるので通常は無くても効くが、nonce を
     # 持たない旧形式の宣言（cwd の祖先フォールバックでしか所有と判定できない）が
     # 将来ここへ来ても、掲示板に残っているのに「無い」と嘘を言わないための保険である。
+    #
+    # **`declared` に、完全性を確認した ``listing`` から絞った分をそのまま渡す。**
+    # 渡さないと `remove_own` が内部で `pairs_for` を呼び直し、ここまでで確認した
+    # 完全性を削除の直前で捨て直す（issue #17 指摘 2・3）。
+    declared_for_resource = [(p, e) for p, e in listing.pairs if e.resource == entry.resource]
     result = board.remove_own(
-        entry.resource, reason="release --nonce コマンド", nonce=entry.nonce, cwd=cwd
+        entry.resource,
+        reason="release --nonce コマンド",
+        nonce=entry.nonce,
+        cwd=cwd,
+        declared=declared_for_resource,
     )
     if result.removed:
         _say(f"解放しました: {naming.display_default(entry.resource)}（nonce {entry.nonce[:8]}）")
@@ -1384,10 +1465,32 @@ def _release_forced(board: Board, resource_id: str) -> int:
 
     見ないことが ``--force`` の意味である。**何件消したかは必ず言う**（黙って
     他人の宣言を消すと、消された側は理由の分からない消失として体験する）。
+
+    **掲示板の一部が読めないときは、消さずに拒否する。** 「全部消す」と言っている
+    以上、読めなかった側にこの資源の宣言が隠れていれば、それは消さずに掲示板へ
+    残る——``--force`` は「見ないことがその意味」であって「見えなかったものは
+    無かったことにする」ではない。読めない宣言が残ったまま「強制解放しました」と
+    言ってはならない（issue #17 指摘 2）。
+
+    **消せなかったものがあれば ``EXIT_BROKEN``。** 共有違反などの I/O 失敗で
+    一部が消せなかった場合も、以前は ``EXIT_OK`` を返していた——警告は出すが
+    終了コードは「成功」のままで、``release --force && 次の手順`` は消えていない
+    宣言を無視して進む。**終了コードで嘘をつかない**（cli.py 冒頭）。
     """
     with board.locked(resource_id) as lock:
         _warn_if_unlocked(board, resource_id, lock, event="force_release_unlocked")
-        before = board.list_for(resource_id)
+        listing = board.pairs_for_detailed(resource_id)
+        if not listing.complete:
+            _say(
+                "掲示板の一部を読めませんでした。強制解放は未確認です"
+                "（読めなかった側にこの資源の宣言が隠れているかもしれません）",
+                err=True,
+            )
+            board.audit(
+                "force_release_unconfirmed", resource=resource_id, reason="掲示板の一部が読めない"
+            )
+            return EXIT_BROKEN
+        before = listing.entries
         removed = board.remove_all(resource_id, reason="release コマンド（強制）")
 
     if not before:
@@ -1402,6 +1505,7 @@ def _release_forced(board: Board, resource_id: str) -> int:
             f"警告: {len(before) - removed} 件を消せませんでした（他プロセスが読んでいる可能性）",
             err=True,
         )
+        return EXIT_BROKEN
     return EXIT_OK
 
 
@@ -1416,12 +1520,11 @@ def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> i
     曖昧なまま 1 件を選ぶと、黙って間違った方を消すことになり、2 件とも消すより悪い
     （DESIGN.md「採らなかった案」）。1 件のときは摩擦を足さない——曖昧なときだけの保険である。
 
-    **数える区間と消す区間の間には TOCTOU の窓がある。** ``list_for`` はこの関数の
-    先頭で一度だけ、ロックの外で読む。ここで数えた「1 件」をそのまま
-    ``remove_own`` の無条件削除（nonce 無し）へ渡すと、数えてから呼ぶまでの間に
-    2 件目が現れたとき ``remove_own`` は**その時点で自分のもの全部**を読み直して
-    消す——「消す前に止める」がまさに防ごうとした事故が、競合下でそのまま成立する。
-    数える区間と消す区間を 1 つの ``Board.locked`` に寄せる案も検討したが、
+    **数える区間と消す区間の間には TOCTOU の窓がある。** ここで数えた「1 件」を
+    そのまま ``remove_own`` の無条件削除（nonce 無し）へ渡すと、数えてから呼ぶ
+    までの間に 2 件目が現れたとき ``remove_own`` は**その時点で自分のもの全部**を
+    読み直して消す——「消す前に止める」がまさに防ごうとした事故が、競合下でそのまま
+    成立する。数える区間と消す区間を 1 つの ``Board.locked`` に寄せる案も検討したが、
     取得（``declare``）はロックが取れなくても続行する（fail-open。DESIGN.md
     「Per-Resource Lock」）ため、ロックで囲っても「ロックを尊重しない書き手」が
     割り込む窓は閉じない。窓を閉じる手段は対象を**個体（nonce）で固定する**ことだけ
@@ -1429,14 +1532,42 @@ def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> i
     ロックの有無に関係なく保証する。だから 1 件のときはその nonce を渡し、
     0 件のときは削除処理そのものへ進まない（同じ理由——その間に現れた宣言を
     「数えた 1 件」と取り違えて消しうる）。
+
+    **掲示板の一部が読めないときは、0 件・1 件のどちらとも断定しない。**
+    以前は ``list_for``（読めなかったものを黙って飛ばす）で数えていたので、
+    掲示板の一部が読めなくても「0 件」「1 件」と断定して消す・消さないを決めて
+    いた——読めなかった側に自分の宣言がもう 1 件隠れているかもしれない
+    （issue #17 指摘 3）。:meth:`Board.pairs_for_detailed` で完全性を確認し、
+    ``--all`` を含めて全ての経路で読めなかったら ``EXIT_BROKEN`` で「解放は
+    未確認」と明示する。選択で得た ``(Path, Entry)`` は ``remove_own`` へ
+    そのまま渡し、削除の直前で完全性の情報を捨て直さない。
     """
     cwd = os.getcwd()
     session_id = platform_info.session_id()
 
+    listing = board.pairs_for_detailed(resource_id)
+    if not listing.complete:
+        _say(
+            "掲示板の一部を読めませんでした。解放は未確認です"
+            "（読めなかった側に自分の宣言が隠れているかもしれません）",
+            err=True,
+        )
+        board.audit(
+            "release_unconfirmed",
+            resource=resource_id,
+            reason="掲示板の一部が読めない",
+            all=take_all,
+        )
+        return EXIT_BROKEN
+    declared = listing.pairs
+
     nonce: str | None = None
     if not take_all:
-        declared = board.list_for(resource_id)
-        mine = [entry for entry in declared if board.owns(entry, cwd=cwd, session_id=session_id)]
+        mine = [
+            (path, entry)
+            for path, entry in declared
+            if board.owns(entry, cwd=cwd, session_id=session_id)
+        ]
         if len(mine) > 1:
             # **消す前に止める。** 曖昧なまま 1 件選ぶと、黙って間違った方を消すのが
             # 「2 件とも消す」より悪い（DESIGN.md「採らなかった案」）。
@@ -1444,7 +1575,7 @@ def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> i
                 f"自分の宣言が {len(mine)} 件あります。曖昧なので何も消しません",
                 err=True,
             )
-            for entry in mine:
+            for _, entry in mine:
                 _say(f"  nonce {entry.nonce[:8]}  {entry.job}（since {entry.since}）", err=True)
             _say("  1 本だけ消すには rb release --nonce <nonce の先頭 8 桁>", err=True)
             _say(
@@ -1459,8 +1590,7 @@ def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> i
             # 時点にはまだ存在しなかったもの——まで拾って消してしまう。この関数の
             # 役目は「いま数えた自分の宣言を消す」ことであって、「これから現れるかも
             # しれない宣言まで待ち構えて消す」ことではない。
-            mine_nonces = {entry.nonce for entry in mine}
-            foreign = [entry for entry in declared if entry.nonce not in mine_nonces]
+            foreign = [entry for _, entry in declared]
             if not foreign:
                 _say(f"宣言はありませんでした: {naming.display_default(resource_id)}")
                 return EXIT_OK
@@ -1472,9 +1602,13 @@ def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> i
         # **1 件だけなら nonce を固定して渡す。** 数えたあとに 2 件目が現れても、
         # `remove_own` は渡した nonce と一致する宣言だけを対象にする（CAS）ので、
         # 新しく現れた宣言には触れない——ここが「消す前に止める」の実体である。
-        nonce = mine[0].nonce
+        nonce = mine[0][1].nonce
 
-    result = board.remove_own(resource_id, reason="release コマンド", cwd=cwd, nonce=nonce)
+    # **選択に使った `declared` をそのまま渡す。** `remove_own` が内部で再列挙すると、
+    # ここまでで確認した完全性を削除の直前で捨て直すことになる（issue #17 指摘 2・3）。
+    result = board.remove_own(
+        resource_id, reason="release コマンド", cwd=cwd, nonce=nonce, declared=declared
+    )
     if result.removed:
         _say(f"解放しました: {naming.display_default(resource_id)}（{len(result.removed)} 件）")
         for entry in result.removed:
@@ -1787,6 +1921,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             # **上限到達（EXIT_BUSY）とも分ける。** どちらも 1 にすると、呼び出し側が
             # 「上限まで待った」と「1 度も待っていない」を区別できない。前者は待ち直す
             # 価値があり、後者は原因を調べる必要がある。対処が違うものを畳まない。
+            return EXIT_BROKEN
+        if command == "release":
+            # **release は破壊的操作である。** ここで 0 を返すと、宣言を 1 件も
+            # 消せていないのに「解放した」と読まれる——catch-all も「終了コードで
+            # 嘘をつかない」（cli.py 冒頭）の対象である。フックと非破壊コマンド
+            # （status / claim / update / history）の catch-all は引き続き
+            # fail-open のまま 0 を返す（issue #17 指摘 5）。
             return EXIT_BROKEN
         return EXIT_OK
 

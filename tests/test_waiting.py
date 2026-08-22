@@ -346,13 +346,142 @@ def test_release_is_audited(tmp_path: Path) -> None:
 
 
 def test_unreadable_board_is_treated_as_released(tmp_path: Path) -> None:
-    """掲示板が読めないときは通す。
+    """**ディレクトリがまだ無い**（＝誰も宣言していない）ときは通す。
 
-    インフラの故障で永久に待たせるより、通すほうがよい（fail-open）。
+    ``Board.declarations_detailed`` は ``FileNotFoundError``（ディレクトリが無い）を
+    「読めない」ではなく「空」として扱う（``_json_files`` の docstring 参照）。
+    これは fail-open の対象ではなく、正規の「空の掲示板」である。
     """
     result = wait(Board(tmp_path / "存在しない"), FakeClock())
 
     assert result.reason == waiting.RELEASED
+
+
+# --- 読めない掲示板を「解放済み」と言わない（issue #17 指摘 4） --------------------
+
+
+def _make_board_unreadable(tmp_path: Path) -> Board:
+    """**本当に**読めない掲示板を作る（ディレクトリが通常ファイルになっている）。
+
+    ``存在しない`` ディレクトリ（上のテスト）とは違い、``os.scandir`` が
+    ``NotADirectoryError`` を投げる——``_json_files`` はこれを「読めない」と
+    区別して報告する。
+    """
+    (tmp_path / "board").write_text("これはディレクトリではない", encoding="utf-8")
+    return Board(tmp_path)
+
+
+def test_a_genuinely_unreadable_board_is_not_treated_as_released(tmp_path: Path) -> None:
+    """**本当に読めない**掲示板は「解放済み」と積極的に言わない。
+
+    以前は ``holder_keys``（読めなかったものを黙って飛ばす）を使っていたので、
+    掲示板全体が読めなくても空集合になり、``RELEASED``（最も積極的な成功表現）を
+    返していた。使用中の資源が「解放済み」に化ける、このツールが最も避けるべき
+    誤りである。一度も確認できないまま上限に達すれば ``BROKEN`` になる。
+    """
+    board = _make_board_unreadable(tmp_path)
+
+    result = wait(board, FakeClock(), timeout_s=25, interval_s=10)
+
+    assert result.reason != waiting.RELEASED
+    assert result.reason == waiting.BROKEN
+
+
+def test_wait_does_not_report_released_when_the_board_goes_unreadable_mid_wait(
+    tmp_path: Path,
+) -> None:
+    """**待機の途中で**読めなくなっても、直前まで使用中だったことを「解放」に変えない。
+
+    最初のポーリングで生きた宣言を確認できたのに、途中から読めなくなると
+    ``holder_keys`` は空集合を返す——それを「全部消えた」と早合点すると、
+    実際にはまだ動いているジョブの資源を奪いにいくことになる。
+    """
+    board = Board(tmp_path)
+    declare(board)
+    fake = FakeClock()
+
+    def sleep(seconds: float) -> None:
+        fake.sleep(seconds)
+        # 最初のポーリングの後、掲示板を壊す。
+        if not (tmp_path / "board").is_dir():
+            return
+        import shutil
+
+        shutil.rmtree(tmp_path / "board")
+        (tmp_path / "board").write_text("壊れた", encoding="utf-8")
+
+    result = waiting.wait_for_room(
+        board, RESOURCE, interval_s=10, timeout_s=30, sleep=sleep, now=fake.now
+    )
+
+    assert result.reason != waiting.RELEASED, "読めなくなった掲示板を解放済みと言っている"
+    # 一度は完全に読めて使用中だと確認できているので、TIMEOUT であって BROKEN ではない。
+    assert result.reason == waiting.TIMEOUT
+
+
+def test_wait_for_room_distinguishes_broken_from_timeout(tmp_path: Path) -> None:
+    """**一度も確認できないまま**上限に達したときだけ ``BROKEN``。
+
+    ``TIMEOUT`` は「正常に読めた上でまだ使用中」を意味する。読めたことが 1 度も
+    無ければ、その確認自体が取れていないので同じ値にしてはならない
+    （``waiting.BROKEN`` の docstring 参照）。
+    """
+    board = _make_board_unreadable(tmp_path)
+    fake = FakeClock()
+
+    result = waiting.wait_for_room(
+        board, RESOURCE, interval_s=5, timeout_s=20, sleep=fake.sleep, now=fake.now
+    )
+
+    assert result.reason == waiting.BROKEN
+    assert result.reason != waiting.TIMEOUT
+
+
+def test_wait_unconfirmed_polls_are_audited(tmp_path: Path) -> None:
+    """読めなかったポーリングも監査ログに残す（沈黙は成功ではない）。"""
+    board = _make_board_unreadable(tmp_path)
+    fake = FakeClock()
+
+    waiting.wait_for_room(
+        board, RESOURCE, interval_s=5, timeout_s=10, sleep=fake.sleep, now=fake.now
+    )
+
+    events = audit_events(tmp_path)
+    assert any(r.get("event") == "wait_unconfirmed" for r in events)
+    # **`wait_released` を書いてはならない。** 読めなかったのに「解放した」と
+    # いう積極的な事象を監査ログへ残すのは、まさに避けたい嘘である。
+    assert not any(r.get("event") == "wait_released" for r in events)
+
+
+def test_holder_keys_detailed_reports_incompleteness(tmp_path: Path) -> None:
+    """``holder_keys_detailed`` は完全性を返す。``holder_keys`` はそれを捨てるだけ。"""
+    board = _make_board_unreadable(tmp_path)
+
+    keys, complete = waiting.holder_keys_detailed(board, RESOURCE)
+
+    assert complete is False
+    assert keys == set()
+    assert waiting.holder_keys(board, RESOURCE) == set()  # 互換の後方経路も壊れていない
+
+
+def test_cmd_wait_returns_exit_broken_for_an_unreadable_board(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CLI 越しに ``rb wait`` を呼ぶと、読めない掲示板で ``EXIT_BROKEN`` を返す。
+
+    入口の近道（``holder_keys`` が空なら即座に「解放済み」と答える）を、読めない
+    ときに取っていないかも合わせて確かめる——取っていれば ``EXIT_OK`` になり、
+    メッセージに「既に解放されています」が出るはずである。
+    """
+    from resource_broker import cli
+
+    _make_board_unreadable(tmp_path)
+
+    code = main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0"])
+
+    assert code == cli.EXIT_BROKEN
+    out = capsys.readouterr().out
+    assert "既に解放されています" not in out, "読めないのに入口の近道を取っている"
 
 
 # --- 待っている側に逃げ道を示す ---------------------------------------------------

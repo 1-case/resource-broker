@@ -449,3 +449,237 @@ def test_an_empty_nonce_is_never_a_cas_key(tmp_path: Path) -> None:
         RemovalResult.NOT_OWNED
     )
     assert len(board.list_for("pc-a::GPU0")) == 2, "空の nonce で宣言が消えた"
+
+
+# --- 候補集合の完全性（issue #17 指摘 1・2） ---------------------------------------
+#
+# 「候補集合は完全か」は破壊的操作の全経路に共通する性質である。ここでは
+# ``declarations_detailed`` / ``pairs_for_detailed`` が返す ``BoardListing.complete``
+# が、**理由を問わず**（読めない・壊れている・構造が不正・不正な UTF-8）
+# ``False`` になることを 1 か所で固定する。CLI 側の経路別テストは
+# tests/test_release_nonce.py・tests/test_waiting.py に置く。
+
+
+def test_declarations_detailed_is_incomplete_on_a_permission_style_failure(
+    board: Board, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """読めないファイル（I/O 失敗）があれば ``complete=False``。"""
+    board.declare(build_entry("pc-a::GPU0", job="正常"))
+    board.entries_dir.mkdir(parents=True, exist_ok=True)
+    flaky = board.entries_dir / "読めない.json"
+    flaky.write_text("{}", encoding="utf-8")
+
+    real_read_text = Path.read_text
+
+    def boom(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name == "読めない.json":
+            raise PermissionError("共有違反")
+        return real_read_text(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", boom)
+
+    listing = board.declarations_detailed()
+
+    assert listing.complete is False
+    # **読めたものは捨てない。** 完全性が崩れても、読めた宣言は返す
+    # （読める分は使えるという fail-open の原則は完全性の判定と別物である）。
+    assert [e.job for _, e in listing.pairs] == ["正常"]
+
+
+def test_declarations_detailed_is_incomplete_on_json_corruption(board: Board) -> None:
+    """JSON として壊れているファイル（``entry_corrupt``）があれば ``complete=False``。
+
+    以前はここを見ていなかった——``entry_unreadable``（I/O 失敗）だけが完全性を
+    崩し、JSON の破損は「完全に読めた」側に黙って含まれていた（issue #17 指摘 1）。
+    """
+    board.declare(build_entry("pc-a::GPU0", job="正常"))
+    board.entries_dir.mkdir(parents=True, exist_ok=True)
+    (board.entries_dir / "壊れている.json").write_text("{ これは JSON ではない", encoding="utf-8")
+
+    listing = board.declarations_detailed()
+
+    assert listing.complete is False
+    assert [e.job for _, e in listing.pairs] == ["正常"]
+
+
+def test_declarations_detailed_is_incomplete_on_structural_corruption(board: Board) -> None:
+    """JSON としては正しいが、宣言の最低限の形を満たさないファイルも ``complete=False``。
+
+    ``resource`` が読めない以上、この 1 件がどの資源のものか分からない
+    ——理由が「JSON が壊れている」ではなく「必須フィールドが無い」だけの違いで、
+    危険の中身（探している宣言が隠れているかもしれない）は変わらない。
+    """
+    board.declare(build_entry("pc-a::GPU0", job="正常"))
+    board.entries_dir.mkdir(parents=True, exist_ok=True)
+    (board.entries_dir / "resource無し.json").write_text(
+        json.dumps({"schema": 1, "holder": {}}), encoding="utf-8"
+    )
+
+    listing = board.declarations_detailed()
+
+    assert listing.complete is False
+    assert [e.job for _, e in listing.pairs] == ["正常"]
+
+
+def test_declarations_detailed_is_incomplete_on_invalid_utf8(board: Board) -> None:
+    """不正な UTF-8 バイト列のファイルでも例外を投げず、``complete=False`` にする。
+
+    以前は ``read_text`` を ``OSError`` だけで囲っていたため、``UnicodeDecodeError``
+    （``ValueError`` の派生）が素通りして本モジュールの「公開関数は例外を投げない」
+    という約束を破っていた（issue #17 指摘 1 の「不正な UTF-8」）。
+    """
+    board.declare(build_entry("pc-a::GPU0", job="正常"))
+    board.entries_dir.mkdir(parents=True, exist_ok=True)
+    (board.entries_dir / "不正utf8.json").write_bytes(b"\xff\xfe\x00broken")
+
+    listing = board.declarations_detailed()  # 例外を投げないことそのものが検査対象
+
+    assert listing.complete is False
+    assert [e.job for _, e in listing.pairs] == ["正常"]
+
+
+def test_declarations_detailed_is_incomplete_even_after_an_earlier_success(
+    board: Board,
+) -> None:
+    """**最初の 1 件が読めたことは、後続の失敗を覆い隠さない。**
+
+    走査は辞書順に進む。壊れたファイル名を読める宣言より**後**に置き、
+    「最初の成功だけを見て complete=True のまま確定する」実装を落とすための
+    退行注入である（辞書順で `a-first` が `z-broken` より先に走査される）。
+    """
+    board.declare(build_entry("pc-a::GPU0", job="先に読める方"))
+    board.entries_dir.mkdir(parents=True, exist_ok=True)
+    # 宣言のファイル名は nonce の安全化なので、既存の 1 件より確実に後に来る名前を選ぶ。
+    (board.entries_dir / "zzz-壊れている.json").write_text("not json", encoding="utf-8")
+
+    listing = board.declarations_detailed()
+
+    assert listing.complete is False
+    assert [e.job for _, e in listing.pairs] == ["先に読める方"]
+
+
+def test_pairs_for_detailed_is_incomplete_for_an_unrelated_corrupt_file(
+    board: Board,
+) -> None:
+    """**別の資源にしか見えない壊れたファイルでも、完全性は崩れる。**
+
+    壊れたファイルは中身が読めないので、``resource`` も分からない——絞り込む
+    「前」の段階で情報が失われている。資源で絞ってから完全性を見ると、絞る前に
+    失われた情報を「たまたま全部読めた」と取り違える（issue #17 指摘 1）。
+    """
+    board.declare(build_entry("pc-a::GPU0", job="無関係な資源"))
+    board.entries_dir.mkdir(parents=True, exist_ok=True)
+    (board.entries_dir / "壊れている.json").write_text("not json", encoding="utf-8")
+
+    listing = board.pairs_for_detailed("pc-a::COM3")
+
+    assert listing.complete is False
+    assert listing.pairs == []  # COM3 自体の宣言は無い
+
+
+def test_pairs_for_detailed_is_complete_when_nothing_is_broken(board: Board) -> None:
+    """壊れたものが無ければ ``complete=True``。**畳んで恒真にしていないか**の対照。"""
+    board.declare(build_entry("pc-a::GPU0", job="正常"))
+
+    listing = board.pairs_for_detailed("pc-a::GPU0")
+
+    assert listing.complete is True
+    assert [e.job for _, e in listing.pairs] == ["正常"]
+
+
+# --- known を渡した CAS: ABSENT と「確認できない」を分ける（issue #17 指摘 2・3） ---
+
+
+def test_remove_if_nonce_with_known_removes_the_exact_entity(board: Board) -> None:
+    """``known`` を渡すと、再列挙せずにその実体を消せる。"""
+    entry = build_entry("pc-a::GPU0", job="対象")
+    board.declare(entry)
+    path, found = board.pairs_for("pc-a::GPU0")[0]
+
+    result = board.remove_if_nonce(
+        "pc-a::GPU0", expect_nonce=entry.nonce, reason="テスト", known=(path, found)
+    )
+
+    assert result is RemovalResult.REMOVED
+    assert board.list_for("pc-a::GPU0") == []
+
+
+def test_remove_if_nonce_with_known_distinguishes_absent_from_swapped(
+    board: Board,
+) -> None:
+    """``known`` の実体が消えていても、**別の宣言に入れ替わっていれば「無い」と言わない**。
+
+    選択に使った実体をそのまま渡すだけでは、その実体が消えたあとに**別の宣言**が
+    同じ資源へ現れていた場合を見落とす。以前の ``pairs_for`` ベースの先読みが
+    守っていた区別（issue #15 で入れた ABSENT / NOT_OWNED の非対称）を、
+    ``known`` 経路でも保つことを固定する。
+    """
+    board.declare(build_entry("pc-a::GPU0", job="消える方"))
+    gone_path, gone_entry = board.pairs_for("pc-a::GPU0")[0]
+    assert (
+        board.remove_if_nonce("pc-a::GPU0", expect_nonce=gone_entry.nonce, reason="事前に消す")
+        is RemovalResult.REMOVED
+    )
+    # 消えた直後に、別の宣言が現れる（他セッションが取り直した想定）。
+    board.declare(build_entry("pc-a::GPU0", job="入れ替わった方"))
+
+    result = board.remove_if_nonce(
+        "pc-a::GPU0", expect_nonce=gone_entry.nonce, reason="テスト", known=(gone_path, gone_entry)
+    )
+
+    assert result is RemovalResult.NOT_OWNED, "入れ替わりを「無い」と言っている"
+    assert [e.job for e in board.list_for("pc-a::GPU0")] == ["入れ替わった方"]
+
+
+def test_remove_if_nonce_with_known_returns_absent_when_truly_nothing_remains(
+    board: Board,
+) -> None:
+    """``known`` の実体が消え、他に何も残っていなければ ``ABSENT``。"""
+    board.declare(build_entry("pc-a::GPU0", job="唯一の宣言"))
+    path, entry = board.pairs_for("pc-a::GPU0")[0]
+    assert (
+        board.remove_if_nonce("pc-a::GPU0", expect_nonce=entry.nonce, reason="事前に消す")
+        is RemovalResult.REMOVED
+    )
+
+    result = board.remove_if_nonce(
+        "pc-a::GPU0", expect_nonce=entry.nonce, reason="テスト", known=(path, entry)
+    )
+
+    assert result is RemovalResult.ABSENT
+
+
+def test_remove_if_nonce_known_absent_recheck_that_cannot_read_is_not_reported_as_absent(
+    board: Board, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**削除の直前に掲示板が読めなくなったら、「無い」と言わない。**
+
+    ``known`` の実体が消えていたので確かめ直そうとしたら、その確かめ直し自体が
+    読めなかった——このとき「本当に無い」と「確認できない」を混同すると、実は
+    生きている別の宣言を見落として「解放した」と嘘をつくことになる（issue #17
+    指摘 2 の「削除直前の読取失敗」）。専用の結果値は増やさず ``FAILED`` に倒す
+    （呼び出し側は既に「消えたと言わない」経路を持つ）。
+    """
+    board.declare(build_entry("pc-a::GPU0", job="唯一の宣言"))
+    path, entry = board.pairs_for("pc-a::GPU0")[0]
+    assert (
+        board.remove_if_nonce("pc-a::GPU0", expect_nonce=entry.nonce, reason="事前に消す")
+        is RemovalResult.REMOVED
+    )
+    # 別の宣言をもう 1 件置く。これが読めなくなる。
+    board.declare(build_entry("pc-a::GPU0", job="読めなくなる宣言"))
+
+    real_read_text = Path.read_text
+
+    def boom(self: Path, *args: object, **kwargs: object) -> str:
+        raise PermissionError("共有違反")
+
+    monkeypatch.setattr(Path, "read_text", boom)
+    try:
+        result = board.remove_if_nonce(
+            "pc-a::GPU0", expect_nonce=entry.nonce, reason="テスト", known=(path, entry)
+        )
+    finally:
+        monkeypatch.setattr(Path, "read_text", real_read_text)
+
+    assert result is RemovalResult.FAILED, f"確認できないのに {result} と断定した"

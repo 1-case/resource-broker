@@ -35,7 +35,14 @@ DESIGN = ROOT / "docs" / "DESIGN.md"
 #: 621 へ上げたのは、``EXIT_BROKEN``（値 3）を Exit Codes の表へ 1 行足すため
 #: である（issue #15 #5 の修正で追加した終了コード。表の抜けを埋める仕様の追加
 #: であり、散文ではない）。
-MAX_LINES = 621
+#:
+#: 640 へ上げたのは、破壊的操作の族全体に「候補集合は完全か」を通した修正
+#: （issue #17）で、Exit Codes に**コマンド × 結果**の対応表を足し、
+#: Corrupt Entries と Waiting に完全性を見る／見ない経路の仕様を 1 段落ずつ
+#: 足し、History の対応付けの鍵を 2 段階（nonce 優先・job フォールバック）へ
+#: 更新したためである。いずれも「今後も真であり続ける仕様」であって経緯では
+#: ない。
+MAX_LINES = 640
 
 #: 公開しない文書。**公開物からここへリンクすると参照切れになる。**
 PRIVATE_DOCS = ("EXPERIMENTS.md", "STATUS.md", "tools/speak.py", "tools/speak_dict.json")

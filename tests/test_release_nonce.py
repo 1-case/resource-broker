@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 
 from resource_broker import cli
-from resource_broker.board import Board, build_entry
+from resource_broker.board import Board, RemovalResult, build_entry
 from resource_broker.cli import EXIT_BROKEN, EXIT_BUSY, EXIT_OK, EXIT_USAGE, main
 from resource_broker.naming import normalize
 
@@ -139,16 +139,17 @@ def test_release_own_does_not_sweep_a_declaration_that_appears_after_counting_on
     （nonce 無し）で呼んでいた。``remove_own`` は自分の宣言をそのとき読み直して
     **全部**消すので、数えてから呼ぶまでの間に自分の 2 件目が現れると、両方とも
     消えていた——「消す前に止める」がまさに防ごうとした事故が競合下でそのまま
-    成立していた。``Board.list_for`` をフックし、数え終えた直後に割り込ませる。
+    成立していた。``_release_own`` は選択に ``Board.pairs_for_detailed`` を使う
+    ので、それをフックして数え終えた直後に割り込ませる。
     """
     assert claim(tmp_path, "GPU0", "先に数えられる方") == EXIT_OK
 
     board = Board(tmp_path)
-    original_list_for = Board.list_for
+    original = Board.pairs_for_detailed
     injected = {"done": False}
 
-    def _list_for_with_race(self: Board, resource_id: str) -> list:
-        result = original_list_for(self, resource_id)
+    def _with_race(self: Board, resource_id: str):  # type: ignore[no-untyped-def]
+        result = original(self, resource_id)
         # **数え終えた直後、1 回だけ割り込ませる。** ここでもう 1 件、自分の宣言を
         # 作る——`_release_own` が「1 件」と判定した直後の状態を再現する。
         if not injected["done"] and resource_id == RESOURCE:
@@ -156,7 +157,7 @@ def test_release_own_does_not_sweep_a_declaration_that_appears_after_counting_on
             assert claim(tmp_path, "GPU0", "数えたあとに現れた方", "--share") == EXIT_OK
         return result
 
-    monkeypatch.setattr(Board, "list_for", _list_for_with_race)
+    monkeypatch.setattr(Board, "pairs_for_detailed", _with_race)
 
     assert run(tmp_path, "release", "GPU0") == EXIT_OK
 
@@ -186,24 +187,103 @@ def test_release_own_does_not_proceed_when_the_count_is_zero(
         session_id="theirs",
     )
 
-    original_list_for = Board.list_for
+    original = Board.pairs_for_detailed
     injected = {"done": False}
 
-    def _list_for_with_race(self: Board, resource_id: str) -> list:
-        result = original_list_for(self, resource_id)
+    def _with_race(self: Board, resource_id: str):  # type: ignore[no-untyped-def]
+        result = original(self, resource_id)
         if not injected["done"] and resource_id == RESOURCE:
             injected["done"] = True
             # 「0 件」と数えた直後に、自分の宣言を割り込ませる。
             assert claim(tmp_path, "GPU0", "数えた後に現れた自分の宣言", "--share") == EXIT_OK
         return result
 
-    monkeypatch.setattr(Board, "list_for", _list_for_with_race)
+    monkeypatch.setattr(Board, "pairs_for_detailed", _with_race)
 
     assert run(tmp_path, "release", "GPU0") == EXIT_BUSY
 
     # **割り込ませた宣言も、元からあった他人の宣言も、両方残っている。**
     remaining = {e.job for e in board.list_for(RESOURCE)}
     assert remaining == {"他人の仕事", "数えた後に現れた自分の宣言"}
+
+
+# --- 通常 release: 掲示板の一部が読めないときは断定しない（issue #17 指摘 3） --------
+
+
+def test_release_own_refuses_when_the_whole_board_is_unreadable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """通常の ``rb release <資源>`` は、掲示板全体が読めなければ ``EXIT_BROKEN``。
+
+    以前は ``list_for``（読めなかったものを黙って飛ばす）で数えていたので、
+    掲示板全体が読めなくても「0 件」と断定して ``宣言はありませんでした`` と
+    ``EXIT_OK`` を返していた——読めなかった側に自分の宣言が隠れていたかも
+    しれないのに、成功として報告していたことになる。
+    """
+    (tmp_path / "board").write_text("これはディレクトリではない", encoding="utf-8")
+
+    code = run(tmp_path, "release", "GPU0")
+
+    assert code == EXIT_BROKEN
+    assert code not in (EXIT_OK, EXIT_BUSY, EXIT_USAGE)
+    assert "未確認" in capsys.readouterr().err
+
+
+def test_release_own_refuses_on_an_unrelated_corrupt_file(tmp_path: Path) -> None:
+    """自分の宣言があっても、**無関係な壊れたファイルがあれば**消さずに拒否する。
+
+    壊れたファイルは中身が読めないので、それが実は自分の 2 件目の宣言だった
+    可能性を否定できない。所有者を数える前の段階で情報が失われている。
+    """
+    assert claim(tmp_path, "GPU0", "自分の宣言") == EXIT_OK
+    (tmp_path / "board" / "壊れている.json").write_text("not json", encoding="utf-8")
+
+    assert run(tmp_path, "release", "GPU0") == EXIT_BROKEN
+    # **拒否したのなら、何も消えていない。**
+    assert len(Board(tmp_path).list_for(RESOURCE)) == 1
+
+
+def test_release_all_refuses_when_the_whole_board_is_unreadable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--all`` も同じ族である。読めない掲示板を「0 件」と断定しない。"""
+    (tmp_path / "board").write_text("これはディレクトリではない", encoding="utf-8")
+
+    code = run(tmp_path, "release", "GPU0", "--all")
+
+    assert code == EXIT_BROKEN
+    assert code not in (EXIT_OK, EXIT_BUSY, EXIT_USAGE)
+    assert "未確認" in capsys.readouterr().err
+
+
+def test_release_all_does_not_sweep_a_declaration_that_appears_after_selecting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--all`` も選択に使った実体だけを消す。選択後に現れた宣言は巻き込まない。
+
+    ``--all`` は ``take_all=True`` で ``nonce`` を固定できないため、``_release_own``
+    は選択で得た ``(Path, Entry)`` の並びをそのまま ``remove_own`` へ渡す
+    （``declared=``）。渡さずに内部で再列挙すると、選択後に現れた宣言まで
+    「自分の宣言だから」と一緒に消してしまう。
+    """
+    assert claim(tmp_path, "GPU0", "選択される方") == EXIT_OK
+
+    original = Board.pairs_for_detailed
+    injected = {"done": False}
+
+    def _with_race(self: Board, resource_id: str):  # type: ignore[no-untyped-def]
+        result = original(self, resource_id)
+        if not injected["done"] and resource_id == RESOURCE:
+            injected["done"] = True
+            assert claim(tmp_path, "GPU0", "選択後に現れた方", "--share") == EXIT_OK
+        return result
+
+    monkeypatch.setattr(Board, "pairs_for_detailed", _with_race)
+
+    assert run(tmp_path, "release", "GPU0", "--all") == EXIT_OK
+
+    remaining = Board(tmp_path).list_for(RESOURCE)
+    assert [e.job for e in remaining] == ["選択後に現れた方"]
 
 
 # --- --nonce: 資源 ID 不要で 1 本だけ消す -----------------------------------------
@@ -589,6 +669,53 @@ def test_release_by_nonce_forwards_cwd_to_the_final_removal(
     assert calls[-1].get("cwd") is not None
 
 
+# --- --nonce: 削除直前に対象が入れ替わっても新しい宣言を消さない（TOCTOU） --------
+
+
+def test_release_by_nonce_does_not_remove_a_declaration_reclaimed_mid_flight(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--nonce`` でも、選択後に対象が消えて別の宣言に入れ替わっていれば消さない。
+
+    ``_release_by_nonce`` は選択で得た ``(Path, Entry)`` を ``known`` として
+    ``remove_if_nonce`` へ渡す。渡した実体そのものが既に無くても、**別の宣言が
+    そこに現れていれば「無い」ではなく「入れ替わった」**と答えなければならない
+    ——でなければ、消していない他人の生きた宣言を「解放した」と偽ることになる
+    （issue #17 指摘 2・3）。
+    """
+    assert claim(tmp_path, "GPU0", "先に居た方") == EXIT_OK
+    board = Board(tmp_path)
+    prefix = board.list_for(RESOURCE)[0].nonce[:8]
+
+    original = Board.remove_if_nonce
+    state = {"nested": False}
+
+    def interleave(
+        self: Board,
+        resource_id: str,
+        *,
+        expect_nonce: str,
+        reason: str,
+        known: tuple | None = None,
+    ) -> RemovalResult:
+        if not state["nested"]:
+            state["nested"] = True
+            # 選択が終わった直後、削除の直前に T が force で取り直す。
+            assert run(tmp_path, "release", "GPU0", "--force") == EXIT_OK
+            assert claim(tmp_path, "GPU0", "後から入れ替わった方") == EXIT_OK
+        return original(self, resource_id, expect_nonce=expect_nonce, reason=reason, known=known)
+
+    monkeypatch.setattr(Board, "remove_if_nonce", interleave)
+    capsys.readouterr()
+
+    code = run(tmp_path, "release", "--nonce", prefix)
+
+    assert code == EXIT_BUSY
+    assert "入れ替わりました" in capsys.readouterr().err
+    remaining = board.list_for(RESOURCE)
+    assert [e.job for e in remaining] == ["後から入れ替わった方"]
+
+
 # --- --all: 自分の宣言を全部消す -------------------------------------------------
 
 
@@ -638,6 +765,59 @@ def test_release_force_still_removes_everything_regardless_of_ownership(
     assert run(tmp_path, "release", "GPU0", "--force") == EXIT_OK
 
     assert board.list_for(RESOURCE) == []
+
+
+def test_release_force_refuses_when_the_whole_board_is_unreadable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--force`` も同じ族である。掲示板全体が読めなければ ``EXIT_BROKEN``。
+
+    「全部消す」と言っている以上、読めなかった側にこの資源の宣言が隠れたまま
+    「強制解放しました」と言ってはならない（issue #17 指摘 2・4「終了コードの
+    契約」）。
+    """
+    (tmp_path / "board").write_text("これはディレクトリではない", encoding="utf-8")
+
+    code = run(tmp_path, "release", "GPU0", "--force")
+
+    assert code == EXIT_BROKEN
+    assert code not in (EXIT_OK, EXIT_BUSY, EXIT_USAGE)
+    assert "未確認" in capsys.readouterr().err
+
+
+def test_release_force_returns_exit_broken_when_some_removals_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--force`` の削除が一部 I/O で失敗したら、``EXIT_OK`` ではなく ``EXIT_BROKEN``。
+
+    以前は警告を出すだけで終了コードは ``EXIT_OK`` のままだった。
+    ``release --force && 次の手順`` のように使われれば、消えていない宣言が
+    残ったまま次へ進む——**終了コードで嘘をつかない**（cli.py 冒頭）。
+    """
+    assert claim(tmp_path, "GPU0", "1 本目") == EXIT_OK
+    assert claim(tmp_path, "GPU0", "2 本目", "--share") == EXIT_OK
+
+    from resource_broker import board as board_module
+
+    original = board_module._unlink_with_retry
+    calls = {"n": 0}
+
+    def flaky(path):  # type: ignore[no-untyped-def]
+        # **最初の 1 回だけ失敗させる。** 2 件のうち 1 件だけが消えない状況
+        # （共有違反）を作る。以降（2 件目の削除・ロックの解放）は素通しする。
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return board_module.RemovalResult.FAILED, "共有違反（注入）"
+        return original(path)
+
+    monkeypatch.setattr(board_module, "_unlink_with_retry", flaky)
+
+    code = run(tmp_path, "release", "GPU0", "--force")
+
+    assert code == EXIT_BROKEN
+    assert code != EXIT_OK
+    # **消せた分は本当に消えている。** 全滅させたのではなく、部分失敗であることを確かめる。
+    assert len(Board(tmp_path).list_for(RESOURCE)) == 1
 
 
 # --- rb run の自動解放が壊れていないこと -----------------------------------------
@@ -699,3 +879,78 @@ def test_status_shows_the_nonce_prefix(tmp_path: Path, capsys: pytest.CaptureFix
 
     entry = Board(tmp_path).list_for(RESOURCE)[0]
     assert entry.nonce[:8] in out
+
+
+# --- 終了コードの契約: コマンド × 故障結果（issue #17 指摘 5） ---------------------
+
+
+def test_exit_wait_broken_alias_still_exists_and_equals_exit_broken() -> None:
+    """``EXIT_WAIT_BROKEN`` は別名として残っている。
+
+    値 3 を ``EXIT_BROKEN`` へ一般化したとき、シンボルごと削除すると
+    ``from resource_broker.cli import EXIT_WAIT_BROKEN`` としていた Python 側の
+    利用者を壊す（issue #17 指摘 7）。新規のコードは ``EXIT_BROKEN`` を使うが、
+    旧名も同じ値を指す別名として引き続き import できることを固定する。
+    """
+    from resource_broker.cli import EXIT_BROKEN, EXIT_WAIT_BROKEN
+
+    assert EXIT_WAIT_BROKEN == EXIT_BROKEN == 3
+
+
+def test_an_internal_error_during_release_is_not_reported_as_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``release`` の内部エラーは ``EXIT_OK`` ではなく ``EXIT_BROKEN``。
+
+    ``release`` は破壊的操作である。catch-all が 0 を返すと、宣言を 1 件も
+    消せていないのに「解放した」と読まれる——フックと非破壊コマンド
+    （status / claim / update / history）の catch-all は引き続き 0 のままで
+    よいが、``release`` は違う（issue #17 指摘 5）。
+    """
+    assert claim(tmp_path, "GPU0", "対象") == EXIT_OK
+
+    def explode(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("release の内部が壊れた")
+
+    monkeypatch.setattr(cli, "_release_own", explode)
+
+    assert run(tmp_path, "release", "GPU0") == EXIT_BROKEN
+
+
+def test_release_exit_codes_match_the_command_by_outcome_table() -> None:
+    """**コマンド × 故障結果**の対応を固定する。定数の値だけでは検出力が無い。
+
+    定数値（``EXIT_BROKEN == 3`` 等）を固定するテストは、値がそろっていれば
+    通ってしまい、「``--force`` の完了未確認が実は ``EXIT_OK`` を返している」
+    という配線ミスを検出できない。ここでは実際に CLI を呼び、**各経路が
+    正しい定数を返しているか**を 1 か所で並べて確認する。
+    """
+    scenarios: list[tuple[list[str], int]] = []
+
+    def whole_board_unreadable(tmp_path: Path) -> None:
+        (tmp_path / "board").write_text("これはディレクトリではない", encoding="utf-8")
+
+    import tempfile
+
+    for args in (
+        ["release", "GPU0"],
+        ["release", "GPU0", "--all"],
+        ["release", "GPU0", "--force"],
+        ["release", "--nonce", "aaaaaaaa"],
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            whole_board_unreadable(tmp_path)
+            code = run(tmp_path, *args)
+            scenarios.append((args, code))
+
+    for args, code in scenarios:
+        assert code == EXIT_BROKEN, f"{args} が読めない掲示板を {code} で通した"
+        assert code not in (EXIT_OK, EXIT_BUSY, EXIT_USAGE)
+
+    # **`--clean` だけは対象外。** 読めない・壊れたファイルを消すための経路なので、
+    # 完全性で門前払いしてはならない。
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        whole_board_unreadable(tmp_path)
+        assert run(tmp_path, "release", "--clean") == EXIT_OK

@@ -712,7 +712,12 @@ def test_release_does_not_remove_a_declaration_reclaimed_mid_flight(
     state = {"nested": False}
 
     def interleave(
-        self: Board, resource_id: str, *, expect_nonce: str, reason: str
+        self: Board,
+        resource_id: str,
+        *,
+        expect_nonce: str,
+        reason: str,
+        known: tuple[Path, Entry] | None = None,
     ) -> RemovalResult:
         if not state["nested"]:
             state["nested"] = True
@@ -732,7 +737,7 @@ def test_release_does_not_remove_a_declaration_reclaimed_mid_flight(
                 )
                 == 0
             )
-        return original(self, resource_id, expect_nonce=expect_nonce, reason=reason)
+        return original(self, resource_id, expect_nonce=expect_nonce, reason=reason, known=known)
 
     monkeypatch.setattr(Board, "remove_if_nonce", interleave)
     capsys.readouterr()
@@ -807,14 +812,18 @@ def corrupt(board: Board) -> None:
     (board.entries_dir / "壊れている.json").write_text("{ これは JSON ではない", encoding="utf-8")
 
 
-def test_a_corrupt_file_blocks_nothing_and_is_cleaned_by_clean(
+def test_a_corrupt_file_blocks_destructive_release_and_is_cleaned_by_clean(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """壊れたファイルは**何も塞がない**。掃除は ``rb release --clean`` である。
+    """壊れたファイルは**取得を塞がないが、破壊的な release は止める**。掃除は ``--clean``。
 
-    宣言のファイル名は nonce なので、読めないファイルがあっても新しい宣言は作れる。
-    一方、**中身が読めないファイルはどの資源のものか分からない**ので、資源を指した
-    ``--force`` では消せない。掃除の道は資源を指定しない ``--clean`` だけである。
+    宣言のファイル名は nonce なので、読めないファイルがあっても新しい宣言は作れる
+    ——**取得**は塞がれない。だが**破壊的な操作**（release）は別である。中身が
+    読めない以上 ``resource`` フィールドすら分からず、この壊れたファイルが GPU0 の
+    ものではないと証明できない（issue #17 指摘 1）。以前は「資源を指すのだから
+    無関係な壊れたファイルは見なくてよい」と `--force` が素通ししていたが、それは
+    証明できないことを証明できたことにしていた。掃除の道は資源を指定しない
+    ``--clean`` だけである。
 
     ここを取り違えると、次に読む人が「force で消えないのはバグだ」と考えて、
     **資源名からパスを組み立てる削除**を復活させる（それは平坦化が捨てた構造である）。
@@ -826,12 +835,19 @@ def test_a_corrupt_file_blocks_nothing_and_is_cleaned_by_clean(
 
     assert claim(tmp_path) == 0, "壊れたファイルが取得を塞いでいる"
 
-    assert run(tmp_path, "release", "GPU0", "--force") == 0
-    assert board.unreadable_paths() == stray, "--force が壊れたファイルを消している"
+    from resource_broker.cli import EXIT_BROKEN
+
+    code = run(tmp_path, "release", "GPU0", "--force")
+    assert code == EXIT_BROKEN, "壊れたファイルがあるのに強制解放が完了したと言っている"
+    assert board.unreadable_paths() == stray, "拒否したのに壊れたファイルへ触れている"
+    assert len(board.list_for(normalize("GPU0"))) == 1, "拒否したのに自分の宣言まで消えている"
 
     capsys.readouterr()
     assert run(tmp_path, "release", "--clean") == 0
     assert board.unreadable_paths() == [], "--clean で掃除できていない"
+
+    # 掃除した後は、もう拒否する理由が無い。
+    assert run(tmp_path, "release", "GPU0", "--force") == 0, "掃除した後もまだ拒否している"
 
 
 def test_claim_names_the_corrupt_entry_instead_of_failing_silently(

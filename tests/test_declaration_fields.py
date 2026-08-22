@@ -360,6 +360,9 @@ def test_history_pairs_by_nonce_when_two_declarations_share_resource_and_job(
     by_nonce = {c["nonce"]: c for c in payload["claims"]}
     assert by_nonce[a.nonce]["released_at"] is None, "まだ生きている A に解放が付いた"
     assert by_nonce[b.nonce]["elapsed_seconds"] == 540, "消した B に解放が対応付かない"
+    # **確実な対応付け（両方が nonce を持つ）は不確実フラグを立てない。**
+    assert by_nonce[a.nonce]["pairing_uncertain"] is False
+    assert by_nonce[b.nonce]["pairing_uncertain"] is False
 
 
 def test_history_falls_back_to_job_pairing_for_audit_logs_without_nonce(
@@ -387,6 +390,125 @@ def test_history_falls_back_to_job_pairing_for_audit_logs_without_nonce(
     (record,) = payload["claims"]
     assert record.get("nonce") is None
     assert record["elapsed_seconds"] == 300
+    # **どちらも nonce を持たないフォールバック対応付けは不確実だと表明する。**
+    assert record["pairing_uncertain"] is True
+
+
+# --- 新旧の監査ログが混在するローリング更新（issue #17 指摘 5） --------------------
+
+
+def test_history_pairs_an_old_claim_without_nonce_to_a_new_removal_with_nonce(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**古い ``claimed``（nonce 無し）と新しい ``removed``（nonce 有り）が混在しても対応が付く。**
+
+    ローリング更新で普通に起きる組み合わせである——宣言した時点では旧バージョンの
+    コードが動いていて ``claimed`` 監査に ``nonce`` を書かなかったが、解放した時点
+    では新バージョンに更新済みで ``removed`` 監査には ``nonce`` が書かれる。単純に
+    「両方が nonce を持てば nonce で決め打つ」だけだと、鍵の種類がそもそも揃わない
+    （旧側は資源+job、新側は資源+nonce）ため**絶対に一致しない**。2 段階の対応付け
+    （nonce 同士を先に、残りを資源+job のフォールバックへ）で拾えることを固定する。
+    """
+    board = Board(tmp_path)
+    base = clock.now()
+    monkeypatch.setattr(clock, "now", lambda: base)
+    # 宣言時は旧バージョン: claimed に nonce が無い。
+    board.audit("claimed", resource=normalize("GPU0"), job="混在ケース", eta={"stated": "40m"})
+    monkeypatch.setattr(clock, "now", lambda: base + timedelta(minutes=7))
+    # 解放時は新バージョンに更新済み: removed には nonce がある。
+    board.audit(
+        "removed",
+        resource=normalize("GPU0"),
+        job="混在ケース",
+        nonce="a" * 32,
+        reason="release コマンド",
+    )
+    capsys.readouterr()
+
+    assert run(tmp_path, "history", "GPU0", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    (record,) = payload["claims"]
+    assert record["elapsed_seconds"] == 420, "新旧混在で対応が付いていない"
+    assert record["pairing_uncertain"] is True
+
+
+def test_history_pairs_a_new_claim_with_nonce_to_an_old_removal_without_nonce(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**逆方向（新しい ``claimed`` と古い ``removed``）でも対応が付く。**
+
+    ローリング更新の途中で解放だけ旧バージョンのプロセスが行った場合を想定する。
+    片方向だけを直すと、混在の半分しか救えない（issue #17 指摘 5 は「両方向」を
+    明示している）。
+    """
+    board = Board(tmp_path)
+    base = clock.now()
+    monkeypatch.setattr(clock, "now", lambda: base)
+    # 宣言時は新バージョン: claimed に nonce がある。
+    board.audit(
+        "claimed",
+        resource=normalize("GPU0"),
+        job="逆方向の混在",
+        nonce="b" * 32,
+        eta={"stated": "40m"},
+    )
+    monkeypatch.setattr(clock, "now", lambda: base + timedelta(minutes=3))
+    # 解放時は旧バージョン: removed に nonce が無い。
+    board.audit(
+        "removed", resource=normalize("GPU0"), job="逆方向の混在", reason="release コマンド"
+    )
+    capsys.readouterr()
+
+    assert run(tmp_path, "history", "GPU0", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    (record,) = payload["claims"]
+    assert record["elapsed_seconds"] == 180, "逆方向の新旧混在で対応が付いていない"
+    assert record["pairing_uncertain"] is True
+
+
+def test_history_does_not_let_a_mismatched_nonce_steal_the_fallback_slot(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """nonce 付きの解放が**別の** nonce 付き宣言のものなら、無関係な宣言を奪わない。
+
+    2 本の宣言（A: nonce 無し、B: nonce 有り）が並び、B に対応する nonce 付きの
+    解放だけが記録されているとき、A はフォールバック（資源+job）で**別の**解放
+    （こちらも記録されていれば）とだけ対応し、B 用の解放を横取りしてはならない。
+    """
+    board = Board(tmp_path)
+    base = clock.now()
+    monkeypatch.setattr(clock, "now", lambda: base)
+    board.audit("claimed", resource=normalize("GPU0"), job="A・旧形式", eta={"stated": "40m"})
+    monkeypatch.setattr(clock, "now", lambda: base + timedelta(minutes=1))
+    board.audit(
+        "claimed",
+        resource=normalize("GPU0"),
+        job="A・旧形式",  # 同じ job にして、鍵が衝突しうる状況を作る
+        nonce="c" * 32,
+        eta={"stated": "40m"},
+    )
+    monkeypatch.setattr(clock, "now", lambda: base + timedelta(minutes=5))
+    # B（nonce 有り）だけを厳密に解放する。
+    board.audit(
+        "removed",
+        resource=normalize("GPU0"),
+        job="A・旧形式",
+        nonce="c" * 32,
+        reason="release --nonce コマンド",
+    )
+    capsys.readouterr()
+
+    assert run(tmp_path, "history", "GPU0", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    a_record, b_record = payload["claims"]
+    assert b_record.get("nonce") == "c" * 32
+    assert b_record["released_at"] is not None
+    assert b_record["pairing_uncertain"] is False, "厳密一致のはずが不確実になっている"
+    # A は nonce を持たないので、B 用の nonce 一致解放を奪えない。
+    assert a_record["released_at"] is None, "nonce の無い A が B の解放を横取りした"
 
 
 # --- はじいたときに次の一手を示す -------------------------------------------------

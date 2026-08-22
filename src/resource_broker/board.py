@@ -464,6 +464,37 @@ class Entry:
 
 
 @dataclass(frozen=True)
+class BoardListing:
+    """掲示板を列挙した結果。**tuple では返さない。**
+
+    以前は ``(entries, unreadable)`` という tuple で返していた。tuple は
+    ``entries, _ = board.list_all_detailed()`` のように第 2 要素を簡単に捨てられ、
+    実際にそれで「読めなかったものがあるか」という情報が失われ、破壊的操作が
+    読めない掲示板を「空」「一意」と誤認する欠陥につながった（issue #17 指摘 1）。
+    フィールドを持つ型にして、捨てるなら ``.pairs`` / ``.entries`` と明示させる。
+    """
+
+    pairs: list[tuple[Path, Entry]]
+    """読めた宣言（パスつき）。古い順とは限らない——並び順は呼び出し元の責務。"""
+
+    complete: bool
+    """**理由を問わず** ``Entry`` にできなかったファイルが 1 つも無かったか。
+
+    ``False`` になるのは、I/O で読めない・不正な UTF-8・JSON が壊れている・
+    必須フィールドが欠けている、のいずれかが 1 件でもあったときである。理由の
+    違いは「破壊的操作の判断材料としてこの列挙を信じてよいか」を変えない
+    ——読めなかった 1 件に、探している宣言が隠れているかもしれないという点は
+    理由によらず同じだからである。**理由じたいは監査ログに個別で残る**
+    （``entry_unreadable`` / ``entry_corrupt``。DESIGN.md「Corrupt Entries」）。
+    """
+
+    @property
+    def entries(self) -> list[Entry]:
+        """``Entry`` だけを取り出す。パスが要らない読み手のための便宜。"""
+        return [entry for _, entry in self.pairs]
+
+
+@dataclass(frozen=True)
 class OwnRemoval:
     """自分の宣言を消した結果。**3 つを畳まない。**
 
@@ -682,30 +713,58 @@ class Board:
         旧い置き場（``board/<資源>.json`` と ``board/joins/*.json``）も**同じ宣言として
         読む**。稼働中のセッションの宣言を、形式を変えた瞬間に見失わないためである。
         """
-        return self.declarations_detailed()[0]
+        return self.declarations_detailed().pairs
 
-    def declarations_detailed(self) -> tuple[list[tuple[Path, Entry]], bool]:
-        """全ての宣言と、**読めなかったものがあったか**を返す。"""
+    def declarations_detailed(self) -> BoardListing:
+        """全ての宣言と、**完全性**（:attr:`BoardListing.complete`）を返す。
+
+        **理由を問わず、1 件でも ``Entry`` にできなければ ``complete=False``。**
+        以前は I/O で読めない場合（``entry_unreadable``）だけを見て、JSON の破損
+        （``entry_corrupt``）や必須フィールドの欠落は「完全に読めた」側へ黙って
+        含めていた。壊れたファイルに、探している宣言が一致していないとは
+        証明できない以上、理由による差は無い（issue #17 指摘 1）。
+
+        **監査には理由を残す。** ``entry_unreadable``（I/O。共有違反など一時的な
+        事象かもしれない）と ``entry_corrupt``（中身が壊れている）は畳まない
+        ——``--clean`` の対象判定（:meth:`unreadable_paths`）が引き続きこの
+        区別を使うためである（DESIGN.md「Corrupt Entries」）。畳むのは
+        「破壊的操作の判断材料としての完全性」だけである。
+        """
         found: list[tuple[Path, Entry]] = []
         paths, unreadable = _json_files(self.entries_dir)
         legacy, legacy_unreadable = _json_files(self.entries_dir / "joins")
+        complete = not (unreadable or legacy_unreadable)
         for path in sorted(paths) + sorted(legacy):
             try:
                 text = path.read_text(encoding="utf-8")
             except OSError as exc:
                 # 読めないのは「壊れている」とは別の事実である。**空だと言わない側。**
                 self.audit("entry_unreadable", path=str(path), error=str(exc))
-                unreadable = True
+                complete = False
+                continue
+            except (UnicodeDecodeError, ValueError) as exc:
+                # **不正な UTF-8 は「読めない」ではなく「壊れている」側。** バイト列は
+                # 取れているので I/O の失敗ではなく、中身が正規の形をしていない
+                # ——JSON デコード失敗と同じ扱いにする。
+                self.audit("entry_corrupt", path=str(path), error=str(exc))
+                complete = False
                 continue
             try:
                 data = json.loads(text)
             except (json.JSONDecodeError, ValueError) as exc:
                 self.audit("entry_corrupt", path=str(path), error=str(exc))
+                complete = False
                 continue
             entry = Entry.from_dict(data)
-            if entry is not None:
-                found.append((path, entry))
-        return found, unreadable or legacy_unreadable
+            if entry is None:
+                # **JSON としては読めたが、宣言の形を最低限すら満たさない。**
+                # これも「完全に読めた」に含めてはならない——`resource` が
+                # 読めない以上、この 1 件がどの資源のものか分からない。
+                self.audit("entry_corrupt", path=str(path), reason="必須フィールドが読めない")
+                complete = False
+                continue
+            found.append((path, entry))
+        return BoardListing(pairs=found, complete=complete)
 
     def unreadable_paths(self) -> list[Path]:
         """**どの資源にも紐づけられないファイル**を返す。
@@ -728,6 +787,12 @@ class Board:
                     # 途中で名前を外した瞬間（`FileNotFoundError`）や、一時的な共有違反
                     # （`PermissionError`）は、**生きた宣言**でも起こる。ここへ入れると
                     # `--clean` がそれを消し、掲示板は空・資源は掴まれたままになる。
+                    continue
+                except (UnicodeDecodeError, ValueError):
+                    # **不正な UTF-8 は「壊れている」側。** バイト列は取れているので
+                    # 生きた宣言が一時的に読めないケースとは違う。JSON デコード失敗と
+                    # 同じ扱いにする（``declarations_detailed`` と揃える）。
+                    found.append(path)
                     continue
                 try:
                     data = json.loads(text)
@@ -763,14 +828,29 @@ class Board:
         """その資源の宣言を**古い順**に返す。
 
         順序は ``since`` で決まる。「どれが先に取ったか」を別に記録しない——
-        時間的に後のものが後から来たに決まっている。
+        時間的に後のものが後から来たに決まっている。**完全性は捨てる**
+        （読めなかったものがあっても黙って飛ばす）。完全性を見る場面は
+        :meth:`pairs_for_detailed` を使うこと。
         """
         return [entry for _, entry in self.pairs_for(resource_id)]
 
     def pairs_for(self, resource_id: str) -> list[tuple[Path, Entry]]:
-        """その資源の宣言を、パスつきで古い順に返す。"""
-        found = [(path, e) for path, e in self.declarations() if e.resource == resource_id]
-        return sorted(found, key=lambda item: (item[1].since, str(item[0])))
+        """その資源の宣言を、パスつきで古い順に返す。**完全性は捨てる。**"""
+        return self.pairs_for_detailed(resource_id).pairs
+
+    def pairs_for_detailed(self, resource_id: str) -> BoardListing:
+        """その資源の宣言を、パスつき・古い順・**完全性つき**で返す。
+
+        破壊的操作（``release`` の各経路）はここを使う。**完全性は掲示板全体を
+        基準にする**——資源で絞ったあとに「揃って見える」かどうかでは判断しない。
+        読めなかったファイルは中身が読めていない以上、それがこの資源のもの
+        ではないと言い切れない。資源で先に絞ってから完全性を見ると、絞る前の
+        段階で失われた情報を「たまたま全部読めた」と取り違える（issue #17 指摘 1）。
+        """
+        listing = self.declarations_detailed()
+        found = [(path, e) for path, e in listing.pairs if e.resource == resource_id]
+        found.sort(key=lambda item: (item[1].since, str(item[0])))
+        return BoardListing(pairs=found, complete=listing.complete)
 
     def declaration_path(self, nonce: str) -> Path:
         """宣言 1 件のパス。**ファイル名は nonce だけで、身元を持たない。**
@@ -828,7 +908,12 @@ class Board:
         return False
 
     def remove_if_nonce(
-        self, resource_id: str, *, expect_nonce: str, reason: str
+        self,
+        resource_id: str,
+        *,
+        expect_nonce: str,
+        reason: str,
+        known: tuple[Path, Entry] | None = None,
     ) -> RemovalResult:
         """**期待する nonce と一致するときだけ**消す（compare-and-swap）。
 
@@ -844,10 +929,28 @@ class Board:
            （成功した瞬間に元の名前は消えるので、同時に走った他方は「無い」になる）
         3. 捕まえた中身の nonce を確かめ、一致すれば消す。違えば**元へ戻す**
 
+        Parameters
+        ----------
+        known : tuple of (Path, Entry), optional
+            呼び出し側が**完全性を確認した列挙**（:meth:`pairs_for_detailed` など）
+            から既に持っている、消したい実体そのもの。渡された場合は 1 段目の
+            先読み（``pairs_for`` による再列挙）を行わない——再列挙は、選択の
+            直後に掲示板の一部が読めなくなっていても気づけず、実際には存在する
+            宣言を「無い」「別物になっている」と誤って断定しうる（issue #17
+            指摘 2）。選択に使ったのと同じ実体をそのまま 2 段目（捕獲）へ渡すことで、
+            選択と削除の間で完全性の情報を捨て直さない。2〜3 段目の正しさ
+            （原子的な捕獲と nonce の再確認）は ``known`` の有無に関わらず同じである
+            ——古くなった ``known`` を渡しても、捕獲後の nonce 照合が誤りを防ぐ。
+            捕獲が ``ABSENT``（選択した実体そのものが既に居ない）に終わったときは、
+            「本当に無い」か「別の宣言に入れ替わった」かを見分けるために、この
+            資源だけを対象とした 1 回きりの再確認を行う。その再確認自体が
+            不完全なら「無い」と断定せず ``FAILED`` に倒す（専用の結果値は増やさず、
+            呼び出し側が既に持つ「消えたと言わない」経路へ委ねる）。
+
         Returns
         -------
         RemovalResult
-            消した / 無かった / 別物だった / 消せなかった。
+            消した / 無かった / 別物だった / 消せなかった（確認できない場合を含む）。
 
         Notes
         -----
@@ -858,8 +961,6 @@ class Board:
         数回やり直して吸収し、吸収できなければ ``FAILED`` を返して**保守的に諦める**
         （消せていないのに消えたと答えるより、退けられなかったと答えるほうが安全である）。
         """
-        # 1. 先読み。**中身で探す。** ファイル名から場所を組み立てない——名前の付け方を
-        #    変えた瞬間に「見つからない」へ黙って倒れる（実際に一度そうなった）。
         if not expect_nonce:
             # **空文字を鍵にしてはならない。** nonce を持たない古い宣言は複数ありうるので、
             # 「nonce が空のもの」に一致させると**別の生きた宣言**を捕まえて消す。
@@ -867,6 +968,41 @@ class Board:
             self.audit("remove_refused", resource=resource_id, reason="nonce が空である")
             return RemovalResult.NOT_OWNED
 
+        if known is not None:
+            path, entry = known
+            if entry.nonce != expect_nonce:
+                # 呼び出し側の取り違え。念のため確かめる（実害は無いはずだが、
+                # 黙って別物を捕獲しにいくよりは早く気づけるほうがよい）。
+                self.audit("remove_refused", resource=resource_id, reason="nonce が一致しない")
+                return RemovalResult.NOT_OWNED
+            result = self._capture_and_remove(
+                path, expect_nonce=expect_nonce, resource_id=resource_id, reason=reason
+            )
+            if result is not RemovalResult.ABSENT:
+                return result
+            # **ABSENT を早合点しない。** 選択に使った実体そのものは居なくなって
+            # いても、この資源に**別の宣言**（他セッションが取り直した）が
+            # 残っているかもしれない——それは「無い」ではなく「入れ替わった」で
+            # あり、対処が違う。この確認だけは再列挙するが、選択の直前ではなく
+            # 削除が ABSENT に終わったあとの一度きりなので、選択時に確認した
+            # 完全性を日常的に捨て直す経路にはならない（issue #17 指摘 2 と対）。
+            listing = self.pairs_for_detailed(resource_id)
+            if not listing.complete:
+                # **「無い」と「確認できない」を分ける。** 専用の結果値は増やさず
+                # `FAILED` に倒す——`FAILED` は元々「操作を完了できなかった」を
+                # 表し、呼び出し側は既に「消えたとは言わない・保守的に扱う」という
+                # 経路を持っている。監査ログに理由を残すので、「本当に無い」との
+                # 違いは追跡できる。
+                self.audit(
+                    "remove_unconfirmed",
+                    resource=resource_id,
+                    reason="削除直後の再確認で掲示板の一部が読めない",
+                )
+                return RemovalResult.FAILED
+            return RemovalResult.NOT_OWNED if listing.pairs else RemovalResult.ABSENT
+
+        # 1. 先読み。**中身で探す。** ファイル名から場所を組み立てない——名前の付け方を
+        #    変えた瞬間に「見つからない」へ黙って倒れる（実際に一度そうなった）。
         pairs = self.pairs_for(resource_id)
         found = [(path, e) for path, e in pairs if e.nonce == expect_nonce]
         if not found:
@@ -1046,7 +1182,13 @@ class Board:
         _unlink_with_retry(tombstone)
 
     def remove_own(
-        self, resource_id: str, *, reason: str, nonce: str | None = None, cwd: str | None = None
+        self,
+        resource_id: str,
+        *,
+        reason: str,
+        nonce: str | None = None,
+        cwd: str | None = None,
+        declared: list[tuple[Path, Entry]] | None = None,
     ) -> OwnRemoval:
         """**自分の**宣言を消す。結果は 3 つに分けて返す（:class:`OwnRemoval`）。
 
@@ -1059,6 +1201,19 @@ class Board:
 
         ロックが取れないときは**囲わずに続行する**。解放できずに宣言を残すほうが
         有害であり、CAS という主防御は失われない。
+
+        Parameters
+        ----------
+        declared : list of (Path, Entry), optional
+            呼び出し側が**完全性を確認した列挙**（:meth:`pairs_for_detailed`）から
+            既に持っている、この資源の全宣言。渡された場合はここで再列挙しない
+            ——``pairs_for`` による再列挙は完全性の情報を持たないので、選択の
+            直後に一部が読めなくなっていても気づけず、「無い」「他人のもの」と
+            誤って断定しうる（issue #17 指摘 2・3）。破壊的操作の呼び出し側
+            （``_release_own`` / ``_release_by_nonce``）は必ずこれを渡す。
+            ``rb run`` の自動解放（``_release_after_run``）だけは渡さない
+            ——後始末は fail-open であり、完全性を確認できなければ動けないという
+            制約を持ち込むと、宣言が残る側へ倒れてしまう。
         """
         removed: list[Entry] = []
         failed: list[Entry] = []
@@ -1067,7 +1222,8 @@ class Board:
         with self.locked(resource_id) as lock:
             if lock is not LockState.ACQUIRED:
                 self.audit("remove_unlocked", resource=resource_id, lock=str(lock))
-            for path, entry in self.pairs_for(resource_id):
+            pairs = declared if declared is not None else self.pairs_for(resource_id)
+            for path, entry in pairs:
                 if nonce is not None and entry.nonce != nonce:
                     foreign.append(entry)
                     continue
@@ -1079,8 +1235,11 @@ class Board:
                 if entry.nonce:
                     # **CAS の入り口を 1 つに寄せる。** ここだけ `_capture_and_remove` を
                     # 直に呼ぶと、公開の入り口を差し替えても効かない経路ができる。
+                    # **`known` でこの場で読んだ実体を渡す。** 渡さないと
+                    # `remove_if_nonce` が内部でもう一度 `pairs_for` を呼び直し、
+                    # ここで確認したはずの完全性を捨て直すことになる（issue #17 指摘 2）。
                     result = self.remove_if_nonce(
-                        resource_id, expect_nonce=entry.nonce, reason=reason
+                        resource_id, expect_nonce=entry.nonce, reason=reason, known=(path, entry)
                     )
                 else:
                     # nonce を持たない古い宣言。**無条件に消さない**——固定パスなので、
@@ -1102,10 +1261,15 @@ class Board:
         """全ての宣言を読む。読めなかったものは飛ばす。"""
         return [entry for _, entry in self.declarations()]
 
-    def list_all_detailed(self) -> tuple[list[Entry], bool]:
-        """全ての宣言と、**読めなかったものがあったか**を返す。"""
-        found, unreadable = self.declarations_detailed()
-        return [entry for _, entry in found], unreadable
+    def list_all_detailed(self) -> BoardListing:
+        """全ての宣言と、**完全性**（:attr:`BoardListing.complete`）を返す。
+
+        ``declarations_detailed`` と中身は同じである（別に持たない——同じ完全性を
+        2 つの型で表現すると、片方だけ直して他方を直し忘れる経路ができる）。
+        名前を分けているのは、呼び出し側の語彙（「宣言」ではなく「掲示板全体」）に
+        合わせるためだけである。
+        """
+        return self.declarations_detailed()
 
     def declare(self, entry: Entry) -> bool:
         """宣言を 1 件、掲示板に残す。残せたら True。
