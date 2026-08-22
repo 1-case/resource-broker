@@ -81,7 +81,25 @@ jobs:
           # 出力が化ける。機械可読な --json を数える。
           rb status --json > board.json
           test "$(grep -c '"nonce"' board.json)" = 2
-          rb release CI-RESOURCE
+          # 自分の宣言が 2 件あるときの release は曖昧なので拒否される（issue #8 の契約）。
+          # 何も消さずに EXIT_USAGE(2) を返すことと、拒否のあと宣言が減っていないことの
+          # 両方を確かめる——「拒否されたのに消えていた」は事後報告では手遅れになる事故である。
+          if rb release CI-RESOURCE; then
+            echo "release resolved an ambiguous (2-declaration) resource without --all/--nonce" >&2
+            exit 1
+          fi
+          rb status --json > board.json
+          test "$(grep -c '"nonce"' board.json)" = 2
+          # nonce の前方一致（rb status --json に載る先頭 8 桁）で 1 本だけを狙って
+          # 消せることを確かめる。**外部の処理系を仮定しない。** jq は Git Bash に無く、
+          # このジョブは setup-python を持たないので python が PATH にある保証もない
+          # （Windows では Store スタブに当たる）。grep と sed だけで取る。
+          NONCE=$(grep -o '"nonce": "[0-9a-f]\{8\}' board.json | head -1 | sed 's/.*"//')
+          rb release --nonce "$NONCE"
+          rb status --json > board.json
+          test "$(grep -c '"nonce"' board.json)" = 1
+          # 残りは --all でまとめて消す（曖昧さの拒否を明示的に上書きする経路）。
+          rb release CI-RESOURCE --all
           rb status --json > empty.json
           grep -q '"resources": \[\]' empty.json
 
@@ -97,7 +115,7 @@ jobs:
       - name: Validate the plugin manifest
         run: npx --yes @anthropic-ai/claude-code plugin validate .
 
-  # 版が 3 箇所に散っている。ずれると /plugin が古い版を表示し続け、更新が届かない。
+  # 版が 4 箇所に散っている。ずれると /plugin が古い版を表示し続け、更新が届かない。
   manifests:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -110,7 +128,12 @@ jobs:
           plugin = json.loads(pathlib.Path(".claude-plugin/plugin.json").read_text(encoding="utf-8"))["version"]
           market = json.loads(pathlib.Path(".claude-plugin/marketplace.json").read_text(encoding="utf-8"))["plugins"][0]["version"]
           pyproj = re.search(r'^version = "([^"]+)"', pathlib.Path("pyproject.toml").read_text(encoding="utf-8"), re.M).group(1)
-          if not plugin == market == pyproj:
-              sys.exit(f"version mismatch: plugin={plugin} marketplace={market} pyproject={pyproj}")
+          init = re.search(
+              r'^__version__ = "([^"]+)"',
+              pathlib.Path("src/resource_broker/__init__.py").read_text(encoding="utf-8"),
+              re.M,
+          ).group(1)
+          if not plugin == market == pyproj == init:
+              sys.exit(f"version mismatch: plugin={plugin} marketplace={market} pyproject={pyproj} init={init}")
           print(f"version ok: {plugin}")
           PY

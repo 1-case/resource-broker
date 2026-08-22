@@ -194,14 +194,16 @@ def test_a_self_hosted_runner_never_accepts_a_fork_pull_request() -> None:
             )
 
 
-# --- 版番号は 3 か所に手書きされている ---------------------------------------------
+# --- 版番号は 4 か所に手書きされている ---------------------------------------------
 
 
 def test_the_version_is_the_same_everywhere() -> None:
-    """``pyproject.toml`` / ``plugin.json`` / ``marketplace.json`` の版が一致している。
+    """``pyproject.toml`` / ``plugin.json`` / ``marketplace.json`` / ``__init__.py`` の版が
+    一致している。
 
-    3 か所に手書きされていて、ずれても誰も気づかない。マーケットプレイス側だけ古い版が
-    出る、あるいは入れた版と名乗る版が食い違う、という形で表に出る。
+    4 か所に手書きされていて、ずれても誰も気づかない。マーケットプレイス側だけ古い版が
+    出る、あるいは入れた版と名乗る版が食い違う、という形で表に出る。``__init__.py`` は
+    一度この検査の対象から漏れて ``0.1.0`` のまま取り残されたことがある。
     """
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     match = re.search(r'^version = "([^"]+)"', pyproject, re.M)
@@ -212,6 +214,15 @@ def test_the_version_is_the_same_everywhere() -> None:
         data = json.loads((ROOT / ".claude-plugin" / name).read_text(encoding="utf-8"))
         found = data.get("version") or data["plugins"][0]["version"]
         assert found == expected, f"{name} の版 {found} が pyproject の {expected} と違う"
+
+    # __init__.py は import せず、pyproject.toml と同じ流儀でテキストとして読む。
+    # import してしまうと、この検査だけがパッケージを import できる前提を増やす。
+    init_py = (ROOT / "src" / "resource_broker" / "__init__.py").read_text(encoding="utf-8")
+    init_match = re.search(r'^__version__ = "([^"]+)"', init_py, re.M)
+    assert init_match, "__init__.py に __version__ が無い"
+    assert init_match.group(1) == expected, (
+        f"__init__.py の版 {init_match.group(1)} が pyproject の {expected} と違う"
+    )
 
 
 # --- README が数えている件数と実装を一致させる ---------------------------------------
