@@ -64,8 +64,7 @@ def safe_filename(resource_id: str) -> str:
     """資源 ID を掲示板のファイル名（拡張子なし）に変換する。
 
     衝突を避けるため ID の SHA-256 の先頭 8 桁を必ず付ける。
-    ハッシュが付くことで ``nul`` や ``con`` などの Windows 予約名にもならない
-    （CLAUDE.md「File Safety」）。
+    ハッシュが付くことで ``nul`` や ``con`` などの Windows 予約名にもならない。
 
     Parameters
     ----------

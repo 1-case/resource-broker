@@ -8,8 +8,7 @@
 ``PYTHONUNBUFFERED`` を子の環境へ入れることで行い、**コマンド行を解釈しない**
 （``python`` を見つけて ``-u`` を挿す実装は、`uv run python` や `py -3` を取りこぼす）。
 
-テストでは ``spawn`` を差し替えて実プロセスを起動せずに検証できる
-（CLAUDE.md「Testing Constraints」）。
+テストでは ``spawn`` を差し替えて実プロセスを起動せずに検証できる。
 """
 
 from __future__ import annotations
@@ -234,10 +233,9 @@ def _pump(source: object, sink: object, limit: int) -> None:
 
     **読むのをやめてはならない。** パイプが詰まると子が書き込みでブロックし、
     「ログの上限」がジョブの停止に化ける。本ツールがユーザーの作業を止めてよい場面は
-    無い（CLAUDE.md「Fail-Open」）。
+    無い。
 
-    捨て始めたことは 1 行残す。黙って捨てると、読む側は「ここでジョブが止まった」と読む
-    （CLAUDE.md「Silence Is Not Success」）。
+    捨て始めたことは 1 行残す。黙って捨てると、読む側は「ここでジョブが止まった」と読む。
     """
     written = 0
     truncated = False
@@ -272,7 +270,7 @@ def _pump(source: object, sink: object, limit: int) -> None:
                 #
                 # **黙って切らない。** 上限のときはログに 1 行残すのに、書けなくなった
                 # ときだけ何も言わないと、ログはぶつ切りになり読む側は「ここでジョブが
-                # 止まった」と読む（CLAUDE.md「Silence Is Not Success」）。ログには
+                # 止まった」と読む。ログには
                 # もう書けないので、言える場所は stderr しかない。
                 _warn(f"警告: ログに書けなくなりました（{exc}）。ジョブは継続します")
                 truncated = True
@@ -310,7 +308,7 @@ def default_spawn(argv: list[str], log_path: Path, env: Mapping[str, str]) -> in
     if stream is None:
         # **ログが開けないのはインフラの故障であって資源の競合ではない。**
         # ここで諦めると「ログ置き場が書けないからジョブが走らない」ことになる。
-        # 本ツールがユーザーの作業を止めてよい場面は無い（CLAUDE.md「Fail-Open」）。
+        # 本ツールがユーザーの作業を止めてよい場面は無い。
         # 子の出力は捕まえずに親へ素通しする。**黙って捨てるほうが悪い。**
         # **この print で落ちない。** ``rb run ... 2>&1 | head`` のように stderr が
         # 閉じていると ``BrokenPipeError`` になり、呼び出し側の catch-all が 126 を返す
@@ -392,8 +390,7 @@ def _warn_if_descendants_survive(process: subprocess.Popen[bytes], sink: IO[byte
     最も検出しにくい不整合ができる。
 
     **待たない。** 常駐する子孫を待てば ``rb run`` が返らなくなり、それはこのツールが
-    ユーザーの作業を止めることになる。できるのは黙らないことである
-    （CLAUDE.md「Silence Is Not Success」）。
+    ユーザーの作業を止めることになる。できるのは黙らないことである。
 
     **これは POSIX でしか発火しない。** Windows にはプロセスグループの同じ概念が無く、
     :func:`_group_alive` は常に None を返す。そちらでは ``taskkill /T`` が木ごと落とす
