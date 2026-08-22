@@ -5,4 +5,4 @@
 CLAUDE.md「Domain-Specific Rules」を参照。
 """
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"

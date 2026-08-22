@@ -9,7 +9,7 @@
       "name": "resource-broker",
       "source": "./",
       "description": "Japanese-language tool. A bulletin board that keeps concurrent Claude Code sessions on one machine from fighting over finite resources: declare before you use, stay visible to everyone else. It never blocks a command, never inspects a resource, and never interprets a declaration. ／ 同じマシンで動く複数の Claude Code セッションが有限資源を取り合わないための掲示板。 The CLI output, hook notices and design docs are in Japanese; hooks can be silenced with RESOURCE_BROKER_DISABLE.",
-      "version": "0.2.1",
+      "version": "0.3.0",
       "author": {
         "name": "satorunnlg"
       },
