@@ -13,6 +13,7 @@ from __future__ import annotations
 import builtins
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -638,6 +639,138 @@ def test_command_line_is_not_interpreted(tmp_path: Path) -> None:
         cli_module.SPAWN = runner.default_spawn  # type: ignore[assignment]
 
     assert captured["argv"] == original
+
+
+# --- コマンド名の解決を呼び出し元の PATH に合わせる（issue #23） ------------------------
+
+
+def test_resolve_launch_target_leaves_absolute_or_qualified_names_untouched() -> None:
+    """絶対パス・区切り文字を含む名前・空は解決しない。**明示は暗黙に勝つ**。"""
+    env = {"PATH": os.environ.get("PATH", "")}
+
+    assert runner._resolve_launch_target([], env) is None
+    assert runner._resolve_launch_target([""], env) is None
+    assert runner._resolve_launch_target([sys.executable], env) is None  # 絶対パス
+    assert runner._resolve_launch_target(["./bash"], env) is None  # "/" を含む
+    assert runner._resolve_launch_target(["foo\\bash"], env) is None  # "\\" を含む
+
+
+def test_resolve_launch_target_does_not_stop_on_an_unresolvable_name() -> None:
+    """``which`` が見つけられなくても None を返すだけで止まらない（fail-open）。
+
+    呼び出し側（``rb run``）はここで諦めず、OS の答え（``exit=127`` 等）に委ねる。
+    """
+    env = {"PATH": os.environ.get("PATH", "")}
+
+    assert runner._resolve_launch_target(["この名前のコマンドは存在しない-rb-test"], env) is None
+
+
+def test_resolve_launch_target_uses_the_child_environments_path() -> None:
+    """解決に使う PATH は ``os.environ`` ではなく**子へ渡す環境**の PATH である。
+
+    ズレると「解決した実体と、子が見る PATH」が食い違う。呼び出し元の
+    ``os.environ`` からは見えない（空の PATH を渡す）のに、渡した env の PATH
+    でだけ見つかる名前で確かめる。
+    """
+    name = os.path.basename(sys.executable)
+    directory = str(Path(sys.executable).parent)
+
+    # 空の PATH を明示的に渡すと、os.environ 側に本物があっても見えない
+    assert runner._resolve_launch_target([name], {"PATH": ""}) is None
+
+    resolved = runner._resolve_launch_target([name], {"PATH": directory})
+    assert resolved is not None
+    assert os.path.normcase(resolved) == os.path.normcase(sys.executable)
+
+
+def test_argv0_is_preserved_while_the_resolved_executable_is_launched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``executable=`` へ解決した実体を渡しても、``argv[0]`` は書き換えない。
+
+    実プロセスは ``sys.executable`` の短命なコマンドに限る。``subprocess.Popen``
+    の呼び出しを横取りし、渡された argv と ``executable=`` を確かめる
+    （argv[0] は名前だけにし、その実体を子環境の PATH で解決させる）。
+    """
+    captured: dict[str, object] = {}
+    real_popen = subprocess.Popen
+
+    def spy(args: list[str], *a: object, **kw: object) -> subprocess.Popen[bytes]:
+        captured["args"] = list(args)
+        captured["executable"] = kw.get("executable")
+        return real_popen(args, *a, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runner.subprocess, "Popen", spy)
+    monkeypatch.setenv(
+        "PATH", str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")
+    )
+
+    name = os.path.basename(sys.executable)
+    code = rb_run(tmp_path, name, "-c", "print('ok')")
+
+    assert code == 0
+    assert captured["args"][0] == name, "argv[0] が書き換わっている"
+    assert os.path.normcase(str(captured["executable"])) == os.path.normcase(sys.executable)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="issue #23 の再現は Windows 固有")
+def test_windows_launches_the_bash_the_caller_would_get(tmp_path: Path) -> None:
+    """Windows で ``bash`` は**呼び出し元の PATH が指す実体**で起動する（issue #23）。
+
+    ``CreateProcess`` は PATH より先に System32 を探すため、素朴な
+    ``Popen(["bash", ...])`` は呼び出し元のシェルで通る ``bash`` とは別の実体
+    （System32 の WSL ランチャ）に化けていた。``uname -s`` の出力を、
+    ``shutil.which("bash")`` が指す実体を直接起動したときの出力と突き合わせる。
+    """
+    resolved = shutil.which("bash")
+    if resolved is None:
+        pytest.skip("bash が PATH に無い")
+
+    expected = subprocess.run(
+        [resolved, "-c", "uname -s"], capture_output=True, text=True, timeout=30
+    ).stdout.strip()
+
+    log = tmp_path / "job.log"
+    code = rb_run(tmp_path, "bash", "-c", "uname -s", log=str(log))
+
+    assert code == 0
+    text = log.read_text(encoding="utf-8", errors="replace")
+    assert expected in text
+
+
+def test_the_log_header_records_the_actually_launched_executable(tmp_path: Path) -> None:
+    """ログの見出しに、起動できた実体の絶対パスが残る（取得できる環境で）。
+
+    Windows / Linux では取れることを確かめる。それ以外（macOS 等）は本検査の対象外
+    ――取らないことが仕様であり、失敗ではない。
+    """
+    if sys.platform != "win32" and not sys.platform.startswith("linux"):
+        pytest.skip("Windows / Linux 以外は実体の記録を取らない仕様")
+
+    log = tmp_path / "job.log"
+
+    code = rb_run(tmp_path, sys.executable, "-c", "print('ok')", log=str(log))
+
+    assert code == 0
+    text = log.read_text(encoding="utf-8", errors="replace")
+    assert "実体" in text
+    assert os.path.normcase(sys.executable) in os.path.normcase(text)
+
+
+def test_rb_run_succeeds_even_when_capturing_the_actual_executable_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """実体の取得（``ctypes`` / ``/proc``）が壊れても ``rb run`` は成功する（fail-open）。
+
+    ログの装飾のために、起動済みの子プロセスを待たないまま終わることがあってはならない。
+    """
+
+    def explode(_pid: int) -> str | None:
+        raise RuntimeError("取得に失敗した")
+
+    monkeypatch.setattr(runner, "_actual_executable_path", explode)
+
+    assert rb_run(tmp_path, sys.executable, "-c", "print('ok')") == 0
 
 
 def test_a_custom_log_directory_is_never_pruned(tmp_path: Path) -> None:
