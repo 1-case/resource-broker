@@ -4,10 +4,14 @@
 # **python が見つからないときに 0 を返さない。** `rb run` は「走らなかったジョブを
 # 成功と報告しない」という規約を持つ。ここで 0 を返すと、コマンドを 1 度も起動して
 # いないのに成功として扱われる。
+#
+# この 2 本のエラーメッセージだけは英語のままにする。**Python が動く前**の失敗なので
+# `resource_broker.messages` の言語判定を使えない。`bin/rb.cmd` は元から英語
+# （`rb: no Python 3.11+ found`）なので、文言もそちらに揃える。
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd) || {
-    echo "rb: 自分の場所を特定できません" >&2
+    echo "rb: could not determine my own location" >&2
     exit 127
 }
 posix_script="$here/bin/rb.py"
@@ -50,5 +54,5 @@ for py in py python3.13 python3.12 python3.11 python3 python; do
     exec "$py" "$script" ${1+"$@"}
 done
 
-echo "rb: python が見つかりません（resource-broker は Python 3.11 以上を必要とします）" >&2
+echo "rb: no Python 3.11+ found" >&2
 exit 127

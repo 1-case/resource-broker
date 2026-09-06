@@ -40,6 +40,7 @@ from .board import (
     first_declaration,
 )
 from .liveness import Observation, Verdict
+from .messages import detect_language, tr, use_language
 
 EXIT_OK = 0
 EXIT_BUSY = 1
@@ -319,12 +320,12 @@ def _report_unreadable(board: Board) -> None:
     paths = board.unreadable_paths()
     if not paths:
         return
-    print(f"  読めないファイルが {len(paths)} 件あります（どの資源のものか判別できません）")
+    print("  " + tr("unreadable_files_found", count=len(paths)))
     for path in paths[:5]:
         print(f"    {path}")
     if len(paths) > 5:
-        print(f"    ほか {len(paths) - 5} 件")
-    print("  掃除するなら rb release --clean（資源は指定しない）")
+        print("    " + tr("unreadable_files_more", count=len(paths) - 5))
+    print("  " + tr("unreadable_files_cleanup_hint"))
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -369,11 +370,11 @@ def _cmd_status(args: argparse.Namespace) -> int:
                     for verdict, entry in judged
                 ],
                 "reason": (
-                    f"{len(living)} 件の宣言がある"
+                    tr("declarations_count_active", count=len(living))
                     if occupied
                     else liveness.explain(judged[0][0])
                     if judged
-                    else "宣言が無い"
+                    else tr("no_declaration")
                 ),
             }
         )
@@ -385,28 +386,28 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
     if not rows:
         if unreadable:
-            print("掲示板を読めませんでした。**空とは限りません**")
-            print(f"  掲示板の場所: {board.root}")
-            print("  権限・パス・ネットワークドライブの接続を確かめること")
+            print(tr("board_unreadable"))
+            print("  " + tr("board_location", root=board.root))
+            print("  " + tr("check_permissions_and_paths"))
             _report_unreadable(board)
             return EXIT_OK
-        print("掲示板は空です（誰も資源を宣言していません）")
-        print("使う前に自分で資源の状態を調べ、rb claim で宣言すること")
+        print(tr("board_empty"))
+        print(tr("check_yourself_before_claim"))
         return EXIT_OK
 
     if unreadable:
-        print("注意: 掲示板の一部を読めませんでした。**これで全部とは限りません**")
+        print(tr("board_partially_unreadable_notice"))
         _report_unreadable(board)
 
     for row in rows:
-        mark = "使用中" if row["occupied"] else "空き"
+        mark = tr("mark_occupied") if row["occupied"] else tr("mark_free")
         print(f"{row['label']:<24} {mark:<6} {row['reason']}")
 
         # **宣言を古い順に並べるだけ。** 役割で分けない——どれが先かは since に出ている。
         for index, declaration in enumerate(row["declarations"], start=1):
             holder = declaration["holder"] or {}
-            ghost = " ※幽霊と判定" if declaration.get("verdict") == "free" else ""
-            job = declaration["job"] or "(ジョブ未記入)"
+            ghost = " " + tr("marked_as_ghost") if declaration.get("verdict") == "free" else ""
+            job = declaration["job"] or tr("no_job")
             # **PID を出す。** 自動回収は「猶予経過 + 実測空き + PID 死亡」の 3 条件が
             # 揃ったときだけで、揃わない宣言は残る。どれが死んでいるかを読む側が
             # 見分けられないと、記録している意味が無い。
@@ -418,35 +419,40 @@ def _cmd_status(args: argparse.Namespace) -> int:
             nonce = holder.get("nonce")
             nonce_marker = f" nonce {nonce[:8]}" if isinstance(nonce, str) and nonce else ""
             print(
-                f"{'':<24} 宣言{index}  {holder.get('session', '?')}{marker}"
-                f"{nonce_marker} / {job}{ghost}"
+                f"{'':<24} {tr('declaration_label', index=index)}  "
+                f"{holder.get('session', '?')}{marker}{nonce_marker} / {job}{ghost}"
             )
 
             held = declaration["held_for_seconds"]
-            elapsed = f"（{_format_duration(held)} 経過）" if held is not None else ""
+            elapsed = (
+                tr("elapsed_since", duration=_format_duration(held)) if held is not None else ""
+            )
             print(f"{'':<24}        since {declaration['since']}{elapsed}")
 
             eta = declaration["eta"] or {}
             if eta.get("stated"):
-                at = f"（{eta['at']} 頃）" if eta.get("at") else ""
-                print(f"{'':<24}        ETA {eta['stated']}{at}  ※申告であって約束ではない")
+                at = tr("eta_at", at=eta["at"]) if eta.get("at") else ""
+                print(f"{'':<24}        ETA {eta['stated']}{at}  {tr('not_a_promise')}")
             usage = declaration["usage"] or {}
             if usage.get("peak") or usage.get("avg"):
-                print(
-                    f"{'':<24}        見積 瞬時最大 {usage.get('peak') or '-'}"
-                    f" / 平均 {usage.get('avg') or '-'}"
+                estimate = tr(
+                    "usage_estimate", peak=usage.get("peak") or "-", avg=usage.get("avg") or "-"
                 )
+                print(f"{'':<24}        {estimate}")
             if declaration["sharing"]:
-                print(f"{'':<24}        共有 {declaration['sharing']}")
+                print(f"{'':<24}        {tr('sharing_label', sharing=declaration['sharing'])}")
             if declaration["log"]:
                 print(f"{'':<24}        log {declaration['log']}")
             observed = declaration["observed"] or {}
             if observed.get("note"):
-                print(f"{'':<24}        観測 {observed['note']}")
-                print(f"{'':<24}             （{observed.get('at', '時刻不明')} 時点の申告）")
+                print(f"{'':<24}        {tr('observed_label', note=observed['note'])}")
+                print(
+                    f"{'':<24}             "
+                    + tr("observed_at", at=observed.get("at") or tr("unknown_time"))
+                )
 
         if row["holders"] > 1:
-            print(f"{'':<24} 合計   {row['holders']} 件の宣言")
+            print(f"{'':<24} {tr('total_declarations', count=row['holders'])}")
     return EXIT_OK
 
 
@@ -492,9 +498,7 @@ def acquire(
             #
             # **黙って続行しない。** ロックが取れないのは本ツール側の事情であって
             # 資源の競合ではない。混同すると「使用中」と読まれる。
-            notices.append(
-                f"[rb] 掲示板のロックを取れませんでした（{lock}）。**排他を弱めて続行**します"
-            )
+            notices.append(tr("lock_not_acquired", lock=lock))
             board.audit("claim_unlocked", resource=resource_id, lock=str(lock))
 
         judged, listing = assess_detailed(board, resource_id, observation)
@@ -505,14 +509,11 @@ def acquire(
             # 隠れているかもしれない——不完全な候補集合から他人の宣言を消すのが
             # issue #18 指摘 1 の欠陥そのものである。``claim`` 本体の fail-open は
             # 変えない（資源アクセスは止めない）が、**退去だけは止める**。
-            notices.append(
-                "[rb] 掲示板の一部を読めませんでした。**退去は行わず**続行します"
-                "（生きた宣言を見逃している可能性があります）"
-            )
+            notices.append(tr("ghost_eviction_skipped_partial"))
             board.audit(
                 "claim_unconfirmed",
                 resource=resource_id,
-                reason="掲示板の一部が読めない",
+                reason=tr("reason_board_partially_unreadable"),
                 force=force,
             )
             living = [e for verdict, _, e in judged if not liveness.is_free(verdict)]
@@ -524,7 +525,7 @@ def acquire(
             for (verdict, _path, entry), selection in zip(judged, selections, strict=True):
                 if not liveness.is_free(verdict):
                     continue
-                reason = "強制取得" if force else "幽霊と判定した"
+                reason = tr("reason_forced_takeover") if force else tr("reason_judged_a_ghost")
                 # **force=True で渡す。** ここは既に `assess_detailed` が幽霊と判定した
                 # 個体を、完全性を確認した列挙からそのまま消す場面であり、``--force``
                 # と同じ「個体を選ぶ責任は呼び出し側が持ち、CAS は実体の入れ替わりだけを
@@ -546,13 +547,11 @@ def acquire(
             living, living_listing = live_declarations_detailed(board, resource_id, observation)
 
             if not living_listing.complete:
-                notices.append(
-                    "[rb] 掲示板の一部を読めませんでした。**追加の退去は行わず**続行します"
-                )
+                notices.append(tr("ghost_reeviction_skipped_partial"))
                 board.audit(
                     "claim_unconfirmed",
                     resource=resource_id,
-                    reason="退去後の再読み取りで一部が読めない",
+                    reason=tr("reason_partial_after_reeviction"),
                     force=force,
                 )
             elif force:
@@ -563,7 +562,9 @@ def acquire(
                     selection = living_selections.get(entry.nonce)
                     if selection is None:
                         continue  # 理論上起きない（living は living_listing.pairs の部分集合）
-                    removal = board.remove_confirmed(selection, reason="強制取得", force=True)
+                    removal = board.remove_confirmed(
+                        selection, reason=tr("reason_forced_takeover"), force=True
+                    )
                     if removal is RemovalResult.REMOVED:
                         living.remove(entry)
 
@@ -579,32 +580,30 @@ def acquire(
         if (living or found == "busy") and not share and not force:
             label = naming.display_default(resource_id)
             if living:
-                notices.append(
-                    f"[rb] {label} は使用中です（既に {len(living)} 件の宣言があります）"
-                )
+                notices.append(tr("resource_in_use_with_count", label=label, count=len(living)))
             else:
-                notices.append(f"[rb] {label} は使用中です（自分で busy と申告している）")
+                notices.append(tr("resource_in_use_self_reported", label=label))
             notices.extend(
-                f"  {e.session} / {e.job}（since {e.since}）"
-                + (f"  申し送り: {e.sharing}" if e.sharing else "")
+                tr("holder_line", session=e.session, job=e.job, since=e.since)
+                + (tr("handover_note_suffix", sharing=e.sharing) if e.sharing else "")
                 for e in living
             )
             if found == "free":
                 # 申告と掲示板が食い違っている。**「空き」は宣言を退ける根拠にならない**
                 # （宣言はジョブが資源を掴む前に出る）ので、掲示板の側を採る。
-                notices.append("  あなたの申告は free です。**どちらかが古い。**")
-            notices.append(
-                "  並んで使うなら --share。宣言が古いと判断したなら --force で退けること"
-            )
+                notices.append(tr("your_report_says_free"))
+            notices.append(tr("share_or_force_advice"))
             # **待つ道を必ず示す。** 断るだけで次の手を示さないと、待つ側は
             # 同じコマンドを繰り返すしかない。
-            notices.append(f"  空くのを待つなら rb wait {resource_id}")
+            notices.append(tr("wait_advice_line", resource_id=resource_id))
             for text in notices:
                 _say(text, err=True)
             board.audit(
                 "claim_refused",
                 resource=resource_id,
-                reason="生きた宣言がある" if living else "自分で busy と申告している",
+                reason=tr("reason_live_declaration_exists")
+                if living
+                else tr("reason_self_reported_busy"),
                 holder=living[0].session if living else None,
                 sharing=(living[0].sharing or None) if living else None,
                 holders=len(living),
@@ -624,15 +623,13 @@ def acquire(
         )
         declared = board.declare(new_entry)
         if not declared:
-            notices.append("警告: 宣言を掲示板に残せていません（他セッションからは見えません）")
+            notices.append(tr("declaration_not_saved_notice"))
 
         # 読めないファイルは何も塞がないが、`status` が留保を出し続ける原因になる。
         # 取得の場面でも場所を教えておく（掃除の道を示さないと放置される）。
         stray = board.unreadable_paths()
         if stray:
-            notices.append(
-                f"[rb] 壊れたエントリが {len(stray)} 件あります（掃除: rb release --clean）"
-            )
+            notices.append(tr("stray_entries_notice", count=len(stray)))
 
         # **書いた直後に読み直す。** 平坦にした代償として、`O_EXCL` による「先着 1 名」が
         # 無くなった。読んでから書くまでの窓で 2 セッションが同時に通り抜けられる
@@ -650,12 +647,12 @@ def acquire(
                 if e.nonce != new_entry.nonce and e.nonce not in {x.nonce for x in living}
             ]
             if latecomers:
-                notices.append(
-                    f"[rb] **ほぼ同時に {len(latecomers)} 件の宣言が入りました。**"
-                    "先着を決める仕組みはありません"
+                notices.append(tr("simultaneous_notice", count=len(latecomers)))
+                notices.extend(
+                    tr("holder_line", session=e.session, job=e.job, since=e.since)
+                    for e in latecomers
                 )
-                notices.extend(f"  {e.session} / {e.job}（since {e.since}）" for e in latecomers)
-                notices.append("  重なって困るなら、どちらかが rb release して rb wait すること")
+                notices.append(tr("overlap_advice"))
                 board.audit(
                     "simultaneous",
                     resource=resource_id,
@@ -663,10 +660,10 @@ def acquire(
                 )
 
     if living:
-        notices.append(f"[rb] この資源には既に {len(living)} 件の宣言があります")
+        notices.append(tr("resource_already_has_declarations", count=len(living)))
         notices.extend(
-            f"  {e.session} / {e.job}（since {e.since}）"
-            + (f" 共有: {e.sharing}" if e.sharing else "")
+            tr("holder_line", session=e.session, job=e.job, since=e.since)
+            + (" " + tr("sharing_note_suffix", sharing=e.sharing) if e.sharing else "")
             for e in living
         )
     for text in notices:
@@ -698,13 +695,10 @@ def _explain_failed_displacement(removal: RemovalResult) -> str:
     後者は待機）。どちらの場合も取得は諦める。
     """
     if removal is RemovalResult.FAILED:
-        return "退けようとした宣言を消せませんでした（掲示板に残っています。監査ログを参照）"
+        return tr("eviction_failed")
     if removal is RemovalResult.UNCONFIRMED:
-        return (
-            "退けようとした宣言の消去を確認できませんでした"
-            "（掲示板の一部が読めません。監査ログを参照）"
-        )
-    return "退けようとした宣言が入れ替わりました（他セッションが先に取り直した可能性）"
+        return tr("eviction_unconfirmed")
+    return tr("eviction_swapped")
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
@@ -734,7 +728,13 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         _warn_not_declared()
         return result.code
 
-    print(f"宣言しました: {naming.display_default(result.entry.resource)} / {result.entry.job}")
+    print(
+        tr(
+            "declared_notice",
+            resource=naming.display_default(result.entry.resource),
+            job=result.entry.job,
+        )
+    )
     return EXIT_OK
 
 
@@ -749,9 +749,9 @@ def _warn_not_declared() -> None:
     """
     # **_say で出す。** ここは掲示板へ書いた後であり、出力が例外を出すと
     # 「宣言だけ残ってジョブが 1 度も走らない」になる（`_say` の docstring 参照）。
-    _say("警告: 宣言を掲示板に残せていません。他セッションからは見えません", err=True)
-    _say("  他セッションはこの利用を知らないまま同じ資源を取りにきます", err=True)
-    _say("  作業は止めませんが、衝突を避けたいなら掲示板の状態を確かめること", err=True)
+    _say(tr("not_declared_warning_line1"), err=True)
+    _say(tr("not_declared_warning_line2"), err=True)
+    _say(tr("not_declared_warning_line3"), err=True)
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -765,11 +765,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     実行しなかった場合だけ ``EXIT_BUSY`` を返し、その旨を stderr に出す。
     """
     if not args.trailing:
-        print("実行するコマンドを `--` の後ろに指定してください", file=sys.stderr)
-        print(
-            '  例: rb run --res GPU0 --job "学習" --observed "..." -- python train.py',
-            file=sys.stderr,
-        )
+        print(tr("run_requires_trailing_command"), file=sys.stderr)
+        print(tr("run_trailing_example"), file=sys.stderr)
         return EXIT_USAGE
 
     board = Board(args.home)
@@ -798,7 +795,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     )
     entry = result.entry
     if entry is None:
-        print("資源を取得できなかったため、コマンドを実行していません", file=sys.stderr)
+        print(tr("run_not_executed_no_acquisition"), file=sys.stderr)
         return result.code
 
     # **宣言を作ったら、次の行から try に入る。** 間に置いた print が
@@ -813,14 +810,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # **記録できていないのに「宣言しました」と言わない。** 掲示板が書けなかった場合も
         # 実行は通す（fail-open）が、他セッションから見えない利用を成功した宣言として
         # 偽装してはならない。
-        _say(f"ログ: {log_path}")
+        _say(tr("run_log_path", log_path=log_path))
         exit_code = runner.execute(list(args.trailing), log_path, spawn=SPAWN)
         return exit_code
     except (KeyboardInterrupt, runner.Terminated):
         # **SIGTERM / SIGHUP もここへ落とす。** 既定のハンドラのままだと `finally` を
         # 通らずに死に、宣言だけが残る。残った宣言は PID が死んでいるため、
         # **幽霊判定に最も拾われやすい形**で残る（孤児のジョブはまだ走っている）。
-        _say("中断されました", err=True)
+        _say(tr("run_interrupted"), err=True)
         exit_code = EXIT_INTERRUPTED
         return EXIT_INTERRUPTED
     finally:
@@ -865,34 +862,24 @@ def _release_after_run(
             return  # そもそもこのプロセスは宣言を作っていない。消すものが無い
 
         # 終了コードを理由に含める。**成否を解釈はしない**（0 が成功とは限らない資源もある）。
-        code = "不明" if exit_code is None else str(exit_code)
-        reason = f"rb run の終了（exit={code}）"
+        code = tr("unknown_value") if exit_code is None else str(exit_code)
+        reason = tr("run_exit_reason", code=code)
 
         selection = board.confirm_own_declaration(entry)
         result = board.remove_confirmed(selection, reason=reason)
         if result is RemovalResult.REMOVED:
-            _say(f"解放しました: {naming.display_default(resource_id)}")
+            _say(tr("released_notice", resource=naming.display_default(resource_id)))
         elif result is RemovalResult.NOT_OWNED:
-            _say("宣言が入れ替わりました（解放していません）", err=True)
+            _say(tr("declaration_swapped"), err=True)
         elif result is RemovalResult.UNCONFIRMED:
-            _say(
-                "警告: 宣言を取り下げられたか確認できませんでした"
-                "（削除直後に掲示板の一部が読めなくなりました）",
-                err=True,
-            )
+            _say(tr("warn_removal_unconfirmed"), err=True)
         elif result is RemovalResult.FAILED:
-            _say(
-                "警告: 宣言を取り下げられませんでした（掲示板に残っています）",
-                err=True,
-            )
+            _say(tr("warn_removal_failed"), err=True)
         else:
             # **「消さなかった」を「消せなかった」と混ぜない。** 走行中に外部から
             # 消えている場合（``--force``、再起動掃除）に「掲示板に残っています」と
             # 出すと嘘になる。
-            _say(
-                "宣言を取り下げませんでした（既に掲示板にありません）",
-                err=True,
-            )
+            _say(tr("declaration_not_withdrawn_absent"), err=True)
     except Exception:  # noqa: BLE001 - 後始末の失敗でジョブの結果を変えない
         pass
 
@@ -916,15 +903,12 @@ def _held_for(entry: Entry) -> str:
     return "" if seconds is None else _format_duration(seconds)
 
 
-#: 待っている側に必ず渡す助言。**本ツールは実測が空きでも宣言を勝手に退けない**ため、
-#: 「掲示板が古いまま」の状態から抜ける道は人間か保持者しかない。それを黙っていると、
-#: 待っている側は待ち続けるしかなくなる（実際に 2 時間 48 分待たせた）。
-WAIT_ADVICE = (
-    "  待っている間に自分でも資源の状態を調べること。"
-    "空いているのに宣言が残っているなら、\n"
-    "  保持者に確認するか、確認が取れなければ人間に相談すること"
-    "（本ツールは実測が空きでも宣言を退けない）"
-)
+def _wait_advice() -> str:
+    """待っている側に必ず渡す助言。**本ツールは実測が空きでも宣言を勝手に退けない**ため、
+    「掲示板が古いまま」の状態から抜ける道は人間か保持者しかない。それを黙っていると、
+    待っている側は待ち続けるしかなくなる（実際に 2 時間 48 分待たせた）。
+    """
+    return tr("wait_advice")
 
 
 def _cmd_wait(args: argparse.Namespace) -> int:
@@ -948,46 +932,59 @@ def _cmd_wait(args: argparse.Namespace) -> int:
     # ようになっているので、待機に入れば誤りは起きない。
     keys, complete = waiting.holder_keys_detailed(board, resource_id)
     if complete and not keys:
-        print(f"既に解放されています: {naming.display_default(resource_id)}")
+        print(tr("already_released", resource=naming.display_default(resource_id)))
         return EXIT_OK
 
     entry = first_declaration(board, resource_id)
     if entry is None:
-        print(f"待機します: {naming.display_default(resource_id)}")
+        print(tr("waiting_notice", resource=naming.display_default(resource_id)))
     else:
         print(
-            f"待機します: {naming.display_default(resource_id)} <- {entry.session} / {entry.job}"
+            tr(
+                "waiting_notice_with_holder",
+                resource=naming.display_default(resource_id),
+                session=entry.session,
+                job=entry.job,
+            )
         )
         held = _held_for(entry)
-        print(f"  since {entry.since}{f'（{held} 経過）' if held else ''}")
+        elapsed = tr("elapsed_since", duration=held) if held else ""
+        print(f"  since {entry.since}{elapsed}")
         if entry.eta:
             stated = entry.eta.get("stated") if isinstance(entry.eta, dict) else None
-            at = entry.eta.get("at") if isinstance(entry.eta, dict) else None
-            print(f"  ETA   {stated}{f'（{at} 頃）' if at else ''}  ※申告であって約束ではない")
+            at_value = entry.eta.get("at") if isinstance(entry.eta, dict) else None
+            at = tr("eta_at", at=at_value) if at_value else ""
+            print(f"  ETA   {stated}{at}  {tr('not_a_promise')}")
         if entry.log:
             print(f"  log   {entry.log}")
-    print(f"  {args.interval:g} 秒ごとに確認、上限 {args.timeout:g} 秒。Ctrl+C で中断できます")
-    print(WAIT_ADVICE)
+    print(
+        "  " + tr("wait_polling_line", interval=f"{args.interval:g}", timeout=f"{args.timeout:g}")
+    )
+    print(_wait_advice())
 
     try:
         result = waiting.wait_for_room(
             board, resource_id, interval_s=args.interval, timeout_s=args.timeout
         )
     except KeyboardInterrupt:
-        print("中断しました（宣言はそのままです）", file=sys.stderr)
+        print(tr("wait_interrupted"), file=sys.stderr)
         return EXIT_INTERRUPTED
 
     if result.reason == waiting.RELEASED:
-        print(f"全ての宣言が消えました（{result.polls} 回確認 / {result.waited_s:.0f} 秒）")
-        print("使う前にもう一度自分で状態を調べること（解放＝空きとは限らない）")
+        print(tr("wait_released", polls=result.polls, waited=f"{result.waited_s:.0f}"))
+        print(tr("wait_check_yourself_after_release"))
         return EXIT_OK
 
     if result.reason == waiting.SHRANK:
         print(
-            f"宣言が減りました（残り {result.holders} 件"
-            f" / {result.polls} 回確認 / {result.waited_s:.0f} 秒）"
+            tr(
+                "wait_shrank",
+                holders=result.holders,
+                polls=result.polls,
+                waited=f"{result.waited_s:.0f}",
+            )
         )
-        print("入れるかどうかは自分で調べて判断すること。駄目ならもう一度 rb wait すればよい")
+        print(tr("wait_check_yourself_after_shrink"))
         return EXIT_OK
 
     if result.reason == waiting.BROKEN:
@@ -996,28 +993,28 @@ def _cmd_wait(args: argparse.Namespace) -> int:
         # いない。ここで `EXIT_BUSY` を返すと「確認した上で使用中」と偽ることに
         # なるので、`EXIT_BROKEN` で区別する（issue #17 指摘 4）。
         print(
-            f"掲示板を読めないまま上限に達しました（{result.polls} 回確認"
-            f" / {result.waited_s:.0f} 秒）。使用中かどうかは未確認です",
+            tr("wait_broken", polls=result.polls, waited=f"{result.waited_s:.0f}"),
             file=sys.stderr,
         )
-        print(WAIT_ADVICE, file=sys.stderr)
+        print(_wait_advice(), file=sys.stderr)
         return EXIT_BROKEN
 
     # **上限で戻るときこそ助言が要る。** ここで黙ると、待っている側は同じ待機を
     # 繰り返すしかない。掲示板が古いまま固まっている場合、そこから抜ける道は
     # 保持者か人間しかなく、本ツールは自力で退けられない。
     print(
-        f"上限に達しました（{result.polls} 回確認 / {result.waited_s:.0f} 秒）。まだ使用中です",
+        tr("wait_timed_out", polls=result.polls, waited=f"{result.waited_s:.0f}"),
         file=sys.stderr,
     )
     holder = first_declaration(board, resource_id)
     if holder is not None:
         held = _held_for(holder)
+        since = tr("held_since_suffix", duration=held) if held else ""
         print(
-            f"  保持者: {holder.session} / {holder.job}{f'（{held} 前から）' if held else ''}",
+            f"  {tr('holder_label', session=holder.session, job=holder.job)}{since}",
             file=sys.stderr,
         )
-    print(WAIT_ADVICE, file=sys.stderr)
+    print(_wait_advice(), file=sys.stderr)
     return EXIT_BUSY
 
 
@@ -1287,7 +1284,7 @@ def _cmd_history(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     if not records:
-        print("過去の宣言は見つかりませんでした")
+        print(tr("no_past_declarations"))
         return EXIT_OK
 
     # **全体を均した値は出さない。** 案件ごとに規模も予測しやすさも違うので、
@@ -1308,22 +1305,30 @@ def _cmd_history(args: argparse.Namespace) -> int:
         )
         print(f"    job   {record.get('job', '')}")
 
-        actual = "解放の記録なし" if elapsed is None else _format_duration(elapsed)
+        actual = tr("no_release_record") if elapsed is None else _format_duration(elapsed)
         if eta_text and elapsed is not None and stated:
             # 比を出すのは**同じ案件の中**だけ。ここは自分の申告と自分の実績の対比である。
-            print(f"    ETA   {eta_text}  →  実績 {actual}（{elapsed / stated:.2f} 倍）")
+            print(
+                "    "
+                + tr(
+                    "history_eta_vs_actual_ratio",
+                    eta=eta_text,
+                    actual=actual,
+                    ratio=elapsed / stated,
+                )
+            )
         elif eta_text:
-            print(f"    ETA   {eta_text}  →  実績 {actual}")
+            print("    " + tr("history_eta_vs_actual", eta=eta_text, actual=actual))
         else:
-            print(f"    実績  {actual}")
+            print("    " + tr("history_actual_only", actual=actual))
 
         if peak or avg:
-            print(f"    見積  peak={peak or '-'} avg={avg or '-'}")
+            print("    " + tr("history_estimate", peak=peak or "-", avg=avg or "-"))
         if release is not None and release.get("reason"):
-            print(f"    終了  {release['reason']}")
+            print("    " + tr("history_ended", reason=release["reason"]))
 
     print()
-    print("同じ案件の前回の申告と実績を突き合わせ、次の申告の精度を上げること")
+    print(tr("history_footer_advice"))
     return EXIT_OK
 
 
@@ -1371,46 +1376,42 @@ def _update_locked(board: Board, resource_id: str, args: argparse.Namespace) -> 
 
     if not declarations:
         if not listing.complete:
-            print(
-                "掲示板の一部を読めず、宣言の有無を確認できませんでした（更新は行っていません）",
-                file=sys.stderr,
-            )
+            print(tr("update_unconfirmed_no_declarations"), file=sys.stderr)
             board.audit(
-                "update_unconfirmed", resource=resource_id, reason="掲示板の一部が読めない"
+                "update_unconfirmed",
+                resource=resource_id,
+                reason=tr("reason_board_partially_unreadable"),
             )
             return EXIT_OK
-        print("宣言が見つかりませんでした", file=sys.stderr)
+        print(tr("no_declaration_found"), file=sys.stderr)
         return EXIT_USAGE
 
     if not listing.complete:
         # **候補は見つかったが、これで全部とは限らない。** fail-open なので
         # 止めはしないが、見えていない自分の宣言が別にあるかもしれないことは
         # 伝える。
-        _say(
-            "注意: 掲示板の一部を読めませんでした（他に自分の宣言があるかもしれません）",
-            err=True,
-        )
+        _say(tr("update_partial_notice"), err=True)
 
     if mine:
         entry = mine[0]
         if len(mine) > 1:
             # **どれを書き換えたかを言う。** 黙って 1 件選ぶと、更新したつもりの宣言と
             # 実際に変わった宣言が食い違ったまま気づけない。
-            _say(
-                f"自分の宣言が {len(mine)} 件あります。最も古いものを書き換えます: {entry.job}",
-                err=True,
-            )
+            _say(tr("update_multiple_own_declarations", count=len(mine), job=entry.job), err=True)
     elif args.force:
         entry = declarations[0]
         # **他人のものを書き換えたことを必ず言う。** 誰の言葉かが変わる操作である。
-        _say(f"警告: 他セッションの宣言を書き換えます: {entry.session} / {entry.job}", err=True)
-    else:
-        print(
-            "自分の宣言はありません（--force で他セッションのものを書き換えられます）",
-            file=sys.stderr,
+        _say(
+            tr("update_overwriting_foreign", session=entry.session, job=entry.job),
+            err=True,
         )
+    else:
+        print(tr("update_no_own_declaration"), file=sys.stderr)
         for other in declarations:
-            print(f"  {other.session} / {other.job}（since {other.since}）", file=sys.stderr)
+            print(
+                tr("holder_line", session=other.session, job=other.job, since=other.since),
+                file=sys.stderr,
+            )
         return EXIT_BUSY
 
     # 読んでから書くまでの間に保持者が入れ替わっていたら、古い内容で潰さない。
@@ -1435,21 +1436,19 @@ def _update_locked(board: Board, resource_id: str, args: argparse.Namespace) -> 
 
     # **競合と I/O 失敗を別の文言で伝える。** 畳むと、共有違反で書けなかっただけなのに
     # 「宣言が変わった」という事実と違う説明になり、読んだ側が誤った対処をする。
-    result = board.replace(entry, reason="update コマンド", expect_nonce=expect_nonce or None)
+    result = board.replace(
+        entry, reason=tr("reason_update_command"), expect_nonce=expect_nonce or None
+    )
     if result is UpdateResult.CONFLICT:
-        print(
-            "更新をやめました: 読んでから書くまでに宣言が入れ替わりました"
-            "（他セッションが取り直した可能性）",
-            file=sys.stderr,
-        )
+        print(tr("update_conflict"), file=sys.stderr)
         return EXIT_BUSY
     if result is UpdateResult.FAILED:
         # 掲示板に書けないのは**インフラの故障**であり、資源の競合ではない。
         # ここを 1 に倒すと、掲示板が壊れた瞬間に呼び出し側が「使用中」と読む。
-        print("更新できませんでした（掲示板に書けません。監査ログを参照）", file=sys.stderr)
+        print(tr("update_failed"), file=sys.stderr)
         return EXIT_OK
 
-    print(f"更新しました: {naming.display_default(entry.resource)} / {entry.job}")
+    print(tr("updated_notice", resource=naming.display_default(entry.resource), job=entry.job))
     return EXIT_OK
 
 
@@ -1486,23 +1485,17 @@ def _cmd_release(args: argparse.Namespace) -> int:
         # ネットワークパス等）場合でも「読めないファイルはありませんでした」と
         # 積極的な成功表現を返し、常に ``EXIT_OK`` だった（issue #18 指摘 5。
         # 新規テストがこの誤った意味を仕様として固定していた）。
-        result = board.remove_unreadable(reason="release --clean")
+        result = board.remove_unreadable(reason=tr("reason_release_clean"))
         if result.removed:
-            _say(f"読めないファイルを {len(result.removed)} 件消しました")
+            _say(tr("unreadable_files_removed", count=len(result.removed)))
             for path in result.removed:
                 _say(f"  {path}")
         elif result.complete:
-            _say("読めないファイルはありませんでした")
+            _say(tr("no_unreadable_files"))
         else:
-            _say(
-                "掲示板を完全に走査できませんでした（他に読めないファイルがあるかもしれません）",
-                err=True,
-            )
+            _say(tr("board_scan_incomplete"), err=True)
         if result.failed:
-            _say(
-                f"警告: {len(result.failed)} 件を消せませんでした（他プロセスが読んでいる可能性）",
-                err=True,
-            )
+            _say(tr("warn_could_not_remove_count", count=len(result.failed)), err=True)
         if not result.complete or result.failed:
             return EXIT_BROKEN
         return EXIT_OK
@@ -1519,7 +1512,7 @@ def _cmd_release(args: argparse.Namespace) -> int:
         # **引数の不備を「内部エラー」にしない。** `normalize(None)` は例外になり、
         # 総括の catch-all が exit 0 と `cli_internal_error` を残す——利用者の打ち間違いが
         # 本ツールの故障として監査ログに積まれる。
-        print("資源 ID を指定するか、--clean か --nonce を付けてください", file=sys.stderr)
+        print(tr("release_requires_resource_or_flag"), file=sys.stderr)
         return EXIT_USAGE
 
     resource_id = naming.normalize(args.resource)
@@ -1577,43 +1570,51 @@ def _release_by_nonce(
     if not prefix:
         # **「見つからない」と混ぜない。** 前者は打ち直しを誘うが、これは入力そのものが
         # 不正であり対処が違う——何を指定すればよいかが打ち直しでは分からない。
-        _say("nonce が空です。前方一致させる値を指定してください", err=True)
-        board.audit("release_nonce_rejected", reason="nonce が空である")
+        _say(tr("nonce_empty_prefix"), err=True)
+        board.audit("release_nonce_rejected", reason=tr("reason_nonce_empty"))
         return EXIT_USAGE
 
     listing = board.list_all_detailed()
     if not listing.complete:
-        _say(
-            "掲示板の一部を読めませんでした。解放は未確認です"
-            "（読めなかった側に一致する宣言が隠れているかもしれません）",
-            err=True,
+        _say(tr("release_nonce_partial_unreadable"), err=True)
+        board.audit(
+            "release_nonce_unconfirmed",
+            reason=tr("reason_board_partially_unreadable"),
+            prefix=prefix,
         )
-        board.audit("release_nonce_unconfirmed", reason="掲示板の一部が読めない", prefix=prefix)
         return EXIT_BROKEN
 
     matches = [(path, entry) for path, entry in listing.pairs if entry.nonce.startswith(prefix)]
 
     if not matches:
-        _say(f"nonce '{prefix}' に一致する宣言が見つかりませんでした", err=True)
-        board.audit("release_nonce_rejected", reason="一致する宣言が無い", prefix=prefix)
+        _say(tr("nonce_no_match", prefix=prefix), err=True)
+        board.audit(
+            "release_nonce_rejected", reason=tr("reason_no_matching_declaration"), prefix=prefix
+        )
         return EXIT_USAGE
 
     if len(matches) > 1:
         # **一意性は所有で絞る前に見る。** 所有で絞ってから一意性を見ると、
         # 「自分 1 件＋他人 1 件」を自分の 1 件だけの「一意」だと誤認し、
         # 狙った他人の宣言ではなく自分の宣言が黙って消える（docstring 参照）。
-        _say(
-            f"nonce '{prefix}' が {len(matches)} 件に一致します。もっと長い桁数を指定してください",
-            err=True,
-        )
+        _say(tr("nonce_ambiguous_matches", prefix=prefix, count=len(matches)), err=True)
         for _, entry in matches:
             _say(
-                f"  nonce {entry.nonce[:8]}  {naming.display_default(entry.resource)}"
-                f"  {entry.session} / {entry.job}（since {entry.since}）",
+                tr(
+                    "nonce_match_line",
+                    nonce=entry.nonce[:8],
+                    resource=naming.display_default(entry.resource),
+                    session=entry.session,
+                    job=entry.job,
+                    since=entry.since,
+                ),
                 err=True,
             )
         board.audit(
-            "release_nonce_rejected", reason="前方一致が曖昧", prefix=prefix, count=len(matches)
+            "release_nonce_rejected",
+            reason=tr("reason_ambiguous_prefix_match"),
+            prefix=prefix,
+            count=len(matches),
         )
         return EXIT_USAGE
 
@@ -1627,13 +1628,13 @@ def _release_by_nonce(
             # **「無い」と「あなたのものではない」を混ぜない。** 前者は打ち直し、
             # 後者は --force を使うかどうかの判断が要る。対処が違う。
             _say(
-                f"nonce '{prefix}' は自分の宣言ではありません（{entry.session} / {entry.job}）",
+                tr("nonce_not_own", prefix=prefix, session=entry.session, job=entry.job),
                 err=True,
             )
-            _say(f"  他セッションの宣言を消すなら rb release --nonce {prefix} --force", err=True)
+            _say(tr("nonce_force_hint", prefix=prefix), err=True)
             board.audit(
                 "release_nonce_rejected",
-                reason="自分の宣言ではない",
+                reason=tr("reason_not_own_declaration"),
                 prefix=prefix,
                 count=1,
             )
@@ -1645,17 +1646,26 @@ def _release_by_nonce(
             # **黙って通さない。** 「この資源を消す」と信じて打った利用者に、
             # 無関係な資源の宣言を消させてはならない。
             _say(
-                f"食い違いがあります: 指定した資源は {naming.display_default(wanted)} ですが、"
-                f"--nonce が指しているのは {naming.display_default(entry.resource)} です",
+                tr(
+                    "resource_nonce_mismatch",
+                    wanted=naming.display_default(wanted),
+                    actual=naming.display_default(entry.resource),
+                ),
                 err=True,
             )
             _say(
-                f"  nonce {entry.nonce[:8]}  {entry.session} / {entry.job}（since {entry.since}）",
+                tr(
+                    "nonce_entry_line",
+                    nonce=entry.nonce[:8],
+                    session=entry.session,
+                    job=entry.job,
+                    since=entry.since,
+                ),
                 err=True,
             )
             board.audit(
                 "release_nonce_rejected",
-                reason="resource と --nonce が食い違う",
+                reason=tr("reason_resource_nonce_mismatch"),
                 prefix=prefix,
                 requested_resource=wanted,
                 actual_resource=entry.resource,
@@ -1673,28 +1683,29 @@ def _release_by_nonce(
         # 選択した実体に対して直接使う——再列挙しないので、選択時に確認した
         # 完全性を削除の直前で捨て直さない（issue #17 指摘 2・3）。
         removal = board.remove_confirmed(
-            selection, reason="release --nonce --force コマンド", force=True
+            selection, reason=tr("reason_release_nonce_force_command"), force=True
         )
         if removal is RemovalResult.REMOVED:
             _say(
-                f"強制解放しました: {naming.display_default(entry.resource)}"
-                f"（nonce {entry.nonce[:8]}, {entry.session} / {entry.job}）"
+                tr(
+                    "force_released_with_nonce",
+                    resource=naming.display_default(entry.resource),
+                    nonce=entry.nonce[:8],
+                    session=entry.session,
+                    job=entry.job,
+                )
             )
             return _exit_for_removal(removal)
         if removal is RemovalResult.ABSENT:
-            _say(f"宣言は既にありませんでした: nonce {entry.nonce[:8]}")
+            _say(tr("declaration_already_absent_nonce", nonce=entry.nonce[:8]))
             return _exit_for_removal(removal)
         if removal is RemovalResult.NOT_OWNED:
-            _say("宣言が入れ替わりました（解放していません）", err=True)
+            _say(tr("declaration_swapped"), err=True)
             return _exit_for_removal(removal)
         if removal is RemovalResult.UNCONFIRMED:
-            _say(
-                "警告: 宣言を取り下げられたか確認できませんでした"
-                "（削除直後に掲示板の一部が読めなくなりました）",
-                err=True,
-            )
+            _say(tr("warn_removal_unconfirmed"), err=True)
             return _exit_for_removal(removal)
-        _say("警告: 宣言を取り下げられませんでした（掲示板に残っています）", err=True)
+        _say(tr("warn_removal_failed"), err=True)
         return _exit_for_removal(removal)
 
     # **所有は既に確認済み。** ここへ来る entry は必ず自分のものなので、
@@ -1710,35 +1721,34 @@ def _release_by_nonce(
     declared_for_resource = [s for s in listing.confirmed() if s.entry.resource == entry.resource]
     result = board.remove_own(
         entry.resource,
-        reason="release --nonce コマンド",
+        reason=tr("reason_release_nonce_command"),
         nonce=entry.nonce,
         cwd=cwd,
         declared=declared_for_resource,
     )
     if result.removed:
-        _say(f"解放しました: {naming.display_default(entry.resource)}（nonce {entry.nonce[:8]}）")
-        return _exit_for_own_removal(result)
-    if result.unconfirmed:
         _say(
-            "警告: 宣言を取り下げられたか確認できませんでした"
-            "（削除直後に掲示板の一部が読めなくなりました）",
-            err=True,
+            tr(
+                "released_with_nonce",
+                resource=naming.display_default(entry.resource),
+                nonce=entry.nonce[:8],
+            )
         )
         return _exit_for_own_removal(result)
+    if result.unconfirmed:
+        _say(tr("warn_removal_unconfirmed"), err=True)
+        return _exit_for_own_removal(result)
     if result.swapped:
-        _say("宣言が入れ替わりました（解放していません）", err=True)
+        _say(tr("declaration_swapped"), err=True)
         return _exit_for_own_removal(result)
     if result.failed:
-        _say("警告: 宣言を取り下げられませんでした（掲示板に残っています）", err=True)
+        _say(tr("warn_removal_failed"), err=True)
         return _exit_for_own_removal(result)
     # **ここへは通常来ない。** 所有は既に確認済みなので `remove_own` は原則
     # removed/unconfirmed/swapped/failed のいずれかで返る。絞り込みからここまでの
     # 間に他セッションが同じ宣言を消していた場合だけ素通りする。「無かった」を
     # 「消せなかった」と混ぜない。
-    _say(
-        f"宣言を取り下げませんでした（既に掲示板に無い可能性）: nonce {entry.nonce[:8]}",
-        err=True,
-    )
+    _say(tr("declaration_not_withdrawn_maybe_absent_nonce", nonce=entry.nonce[:8]), err=True)
     return EXIT_BUSY
 
 
@@ -1770,13 +1780,11 @@ def _release_forced(board: Board, resource_id: str) -> int:
     """
     listing = board.pairs_for_detailed(resource_id)
     if not listing.complete:
-        _say(
-            "掲示板の一部を読めませんでした。強制解放は未確認です"
-            "（読めなかった側にこの資源の宣言が隠れているかもしれません）",
-            err=True,
-        )
+        _say(tr("force_release_partial_unreadable"), err=True)
         board.audit(
-            "force_release_unconfirmed", resource=resource_id, reason="掲示板の一部が読めない"
+            "force_release_unconfirmed",
+            resource=resource_id,
+            reason=tr("reason_board_partially_unreadable"),
         )
         return EXIT_BROKEN
     before = listing.entries
@@ -1784,32 +1792,28 @@ def _release_forced(board: Board, resource_id: str) -> int:
     # 同一プロセス内の入れ子ロックになり `LOCK_WAIT_S` を無駄に待つ
     # （`remove_own` と同じ「列挙は外・削除は内」の形にそろえる）。
     result = board.remove_selected(
-        resource_id, listing.confirmed(), reason="release コマンド（強制）"
+        resource_id, listing.confirmed(), reason=tr("reason_release_forced_command")
     )
 
     if not before:
-        _say(f"宣言はありませんでした: {naming.display_default(resource_id)}")
+        _say(tr("no_declarations_for_resource", resource=naming.display_default(resource_id)))
         return EXIT_OK
 
-    _say(f"強制解放しました: {naming.display_default(resource_id)}（{len(result.removed)} 件）")
+    _say(
+        tr(
+            "force_released_notice",
+            resource=naming.display_default(resource_id),
+            count=len(result.removed),
+        )
+    )
     for entry in result.removed:
-        _say(f"  {entry.session} / {entry.job}（since {entry.since}）")
+        _say(tr("holder_line", session=entry.session, job=entry.job, since=entry.since))
     if result.failed:
-        _say(
-            f"警告: {len(result.failed)} 件を消せませんでした（他プロセスが読んでいる可能性）",
-            err=True,
-        )
+        _say(tr("warn_could_not_remove_count", count=len(result.failed)), err=True)
     if result.unconfirmed:
-        _say(
-            f"警告: {len(result.unconfirmed)} 件は消せたか確認できませんでした"
-            "（削除直後に掲示板の一部が読めなくなりました）",
-            err=True,
-        )
+        _say(tr("warn_could_not_confirm_removal_count", count=len(result.unconfirmed)), err=True)
     if result.swapped:
-        _say(
-            f"警告: {len(result.swapped)} 件は他セッションが取り直していたため消していません",
-            err=True,
-        )
+        _say(tr("warn_swapped_not_removed_count", count=len(result.swapped)), err=True)
     return _exit_for_forced_removal(result)
 
 
@@ -1851,15 +1855,11 @@ def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> i
 
     listing = board.pairs_for_detailed(resource_id)
     if not listing.complete:
-        _say(
-            "掲示板の一部を読めませんでした。解放は未確認です"
-            "（読めなかった側に自分の宣言が隠れているかもしれません）",
-            err=True,
-        )
+        _say(tr("release_own_partial_unreadable"), err=True)
         board.audit(
             "release_unconfirmed",
             resource=resource_id,
-            reason="掲示板の一部が読めない",
+            reason=tr("reason_board_partially_unreadable"),
             all=take_all,
         )
         return EXIT_BROKEN
@@ -1875,16 +1875,21 @@ def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> i
         if len(mine) > 1:
             # **消す前に止める。** 曖昧なまま 1 件選ぶと、黙って間違った方を消すのが
             # 「2 件とも消す」より悪い（DESIGN.md「採らなかった案」）。
-            _say(
-                f"自分の宣言が {len(mine)} 件あります。曖昧なので何も消しません",
-                err=True,
-            )
+            _say(tr("release_own_ambiguous", count=len(mine)), err=True)
             for selection in mine:
                 entry = selection.entry
-                _say(f"  nonce {entry.nonce[:8]}  {entry.job}（since {entry.since}）", err=True)
-            _say("  1 本だけ消すには rb release --nonce <nonce の先頭 8 桁>", err=True)
+                _say(
+                    tr(
+                        "nonce_job_since_line",
+                        nonce=entry.nonce[:8],
+                        job=entry.job,
+                        since=entry.since,
+                    ),
+                    err=True,
+                )
+            _say(tr("release_nonce_single_hint"), err=True)
             _say(
-                f"  まとめて消すには rb release {naming.display_default(resource_id)} --all",
+                tr("release_all_hint", resource=naming.display_default(resource_id)),
                 err=True,
             )
             board.audit("release_ambiguous", resource=resource_id, count=len(mine))
@@ -1897,12 +1902,25 @@ def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> i
             # しれない宣言まで待ち構えて消す」ことではない。
             foreign = [selection.entry for selection in declared]
             if not foreign:
-                _say(f"宣言はありませんでした: {naming.display_default(resource_id)}")
+                _say(
+                    tr(
+                        "no_declarations_for_resource",
+                        resource=naming.display_default(resource_id),
+                    )
+                )
                 return EXIT_OK
-            _say(f"自分の宣言はありません: {naming.display_default(resource_id)}", err=True)
+            _say(
+                tr(
+                    "no_own_declaration_for_resource", resource=naming.display_default(resource_id)
+                ),
+                err=True,
+            )
             for entry in foreign:
-                _say(f"  {entry.session} / {entry.job}（since {entry.since}）", err=True)
-            _say(f"  他セッションの宣言を消すなら rb release {resource_id} --force", err=True)
+                _say(
+                    tr("holder_line", session=entry.session, job=entry.job, since=entry.since),
+                    err=True,
+                )
+            _say(tr("release_force_hint", resource=resource_id), err=True)
             return EXIT_BUSY
         # **1 件だけなら nonce を固定して渡す。** 数えたあとに 2 件目が現れても、
         # `remove_own` は渡した nonce と一致する宣言だけを対象にする（CAS）ので、
@@ -1912,48 +1930,56 @@ def _release_own(board: Board, resource_id: str, *, take_all: bool = False) -> i
     # **選択に使った `declared` をそのまま渡す。** `remove_own` が内部で再列挙すると、
     # ここまでで確認した完全性を削除の直前で捨て直すことになる（issue #17 指摘 2・3）。
     result = board.remove_own(
-        resource_id, reason="release コマンド", cwd=cwd, nonce=nonce, declared=declared
+        resource_id, reason=tr("reason_release_command"), cwd=cwd, nonce=nonce, declared=declared
     )
     if result.removed:
-        _say(f"解放しました: {naming.display_default(resource_id)}（{len(result.removed)} 件）")
+        _say(
+            tr(
+                "released_notice_count",
+                resource=naming.display_default(resource_id),
+                count=len(result.removed),
+            )
+        )
         for entry in result.removed:
-            _say(f"  {entry.session} / {entry.job}（since {entry.since}）")
+            _say(tr("holder_line", session=entry.session, job=entry.job, since=entry.since))
 
     if result.unconfirmed:
         # **消せたか確認できなかった。** 「入れ替わった」「消せなかった」とも違う
         # ——削除直後の再確認で掲示板の一部が読めなかった（issue #18 指摘 4）。
-        _say(
-            f"警告: {len(result.unconfirmed)} 件は消せたか確認できませんでした"
-            "（削除直後に掲示板の一部が読めなくなりました）",
-            err=True,
-        )
+        _say(tr("warn_could_not_confirm_removal_count", count=len(result.unconfirmed)), err=True)
 
     if result.swapped:
         # **他セッションが取り直していた。** 新しい宣言は消していない（CAS が守った）。
         # 0 を返すと「解放した」と読まれるので返さない。
-        _say("宣言が入れ替わりました（解放していません）", err=True)
+        _say(tr("declaration_swapped"), err=True)
         for entry in board.list_for(resource_id):
-            _say(f"  現在: {entry.session} / {entry.job}（since {entry.since}）", err=True)
+            _say(
+                tr("current_holder_line", session=entry.session, job=entry.job, since=entry.since),
+                err=True,
+            )
 
     if result.failed:
         # **消せなかったことを「無かった」と混ぜない。** 残っているのに消えたと読まれる。
-        _say(
-            f"警告: {len(result.failed)} 件を消せませんでした（他プロセスが読んでいる可能性）",
-            err=True,
-        )
+        _say(tr("warn_could_not_remove_count", count=len(result.failed)), err=True)
 
     only_foreign = not (result.removed or result.unconfirmed or result.swapped or result.failed)
     if result.foreign and only_foreign:
         # **他人の宣言を「無い」と言わない。** 誰がいるかを見せて、--force を案内する。
-        _say(f"自分の宣言はありません: {naming.display_default(resource_id)}", err=True)
+        _say(
+            tr("no_own_declaration_for_resource", resource=naming.display_default(resource_id)),
+            err=True,
+        )
         for entry in result.foreign:
-            _say(f"  {entry.session} / {entry.job}（since {entry.since}）", err=True)
-        _say(f"  他セッションの宣言を消すなら rb release {resource_id} --force", err=True)
+            _say(
+                tr("holder_line", session=entry.session, job=entry.job, since=entry.since),
+                err=True,
+            )
+        _say(tr("release_force_hint", resource=resource_id), err=True)
 
     if result.any_here:
         return _exit_for_own_removal(result)
 
-    _say(f"宣言はありませんでした: {naming.display_default(resource_id)}")
+    _say(tr("no_declarations_for_resource", resource=naming.display_default(resource_id)))
     return EXIT_OK
 
 
@@ -1964,63 +1990,50 @@ def _add_declaration_options(parser: argparse.ArgumentParser, *, with_force: boo
     **書かせること自体に意味がある**。ETA を必須にしているのは、正確な値が欲しいからではなく、
     「どれくらいで終わるか」を一度考えさせるためである。外れても本ツールは何も判断しない。
     """
-    parser.add_argument("--job", required=True, help="何をするか（1 行）")
+    parser.add_argument("--job", required=True, help=tr("help_job"))
     parser.add_argument(
         "--observed",
         required=True,
-        help="自分で調べて何を見たか（例: 'nvidia-smi: compute apps なし'）",
+        help=tr("help_observed"),
     )
     parser.add_argument(
         "--eta",
         required=True,
-        help=(
-            "終わるまでの見込み。'30m' '2h' '1h30m' なら絶対時刻を機械が計算して併記する。"
-            "自由記述も可（'モデル次第' 等）。**判断には使わない**"
-        ),
+        help=tr("help_eta"),
     )
     parser.add_argument(
         "--found",
         choices=sorted(FOUND_CHOICES),
         default="unknown",
-        help="調べた結論。既定は unknown（分からなかった）",
+        help=tr("help_found"),
     )
-    parser.add_argument(
-        "--peak", default=None, help="利用見積もりの瞬時最大（例: 'VRAM 6GB' '80%%' '4 cores'）"
-    )
-    parser.add_argument("--avg", default=None, help="利用見積もりの平均（同上）")
+    parser.add_argument("--peak", default=None, help=tr("help_peak"))
+    parser.add_argument("--avg", default=None, help=tr("help_avg"))
     parser.add_argument(
         "--sharing",
         default=None,
-        help=(
-            "次に来る人への申し送り（例: 'VRAM 残 6GB まで空き' '15 コア占有'）。"
-            "**許可を与える旗ではない**（与える保持者がいない）。本ツールは解釈しない"
-        ),
+        help=tr("help_sharing"),
     )
-    parser.add_argument("--log", default=None, help="進捗が読めるログのパス")
+    parser.add_argument("--log", default=None, help=tr("help_log"))
     # **承知で並ぶ意思表示。掲示板には役割として記録されない。**
     # かつての `rb join` が作っていた「相乗り」という種類の記録は無い。
     parser.add_argument(
         "--share",
         action="store_true",
-        help="既に宣言がある資源へ並んで使う（誰の宣言も消さない）",
+        help=tr("help_share"),
     )
     if with_force:
-        parser.add_argument(
-            "--force", action="store_true", help="他者の宣言を退けて強制的に取得する"
-        )
+        parser.add_argument("--force", action="store_true", help=tr("help_force_claim"))
 
 
 def build_parser() -> argparse.ArgumentParser:
     """引数パーサを組み立てる。"""
     parser = argparse.ArgumentParser(
         prog="resource-broker",
-        description="並行する Claude Code セッション間で有限資源の使用状況を共有する掲示板",
-        epilog=(
-            "本ツールは資源を調べない。調べるのは資源を使おうとするセッションの仕事であり、"
-            "claim はその結果の申告を必須とする。"
-        ),
+        description=tr("parser_description"),
+        epilog=tr("parser_epilog"),
     )
-    parser.add_argument("--home", default=None, help="掲示板のルート（既定は環境依存）")
+    parser.add_argument("--home", default=None, help=tr("help_home"))
     # **サブコマンドより前に処理させる。** ``_VersionAction`` は出会った時点で即座に
     # 表示して終了する（``nargs=0`` + ``parser.exit()``）ため、``required=True`` の
     # サブパーサ検査には到達しない——``rb --version`` がサブコマンド無しで動く理由は
@@ -2029,135 +2042,103 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version",
         action=_VersionAction,
-        help="版と実行元のパッケージディレクトリを表示して終了する",
+        help=tr("help_version"),
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     status = sub.add_parser(
         "status",
-        help="資源の状態を表示する（常に全件）",
-        description=(
-            "宣言のある全資源を表示する。資源 ID は受け取らない——名指しで絞ると、"
-            "表記の揺れ（大文字小文字は別資源）で相手の宣言が見えず「空き」と誤って"
-            "答えることがあるため（issue #9）。"
-        ),
+        help=tr("help_status"),
+        description=tr("description_status"),
     )
-    status.add_argument("--json", action="store_true", help="JSON で出力する")
+    status.add_argument("--json", action="store_true", help=tr("help_json"))
     status.set_defaults(func=_cmd_status)
 
     claim = sub.add_parser(
         "claim",
-        help="資源を宣言する（先に自分で調べること）",
-        description=(
-            "資源を宣言する。--observed には「自分が何を見たか」を書く。"
-            "本ツールは中身を解釈せず、観測点として掲示板に残すだけである。"
-        ),
+        help=tr("help_claim"),
+        description=tr("description_claim"),
     )
-    claim.add_argument("resource", help="資源 ID")
+    claim.add_argument("resource", help=tr("help_resource_id"))
     _add_declaration_options(claim)
     claim.set_defaults(func=_cmd_claim)
 
     release = sub.add_parser(
         "release",
-        help="宣言を解放する（自分のものだけ）",
-        description=(
-            "自分の宣言を取り下げる。自分の宣言が 2 件以上あるときは、曖昧なので"
-            "既定では何も消さずに拒否する（--all でまとめて消せる）。"
-            "--nonce を使えば資源 ID 無しで 1 本だけを狙って消せる。"
-            "他セッションの宣言まで消すのは --force だけである。"
-        ),
+        help=tr("help_release"),
+        description=tr("description_release"),
     )
-    release.add_argument("resource", nargs="?", help="資源 ID（--clean / --nonce のときは不要）")
+    release.add_argument("resource", nargs="?", help=tr("help_resource_id_optional"))
     release.add_argument(
         "--nonce",
         default=None,
-        help=(
-            "資源 ID の代わりに nonce の前方一致で 1 本を指定する（rb status に表示される"
-            "先頭 8 桁でよい）。既定では自分が所有する宣言だけに絞り込み、一意に決まらなければ"
-            "何も消さず候補を挙げて拒否する。他セッションの宣言を消すには --force を併用する"
-        ),
+        help=tr("help_nonce"),
     )
     release.add_argument(
         "--all",
         action="store_true",
-        help="自分の宣言が複数あっても全部まとめて解放する（曖昧さの拒否を明示的に上書きする）",
+        help=tr("help_all"),
     )
-    release.add_argument(
-        "--force", action="store_true", help="他セッションの宣言も強制的に解放する"
-    )
+    release.add_argument("--force", action="store_true", help=tr("help_force_release"))
     release.add_argument(
         "--clean",
         action="store_true",
-        help="読めないファイルを消す（どの資源のものか判別できないので資源は指定しない）",
+        help=tr("help_clean"),
     )
     release.set_defaults(func=_cmd_release)
 
     run = sub.add_parser(
         "run",
-        help="資源を宣言してコマンドを実行し、終了時に必ず解放する",
-        description=(
-            "宣言・ログ出力・解放を機械的に行う。解放は finally で行うため、"
-            "異常終了でも中断でもエントリは残らない。"
-            "終了コードは子プロセスのものをそのまま返す。"
-        ),
+        help=tr("help_run"),
+        description=tr("description_run"),
     )
-    run.add_argument("--res", required=True, help="資源 ID")
+    run.add_argument("--res", required=True, help=tr("help_resource_id"))
     _add_declaration_options(run)
     run.set_defaults(func=_cmd_run)
 
     update = sub.add_parser(
         "update",
-        help="自分の宣言を書き換える（見積もりや ETA を実態に合わせる）",
-        description=(
-            "既に出している宣言の申告値を更新する。ジョブが進んで使用量が変わったときに、"
-            "掲示板を実態へ寄せるために使う。"
-        ),
+        help=tr("help_update"),
+        description=tr("description_update"),
     )
-    update.add_argument("resource", help="資源 ID")
-    update.add_argument("--job", default=None, help="何をするか（1 行）")
-    update.add_argument("--eta", default=None, help="終わるまでの見込み")
-    update.add_argument("--peak", default=None, help="利用見積もりの瞬時最大")
-    update.add_argument("--avg", default=None, help="利用見積もりの平均")
-    update.add_argument("--sharing", default=None, help="次に来る人への申し送り")
-    update.add_argument("--log", default=None, help="進捗が読めるログのパス")
-    update.add_argument("--force", action="store_true", help="他者の宣言でも書き換える")
+    update.add_argument("resource", help=tr("help_resource_id"))
+    update.add_argument("--job", default=None, help=tr("help_job"))
+    update.add_argument("--eta", default=None, help=tr("help_eta_update"))
+    update.add_argument("--peak", default=None, help=tr("help_peak_update"))
+    update.add_argument("--avg", default=None, help=tr("help_avg_update"))
+    update.add_argument("--sharing", default=None, help=tr("help_sharing_update"))
+    update.add_argument("--log", default=None, help=tr("help_log"))
+    update.add_argument("--force", action="store_true", help=tr("help_force_update"))
     update.set_defaults(func=_cmd_update)
 
     wait = sub.add_parser(
         "wait",
-        help="資源を宣言している者が減るまで待つ",
-        description=(
-            "宣言の数が減る（誰かが解放する）まで待つ。相乗りが**増えた**ときには起きない"
-            "（資源はさらに詰まっているため）。ETA では打ち切らない（申告であって約束ではない）。"
-            "打ち切るのは --timeout だけである。毎回のポーリングは監査ログに残る。"
-        ),
+        help=tr("help_wait"),
+        description=tr("description_wait"),
     )
-    wait.add_argument("resource", help="資源 ID")
+    wait.add_argument("resource", help=tr("help_resource_id"))
     wait.add_argument(
         "--interval",
         type=float,
         default=waiting.DEFAULT_INTERVAL_S,
-        help=f"ポーリング間隔の秒数（既定 {waiting.DEFAULT_INTERVAL_S:g}）",
+        help=tr("help_interval", default=f"{waiting.DEFAULT_INTERVAL_S:g}"),
     )
     wait.add_argument(
         "--timeout",
         type=float,
         default=waiting.DEFAULT_TIMEOUT_S,
-        help=f"待機の上限秒数（既定 {waiting.DEFAULT_TIMEOUT_S:g}）。超えたら一度戻る",
+        help=tr("help_timeout", default=f"{waiting.DEFAULT_TIMEOUT_S:g}"),
     )
     wait.set_defaults(func=_cmd_wait)
 
     history = sub.add_parser(
         "history",
-        help="過去の宣言を振り返る（見積もりの根拠にする）",
-        description=(
-            "監査ログから過去の宣言と解放を拾う。前回どう見積もって実際どうだったかを"
-            "見返すためのもので、見積もりの精度を回ごとに上げるために使う。"
-        ),
+        help=tr("help_history"),
+        description=tr("description_history"),
     )
-    history.add_argument("resource", nargs="?", default=None, help="資源 ID（省略時は全件）")
-    history.add_argument("--limit", type=int, default=20, help="表示する件数（既定 20）")
-    history.add_argument("--json", action="store_true", help="JSON で出力する")
+    history.add_argument("resource", nargs="?", default=None, help=tr("help_resource_id_history"))
+    history.add_argument("--limit", type=int, default=20, help=tr("help_limit"))
+    history.add_argument("--json", action="store_true", help=tr("help_json"))
     history.set_defaults(func=_cmd_history)
 
     return parser
@@ -2212,6 +2193,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     内部エラーは 0 を返して通す（fail-open）。本ツールの不具合で
     ユーザーの作業を止めないことを、コード上でも保証する。
     """
+    # **起動のたびに判定し直す。** 使い回すと、同一プロセス内で複数回 ``main()`` を
+    # 呼ぶテストが前回の言語を引きずる（``resource_broker.messages`` 参照）。
+    use_language(detect_language())
     _use_utf8_for_our_own_output()
     head, trailing = split_trailing(sys.argv[1:] if argv is None else argv)
 
@@ -2227,10 +2211,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         # **中断を「使用中」に化けさせない。** EXIT_BUSY は 1 なので、traceback で 1 を
         # 返すと呼び出し側から資源の競合と区別できない。シェルの慣習どおり 130 を返す。
-        print("中断しました", file=sys.stderr)
+        print(tr("main_interrupted"), file=sys.stderr)
         return EXIT_INTERRUPTED
     except Exception as exc:  # noqa: BLE001 - fail-open
-        print(f"[resource-broker] 内部エラーのため判定を省略します: {exc}", file=sys.stderr)
+        print(tr("main_internal_error", error=exc), file=sys.stderr)
         try:
             Board(args.home).audit("cli_internal_error", command=args.command, error=str(exc))
         except Exception:  # noqa: BLE001

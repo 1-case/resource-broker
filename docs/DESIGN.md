@@ -511,6 +511,15 @@ user スコープ（`~/.claude/settings.json`）またはプラグインとし�
   環境変数 `RESOURCE_BROKER_LANG` → Claude Code の `language`（`~/.claude/settings.json`）→
   OS のロケール → 既定は日本語。**`en` が欠けていれば `ja` を返す**ので、訳が追いつかなくても日本語で必ず動く
 
+CLI（`src/resource_broker/`）にも issue #13 第 2 段で同じ方針を広げた。`cli.py` / `board.py` / `runner.py` / `liveness.py` /
+`naming.py` が出す固定文言（`print` ・引数の `help` ・監査ログの `reason` 等）は `src/resource_broker/messages.py` の 1 つの表
+（`MESSAGES` と `tr()`）にまとめる — `src/` の中は互いに import できるため、フックのような 3 重の重複は不要である。**言語判定
+だけはフックから見えない独立した実装として `messages.py` にも持つ**（フックは素の `python` で単体起動され `src/` を import
+できないため、判定ロジックは結果として 4 つ目の写しになる）。`cli.main()` が起動のたびに `use_language(detect_language())` を
+呼んで確定させ、以後は `tr()` がそれを読むだけにする（1 コマンドで何十件も呼ぶため、呼ぶたびに再判定はしない）。宣言の自由記述
+（`--job` / `--observed` / `--sharing`）は訳す対象ではない。`bin/rb` の 2 行（起動前の失敗）だけは Python が動く前で言語判定を
+使えないため英語固定とし、`bin/rb.cmd` と文言をそろえる。
+
 `SessionStart` は**判定を再実装せず `rb status --json` を呼ぶ**（自前の幽霊判定を書けば本体と乖離した第 2 の真実ができる）。`rb` を起動
 できない環境では**掲示板を直接読んで degrade し、その旨を注意文に明記する** — 黙ると、このフックが唯一配っている使い方が丸ごと消え、
 しかも fail-open なので誰も気づかない。`UserPromptSubmit` は起動時 1 回では埋まらない穴を**判別なしで**埋めるため、どの資源にもどの

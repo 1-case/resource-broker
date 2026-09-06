@@ -36,6 +36,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from . import audit, clock, naming, platform_info
+from .messages import tr
 
 SCHEMA = 1
 
@@ -182,7 +183,7 @@ def _unlink_with_retry(path: Path) -> tuple[RemovalResult, str]:
             time.sleep(UNLINK_DELAY_S)
             continue
         return RemovalResult.REMOVED, ""
-    return RemovalResult.FAILED, "削除を諦めた"
+    return RemovalResult.FAILED, tr("gave_up_deleting")
 
 
 def _rename_with_retry(source: Path, target: Path) -> tuple[MoveResult, str]:
@@ -210,7 +211,7 @@ def _rename_with_retry(source: Path, target: Path) -> tuple[MoveResult, str]:
             time.sleep(UNLINK_DELAY_S)
             continue
         return MoveResult.MOVED, ""
-    return MoveResult.FAILED, "移動を諦めた"
+    return MoveResult.FAILED, tr("gave_up_moving")
 
 
 def _replace_with_retry(source: Path, target: Path) -> tuple[bool, str]:
@@ -229,7 +230,7 @@ def _replace_with_retry(source: Path, target: Path) -> tuple[bool, str]:
             time.sleep(UNLINK_DELAY_S)
             continue
         return True, ""
-    return False, "置換を諦めた"
+    return False, tr("gave_up_replacing")
 
 
 def _read_entry_at(path: Path) -> Entry | None:
@@ -276,10 +277,10 @@ def _describe_special_node(entry: os.DirEntry) -> str:
     """
     try:
         if entry.is_dir():
-            return "ディレクトリ"
+            return tr("kind_directory")
     except OSError:
         pass
-    return "特殊ファイル"
+    return tr("kind_special_file")
 
 
 def _json_files(
@@ -326,7 +327,7 @@ def _json_files(
             if entry.is_symlink():
                 unreadable = True
                 if on_anomaly:
-                    on_anomaly(Path(entry.path), "壊れたリンク")
+                    on_anomaly(Path(entry.path), tr("kind_broken_link"))
                 continue
             # **通常ファイルでもシンボリックリンクでもない ".json" 名のノード。**
             # ディレクトリ・FIFO・デバイスファイルなど。以前は ``is_file()`` と
@@ -608,10 +609,7 @@ class BoardListing:
         戻り値は ``self.pairs`` と同じ並び・同じ長さである（1 対 1 で対応する）。
         """
         if not self.complete:
-            raise PartialListingError(
-                "掲示板の一部が読めていない列挙からは、削除できる選択を作れない"
-                "（read されなかった側に探している宣言が隠れているかもしれない）"
-            )
+            raise PartialListingError(tr("cannot_build_selection_from_partial_listing"))
         return [ConfirmedEntry(path=path, entry=entry) for path, entry in self.pairs]
 
 
@@ -928,7 +926,9 @@ class Board:
                 # **JSON としては読めたが、宣言の形を最低限すら満たさない。**
                 # これも「完全に読めた」に含めてはならない——`resource` が
                 # 読めない以上、この 1 件がどの資源のものか分からない。
-                self.audit("entry_corrupt", path=str(path), reason="必須フィールドが読めない")
+                self.audit(
+                    "entry_corrupt", path=str(path), reason=tr("reason_required_field_unreadable")
+                )
                 complete = False
                 continue
             found.append((path, entry))
@@ -1177,7 +1177,7 @@ class Board:
             # 呼び出し元は :meth:`remove_confirmed` であり、nonce を持たない宣言を
             # ここへ渡してくるのは ``--force``（:meth:`remove_selected`）だけである
             # ——そちらは個体の照合をそもそも要求しない（``_remove_unkeyed`` 参照）。
-            self.audit("remove_refused", resource=resource_id, reason="nonce が空である")
+            self.audit("remove_refused", resource=resource_id, reason=tr("reason_nonce_empty"))
             return RemovalResult.NOT_OWNED
 
         if known is not None:
@@ -1185,7 +1185,9 @@ class Board:
             if entry.nonce != expect_nonce:
                 # 呼び出し側の取り違え。念のため確かめる（実害は無いはずだが、
                 # 黙って別物を捕獲しにいくよりは早く気づけるほうがよい）。
-                self.audit("remove_refused", resource=resource_id, reason="nonce が一致しない")
+                self.audit(
+                    "remove_refused", resource=resource_id, reason=tr("reason_nonce_mismatch")
+                )
                 return RemovalResult.NOT_OWNED
             result = self._capture_and_remove(
                 path, expect_nonce=expect_nonce, resource_id=resource_id, reason=reason
@@ -1207,7 +1209,7 @@ class Board:
                 self.audit(
                     "remove_unconfirmed",
                     resource=resource_id,
-                    reason="削除直後の再確認で掲示板の一部が読めない",
+                    reason=tr("reason_unreadable_after_removal"),
                 )
                 return RemovalResult.UNCONFIRMED
             return RemovalResult.NOT_OWNED if listing.pairs else RemovalResult.ABSENT
@@ -1220,7 +1222,9 @@ class Board:
             # **「無い」と「別物になっている」を畳まない。** 宣言が残っているのに
             # nonce が違うのは、解放と再取得が挟まったということで、対処が違う。
             if pairs:
-                self.audit("remove_refused", resource=resource_id, reason="nonce が一致しない")
+                self.audit(
+                    "remove_refused", resource=resource_id, reason=tr("reason_nonce_mismatch")
+                )
                 return RemovalResult.NOT_OWNED
             return RemovalResult.ABSENT
 
@@ -1289,7 +1293,9 @@ class Board:
         captured = _read_entry_at(tombstone)
         if captured is None or captured.nonce != expect_nonce:
             self._restore(tombstone, path, resource_id)
-            self.audit("remove_refused", resource=resource_id, reason="捕まえた宣言が別物だった")
+            self.audit(
+                "remove_refused", resource=resource_id, reason=tr("reason_captured_entry_swapped")
+            )
             return RemovalResult.NOT_OWNED
 
         result, error = _unlink_with_retry(tombstone)
@@ -1367,7 +1373,9 @@ class Board:
         捕まえたのは**既に退けられた古い宣言**なので、戻す先が無くても失うものは無い。
         残骸を消しておかないと、捕獲直後に死ななくても tombstone が溜まっていく。
         """
-        self.audit("restore_dropped", resource=resource_id, reason="新しい宣言が既にある")
+        self.audit(
+            "restore_dropped", resource=resource_id, reason=tr("reason_new_declaration_exists")
+        )
         _unlink_with_retry(tombstone)
 
     def remove_confirmed(
@@ -1397,10 +1405,7 @@ class Board:
         if not isinstance(selection, ConfirmedEntry):
             # **型を実行時にも守る。** 静的型検査を経ない呼び出し（動的な dispatch、
             # テストの誤用）でも、確認済みでない選択で削除が進まないようにする。
-            raise TypeError(
-                "remove_confirmed には ConfirmedEntry を渡すこと"
-                "（BoardListing.confirmed() または confirm_own_declaration() で作る）"
-            )
+            raise TypeError(tr("remove_confirmed_requires_confirmed_entry"))
         path, entry = selection.path, selection.entry
         if entry.nonce:
             return self._remove_if_nonce(
@@ -1413,7 +1418,9 @@ class Board:
         # 引き続き載るので「見えないまま残る」にはならない——消す手段が `--force` と
         # `--clean`（`remove_unreadable`。別経路）だけになるだけである。
         self.audit(
-            "remove_refused", resource=entry.resource, reason="nonce が無い個体は指定できない"
+            "remove_refused",
+            resource=entry.resource,
+            reason=tr("reason_unkeyed_entry_not_selectable"),
         )
         return RemovalResult.NOT_OWNED
 

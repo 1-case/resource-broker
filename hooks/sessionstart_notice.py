@@ -275,30 +275,31 @@ MESSAGES: dict[str, dict[str, str]] = {
     "usage": {
         "ja": USAGE,
         "en": (
-            "**Criterion for declaring something as a resource**: declare it if the "
-            "operation could conflict with another session and a conflict would have "
-            "serious consequences (a failed job, corrupted data, a long rework). It does "
-            "not matter what kind of resource it is. Both the resource ID and the "
-            "declaration text are free-form -- the judgment call is yours.\n"
+            "**Criterion for declaring something as a resource**: Declare it if the "
+            "operation could conflict with another session and such a conflict "
+            "would have serious consequences (job failure, data corruption, or "
+            "lengthy rework). The type of resource does not matter. Resource IDs "
+            "and declaration details are free-form; you decide.\n"
             "Before using it:\n"
-            "  1. **Investigate the resource's state yourself** (how you check it is up "
-            "to you; this tool does not know about resources)\n"
+            "  1. **Investigate the resource's state yourself** (you decide how; "
+            "this tool does not know about resources)\n"
             '  2. rb run --res <resource-id> --job "<description>" '
             '--observed "<what you saw>" --eta "<expected finish>"\n'
             "            --found busy|free|unknown -- <command>\n"
-            "     rb run bundles the declaration, logging, and automatic release on "
-            "exit. For manual use: rb claim / rb release\n"
-            "     --eta is never used for judgment; it is required just to make you "
-            "stop and think once\n"
-            "**Always check the board with rb status (no arguments, everything) -- "
-            "never name a resource.**\n"
-            "Reading the whole board is the point: a single machine does not deal with "
-            "that many resources. Resource IDs are free text and their spelling drifts "
-            "(case differs -> different resource), so naming one hides the other "
-            'session\'s declaration and reports "free". Reading everything lets you '
-            "match whatever spelling is already in use.\n"
-            "Also read it when you start work (if someone is already there, you can "
-            "choose a different approach)."
+            "     rb run bundles the declaration, logging, and automatic release "
+            "of the declaration on exit. For manual use: rb claim / rb release\n"
+            "     --eta is never used for any decision; it is required only to "
+            "make you consider the expected finish time once\n"
+            "**Always check the entire board with rb status (no arguments). "
+            "Never specify a resource name.**\n"
+            "The point is to read the entire board. A single machine has "
+            "relatively few resources. Resource IDs are free-form, so their "
+            "spelling varies (different letter case means a different resource). "
+            "Looking up one spelling can hide another session's declaration and "
+            'make the resource appear "free". Reading the entire board lets you '
+            "use the spelling already in use.\n"
+            "You must also check the board when you start work (if someone is "
+            "already using a resource, you can choose a different approach)."
         ),
     },
     "no_job": {"ja": "(ジョブ未記入)", "en": "(no job noted)"},
@@ -307,14 +308,14 @@ MESSAGES: dict[str, dict[str, str]] = {
         "en": "log   {log}  (read progress here)",
     },
     "observed_label": {"ja": "観測  {note}", "en": "observed  {note}"},
-    "sharing_label": {"ja": "共有  {sharing}", "en": "sharing  {sharing}"},
+    "sharing_label": {"ja": "共有  {sharing}", "en": "handover note  {sharing}"},
     "declaration_count": {
         "ja": "  （宣言 {count} 件）",
         "en": "  ({count} declarations)",
     },
     "partial_warning": {
         "ja": "\n注意: 掲示板の一部を読めませんでした。**これで全部とは限りません。**",
-        "en": "\nNote: part of the board could not be read. **This may not be everything.**",
+        "en": "\nNote: part of the board could not be read. **This may not be the full list.**",
     },
     "board_location": {"ja": "（掲示板: {path}）", "en": " (board: {path})"},
     "partial_only_notice": {
@@ -323,9 +324,9 @@ MESSAGES: dict[str, dict[str, str]] = {
             "**読めなかった宣言があるので、空とは限りません。**\n{usage}"
         ),
         "en": (
-            "[resource-broker] No declarations found in the part of the board that "
-            "could be read{where}. **Since some declarations could not be read, this "
-            "may not mean the board is empty.**\n{usage}"
+            "[resource-broker] No declarations were found in the readable part of "
+            "the board{where}. **Some declarations could not be read, so the "
+            "board may not be empty.**\n{usage}"
         ),
     },
     "empty_board": {
