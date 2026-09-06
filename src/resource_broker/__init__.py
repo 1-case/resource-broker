@@ -4,4 +4,4 @@
 止めてはならない。詳細は DESIGN.md「Design Principles」を参照。
 """
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
