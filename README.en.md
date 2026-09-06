@@ -23,8 +23,11 @@ GPU0                     使用中    実測で使用を確認、または宣言
                          共有 up to 5GB VRAM remaining
 ```
 
-> **Note on language.** The CLI, the hook messages and all design documents are in Japanese.
-> This file is a summary for readers who do not read Japanese; it is not a full translation.
+> **Note on language.** The CLI output and the hook messages are bilingual and pick
+> English or Japanese automatically for your environment (see [Language](#language) below).
+> The design document (`docs/DESIGN.md`) stays Japanese-only. This file is a summary, not a
+> full translation — the Japanese [README](README.md) is canonical. Free text you write in a
+> declaration (`--job` / `--observed` / `--sharing`) is never translated; it stays as written.
 
 ## What it does *not* do
 
@@ -167,6 +170,18 @@ free text, so spellings drift — `GPU0` and `gpu0` are *different resources* �
 lookup used to silently answer "free" while someone held the other spelling. `rb status`
 used to accept a resource ID; that path is gone now, so every check reads the whole board.
 
+| Command | Purpose |
+|---|---|
+| `rb status` (takes no resource ID) | **Read the whole board. This is how you check.** `--json` for machine-readable output |
+| `rb claim <resource>` | Declare. Refuses if someone already holds it (`--share` to join them, `--force` to evict them) |
+| `rb run --res <resource> -- <cmd>` | Declare, run the command, and always release in a `finally` |
+| `rb claim <resource> --share` | Join a resource someone else already declared |
+| `rb update <resource>` | Bring your own declaration in line with reality |
+| `rb release <resource>` | Withdraw your own declaration. Refuses if you hold more than one (ambiguous) — `--all` clears every one of yours, `--nonce <value>` targets exactly one without naming a resource. `--force` also removes other people's |
+| `rb wait <resource>` | Wait until the set of holders shrinks |
+| `rb history [resource]` | Line up declared ETA against what actually happened |
+| `rb --version` | Print the version and the package directory it runs from, then exit. Never touches the board |
+
 ## Hooks
 
 Three hooks, and **none of them blocks anything.** They put the facts where the decision is
@@ -202,6 +217,28 @@ shipped — so out of the box the third hook stays silent. You decide what deser
 ```
 
 A stale table is harmless: it stops matching, so notices stop — nothing is ever blocked.
+
+## Language
+
+The CLI output and hook notices are bilingual and choose automatically at runtime. The order,
+top to bottom:
+
+1. the `RESOURCE_BROKER_LANG` environment variable (`ja` / `en` — an explicit choice always
+   wins)
+2. Claude Code's `language` setting (`~/.claude/settings.json`)
+3. the OS locale
+4. Japanese, if none of the above resolve
+
+**Japanese is canonical; English is a translation.** Any message the translation has not
+caught up with falls back to Japanese (a missing `en` string reads as `ja`). Free text you
+write in a declaration (`--job` / `--observed` / `--sharing`) is carried verbatim in whatever
+language you wrote it — it is never translated.
+
+To force a language explicitly:
+
+```console
+$ RESOURCE_BROKER_LANG=en rb status
+```
 
 ## The cost (it eats context every turn)
 
