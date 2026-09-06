@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import IO
 
 from . import clock, naming
+from .messages import tr
 
 #: ログを置くディレクトリ名（掲示板のルート直下）。
 #:
@@ -256,9 +257,8 @@ def _pump(source: object, sink: object, limit: int) -> None:
                     if room:
                         sink.write(chunk[:room])  # type: ignore[attr-defined]
                         written += room
-                    notice = (
-                        f"\n=== {clock.now_iso()} ログが上限（{limit} バイト）に達したため、"
-                        "以降の出力を破棄した（ジョブは継続中）\n"
+                    notice = "\n=== {at} {text}\n".format(
+                        at=clock.now_iso(), text=tr("log_limit_reached", limit=limit)
                     )
                     sink.write(notice.encode("utf-8", errors="replace"))  # type: ignore[attr-defined]
                     truncated = True
@@ -273,7 +273,7 @@ def _pump(source: object, sink: object, limit: int) -> None:
                 # ときだけ何も言わないと、ログはぶつ切りになり読む側は「ここでジョブが
                 # 止まった」と読む。ログには
                 # もう書けないので、言える場所は stderr しかない。
-                _warn(f"警告: ログに書けなくなりました（{exc}）。ジョブは継続します")
+                _warn(tr("log_write_failed", error=exc))
                 truncated = True
     except (OSError, ValueError):
         pass  # 読み口が壊れた。ここまで写した分で諦める
@@ -384,7 +384,9 @@ def _log_actual_executable(stream: IO[bytes], pid: int) -> None:
         path = _actual_executable_path(pid)
         if not path:
             return
-        stream.write(f"    実体: {path}\n".encode("utf-8", errors="replace"))
+        stream.write(
+            f"    {tr('actual_executable', path=path)}\n".encode("utf-8", errors="replace")
+        )
         stream.flush()
     except Exception:  # noqa: BLE001 - ログの装飾のために起動処理を止めない
         pass
@@ -420,10 +422,7 @@ def default_spawn(argv: list[str], log_path: Path, env: Mapping[str, str]) -> in
         # **この print で落ちない。** ``rb run ... 2>&1 | head`` のように stderr が
         # 閉じていると ``BrokenPipeError`` になり、呼び出し側の catch-all が 126 を返す
         # ——「ログ置き場が書けないだけでジョブが走らない」に逆戻りする。
-        _warn(
-            f"警告: ログを開けませんでした（{log_path}）。出力は捕まえずにそのまま流します。"
-            "掲示板に載せた log のパスは生成されません"
-        )
+        _warn(tr("log_open_failed", log_path=log_path))
         return _spawn_without_log(argv, env)
 
     with stream:
@@ -511,10 +510,7 @@ def _warn_if_descendants_survive(process: subprocess.Popen[bytes], sink: IO[byte
     """
     if _group_alive(process.pid) is not True:
         return
-    text = (
-        f"=== {clock.now_iso()} 警告: 子プロセスの子孫が残ったまま rb run が終了する。"
-        "宣言は解放されるので、掲示板は空・資源は掴まれたままになりうる\n"
-    )
+    text = "=== {at} {text}\n".format(at=clock.now_iso(), text=tr("descendants_survived"))
     _warn(text.strip())
     if sink is None:
         return

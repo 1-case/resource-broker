@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from resource_broker import messages
 from resource_broker.board import Board
 
 
@@ -46,8 +47,15 @@ def _pin_language_to_japanese(monkeypatch: pytest.MonkeyPatch) -> None:
     専用のテスト（``tests/test_hook_language_switch.py``）で英語の出力を別途守る。
     このフィクスチャは ``monkeypatch`` を使うので、個々のテストが同じキーを
     上書きすれば（後勝ちで）そちらが有効になる。
+
+    ``resource_broker.messages`` は 1 プロセス内で判定を使い回すため
+    （``cli.main()`` が起動のたびに確定し直す設計。``messages.py`` の
+    ``_current_lang`` 参照）、``main()`` を経由しない直接呼び出し
+    （:func:`resource_broker.liveness.explain` の単体テスト等）が前のテストの
+    判定を読んでしまわないよう、**ここで毎回リセットする**。
     """
     monkeypatch.setenv("RESOURCE_BROKER_LANG", "ja")
+    monkeypatch.setattr(messages, "_current_lang", None)
 
 
 @pytest.fixture(autouse=True)

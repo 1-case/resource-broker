@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 
+from .messages import tr
+
 
 @dataclass(frozen=True)
 class Observation:
@@ -183,11 +185,14 @@ def is_free(verdict: Verdict) -> bool:
 
 
 def explain(verdict: Verdict) -> str:
-    """判定の理由を日本語 1 行で返す。CLI とフックの説明文に使う。"""
+    """判定の理由を 1 行で返す（言語は :mod:`resource_broker.messages` の判定に従う）。
+
+    CLI とフックの説明文に使う。
+    """
     return {
-        Verdict.FREE: "掲示板にエントリが無い",
-        Verdict.HELD: "実測で使用を確認、または宣言が有効",
-        Verdict.STALE_PROBE: "猶予を過ぎ、実測が空きで宣言プロセスも消えている（幽霊）",
-        Verdict.STALE_REBOOT: "宣言が再起動より前のもの（確定的な幽霊）",
-        Verdict.UNCERTAIN: "宣言はあるが裏が取れない（PID 消失または時刻不正）",
+        Verdict.FREE: tr("verdict_free"),
+        Verdict.HELD: tr("verdict_held"),
+        Verdict.STALE_PROBE: tr("verdict_stale_probe"),
+        Verdict.STALE_REBOOT: tr("verdict_stale_reboot"),
+        Verdict.UNCERTAIN: tr("verdict_uncertain"),
     }[verdict]

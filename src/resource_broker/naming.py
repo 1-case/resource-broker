@@ -15,6 +15,7 @@ import hashlib
 import re
 
 from . import platform_info
+from .messages import tr
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 _MAX_BASE = 64
@@ -54,7 +55,7 @@ def normalize(resource_id: str, host: str | None = None) -> str:
     """
     trimmed = (resource_id or "").strip()
     if not trimmed:
-        raise ValueError("資源 ID が空である")
+        raise ValueError(tr("resource_id_empty"))
     if HOST_SEP in trimmed:
         return trimmed
     return f"{host or platform_info.hostname()}{HOST_SEP}{trimmed}"
