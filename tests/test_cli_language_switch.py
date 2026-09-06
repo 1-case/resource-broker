@@ -85,7 +85,7 @@ def test_claim_refusal_speaks_english_and_keeps_free_text_untranslated(
 
     assert code == 1
     assert "is in use" in err
-    assert "Use --share" in err
+    assert "use --share" in err
     assert UNTRANSLATED_JOB in err  # 先に取った側の job（自由記述）
     assert UNTRANSLATED_SHARING in err
     assert "は使用中です" not in err
@@ -116,7 +116,7 @@ def test_help_speaks_english(tmp_path: Path, capsys: pytest.CaptureFixture[str])
     # （``--help`` や引数不備の経路）。呼び出し側からは通常の戻り値として見える。
     assert run(tmp_path, "--help") == 0
     out = capsys.readouterr().out
-    assert "board that shares finite-resource usage" in out
+    assert "board for sharing the usage status of finite resources" in out
     assert "並行する Claude Code セッション" not in out
 
 

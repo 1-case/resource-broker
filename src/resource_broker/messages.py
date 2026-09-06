@@ -230,7 +230,8 @@ MESSAGES: dict[str, dict[str, str]] = {
     "verdict_uncertain": {
         "ja": "宣言はあるが裏が取れない（PID 消失または時刻不正）",
         "en": (
-            "There is a declaration but it cannot be corroborated (missing PID or a bad timestamp)"
+            "There is a declaration, but it cannot be corroborated (the PID no "
+            "longer exists or the timestamp is invalid)"
         ),
     },
     # --- naming.py ---------------------------------------------------------------
@@ -261,7 +262,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         ),
         "en": (
             "Warning: could not open the log ({log_path}). Output is being passed through "
-            "uncaptured. No log path will be recorded on the board"
+            "uncaptured. No log will be created at the path recorded on the board"
         ),
     },
     "descendants_survived": {
@@ -320,9 +321,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "（read されなかった側に探している宣言が隠れているかもしれない）"
         ),
         "en": (
-            "Cannot build a deletable selection from a listing where part of the board "
-            "could not be read (the declaration you are looking for may be hiding on "
-            "the unread side)"
+            "Cannot select declarations for removal from an incomplete board "
+            "listing (the declaration being sought may be in the unread portion)"
         ),
     },
     "remove_confirmed_requires_confirmed_entry": {
@@ -338,7 +338,7 @@ MESSAGES: dict[str, dict[str, str]] = {
     # --- cli.py: _report_unreadable / _cmd_status ---------------------------------
     "unreadable_files_found": {
         "ja": "読めないファイルが {count} 件あります（どの資源のものか判別できません）",
-        "en": "There are {count} unreadable files (cannot tell which resource they belong to)",
+        "en": "Unreadable files: {count} (cannot determine which resource each file belongs to)",
     },
     "unreadable_files_more": {
         "ja": "ほか {count} 件",
@@ -350,7 +350,7 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "declarations_count_active": {
         "ja": "{count} 件の宣言がある",
-        "en": "{count} active declaration(s)",
+        "en": "active declarations: {count}",
     },
     "no_declaration": {
         "ja": "宣言が無い",
@@ -378,7 +378,7 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "board_partially_unreadable_notice": {
         "ja": "注意: 掲示板の一部を読めませんでした。**これで全部とは限りません**",
-        "en": "Note: part of the board could not be read. **This may not be everything.**",
+        "en": "Note: part of the board could not be read. **This may not be the full list.**",
     },
     "mark_occupied": {"ja": "使用中", "en": "in use"},
     "mark_free": {"ja": "空き", "en": "free"},
@@ -397,7 +397,7 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "sharing_label": {
         "ja": "共有 {sharing}",
-        "en": "share {sharing}",
+        "en": "handover note: {sharing}",
     },
     "observed_label": {
         "ja": "観測 {note}",
@@ -405,18 +405,19 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "observed_at": {
         "ja": "（{at} 時点の申告）",
-        "en": "(as declared at {at})",
+        "en": "(as reported at {at})",
     },
     "unknown_time": {"ja": "時刻不明", "en": "time unknown"},
     "total_declarations": {
         "ja": "合計   {count} 件の宣言",
-        "en": "total   {count} declaration(s)",
+        "en": "total   declarations: {count}",
     },
     # --- cli.py: acquire() / _explain_failed_displacement -------------------------
     "lock_not_acquired": {
         "ja": "[rb] 掲示板のロックを取れませんでした（{lock}）。**排他を弱めて続行**します",
         "en": (
-            "[rb] Could not acquire the board lock ({lock}). **Continuing with weaker exclusion.**"
+            "[rb] Could not acquire the board lock ({lock}). **Continuing with "
+            "weaker mutual exclusion.**"
         ),
     },
     "ghost_eviction_skipped_partial": {
@@ -425,8 +426,9 @@ MESSAGES: dict[str, dict[str, str]] = {
             "（生きた宣言を見逃している可能性があります）"
         ),
         "en": (
-            "[rb] Part of the board could not be read. **Continuing without evicting "
-            "anyone** (a live declaration may be hiding on the unread side)"
+            "[rb] Part of the board could not be read. **Continuing without "
+            "evicting any declarations** (a live declaration may be in the "
+            "unread portion)"
         ),
     },
     "reason_board_partially_unreadable": {
@@ -453,7 +455,7 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "resource_in_use_with_count": {
         "ja": "[rb] {label} は使用中です（既に {count} 件の宣言があります）",
-        "en": "[rb] {label} is in use (there are already {count} declaration(s))",
+        "en": "[rb] {label} is in use (declarations already present: {count})",
     },
     "resource_in_use_self_reported": {
         "ja": "[rb] {label} は使用中です（自分で busy と申告している）",
@@ -469,13 +471,16 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "your_report_says_free": {
         "ja": "  あなたの申告は free です。**どちらかが古い。**",
-        "en": ("  You reported free, but the board disagrees. **One of the two is out of date.**"),
+        "en": (
+            "  Your report says free, but the board says otherwise. **Either your "
+            "report or the board entry is stale.**"
+        ),
     },
     "share_or_force_advice": {
         "ja": "  並んで使うなら --share。宣言が古いと判断したなら --force で退けること",
         "en": (
-            "  Use --share to use it alongside them. If you have decided the "
-            "declaration is stale, use --force to evict it"
+            "  If you intend to share the resource, use --share. If you determine "
+            "that a declaration is stale, evict it with --force"
         ),
     },
     "wait_advice_line": {
@@ -498,13 +503,13 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "stray_entries_notice": {
         "ja": "[rb] 壊れたエントリが {count} 件あります（掃除: rb release --clean）",
-        "en": "[rb] There are {count} corrupt entries (clean up with: rb release --clean)",
+        "en": "[rb] Corrupt entries: {count} (clean up with rb release --clean)",
     },
     "simultaneous_notice": {
         "ja": ("[rb] **ほぼ同時に {count} 件の宣言が入りました。**先着を決める仕組みはありません"),
         "en": (
-            "[rb] **{count} declaration(s) arrived at almost the same moment.** "
-            "There is no mechanism for who arrived first"
+            "[rb] **Declarations arrived almost simultaneously: {count}.** "
+            "The tool has no mechanism for determining which declaration came first"
         ),
     },
     "overlap_advice": {
@@ -513,11 +518,11 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "resource_already_has_declarations": {
         "ja": "[rb] この資源には既に {count} 件の宣言があります",
-        "en": "[rb] This resource already has {count} declaration(s)",
+        "en": "[rb] This resource already has declarations: {count}",
     },
     "sharing_note_suffix": {
         "ja": "共有: {sharing}",
-        "en": "share: {sharing}",
+        "en": "handover note: {sharing}",
     },
     "eviction_failed": {
         "ja": "退けようとした宣言を消せませんでした（掲示板に残っています。監査ログを参照）",
@@ -554,13 +559,15 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "not_declared_warning_line2": {
         "ja": "  他セッションはこの利用を知らないまま同じ資源を取りにきます",
-        "en": "  Other sessions will come for the same resource without knowing about this use",
+        "en": (
+            "  Other sessions will try to acquire the same resource without knowing it is in use"
+        ),
     },
     "not_declared_warning_line3": {
         "ja": "  作業は止めませんが、衝突を避けたいなら掲示板の状態を確かめること",
         "en": (
-            "  This will not stop your work, but check the board's state yourself if "
-            "you want to avoid a collision"
+            "  The tool will not stop your work, but if you want to avoid a "
+            "collision, you must check the board's state"
         ),
     },
     "run_requires_trailing_command": {
@@ -623,10 +630,11 @@ MESSAGES: dict[str, dict[str, str]] = {
             "（本ツールは実測が空きでも宣言を退けない）"
         ),
         "en": (
-            "  While you wait, also check the resource's state yourself. If it looks "
-            "free but the declaration is still there,\n"
-            "  confirm with the holder, or ask a human if you cannot reach them "
-            "(this tool never evicts a declaration just because it observes free)"
+            "  While waiting, you must also check the resource's state yourself. If "
+            "it appears free but the declaration remains,\n"
+            "  confirm with the holder; if you cannot confirm with them, consult a "
+            "human (this tool does not evict a declaration solely because an "
+            "observation reports the resource as free)"
         ),
     },
     "already_released": {
@@ -651,21 +659,28 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "wait_released": {
         "ja": "全ての宣言が消えました（{polls} 回確認 / {waited} 秒）",
-        "en": "All declarations are gone ({polls} check(s) / {waited}s)",
+        "en": "All declarations are gone (polls: {polls} / waited: {waited}s)",
     },
     "wait_check_yourself_after_release": {
         "ja": "使う前にもう一度自分で状態を調べること（解放＝空きとは限らない）",
-        "en": "Before using it, check its state yourself once more (released is not always free)",
+        "en": (
+            "Before using it, you must check the resource's state yourself again "
+            "(a released declaration does not necessarily mean the resource is free)"
+        ),
     },
     "wait_shrank": {
         "ja": "宣言が減りました（残り {holders} 件 / {polls} 回確認 / {waited} 秒）",
         "en": (
-            "The number of declarations went down (now {holders} / {polls} check(s) / {waited}s)"
+            "The number of declarations went down (remaining: {holders} / "
+            "polls: {polls} / waited: {waited}s)"
         ),
     },
     "wait_check_yourself_after_shrink": {
         "ja": "入れるかどうかは自分で調べて判断すること。駄目ならもう一度 rb wait すればよい",
-        "en": "Check for yourself whether you can go ahead. If not, just run rb wait again",
+        "en": (
+            "You must check and decide for yourself whether you can use the "
+            "resource. If not, run rb wait again"
+        ),
     },
     "wait_broken": {
         "ja": (
@@ -673,13 +688,14 @@ MESSAGES: dict[str, dict[str, str]] = {
             "使用中かどうかは未確認です"
         ),
         "en": (
-            "Reached the limit without ever reading the board successfully "
-            "({polls} check(s) / {waited}s). Whether it is in use is unconfirmed"
+            "Reached the limit without ever successfully reading the board "
+            "(polls: {polls} / waited: {waited}s). Whether the resource is in use "
+            "remains unconfirmed"
         ),
     },
     "wait_timed_out": {
         "ja": "上限に達しました（{polls} 回確認 / {waited} 秒）。まだ使用中です",
-        "en": "Reached the limit ({polls} check(s) / {waited}s). Still in use",
+        "en": "Reached the limit (polls: {polls} / waited: {waited}s). Still in use",
     },
     "holder_label": {
         "ja": "保持者: {session} / {job}",
@@ -687,7 +703,7 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "held_since_suffix": {
         "ja": "（{duration} 前から）",
-        "en": " (since {duration} ago)",
+        "en": " (for {duration})",
     },
     # --- cli.py: _cmd_history ---------------------------------------------------------
     "no_past_declarations": {
@@ -721,8 +737,8 @@ MESSAGES: dict[str, dict[str, str]] = {
     "history_footer_advice": {
         "ja": "同じ案件の前回の申告と実績を突き合わせ、次の申告の精度を上げること",
         "en": (
-            "Compare this job's previous report against what actually happened, and use "
-            "that to sharpen your next estimate"
+            "Compare the previous declaration for the same work with the actual "
+            "outcome, and use that to improve the accuracy of your next declaration"
         ),
     },
     # --- cli.py: _cmd_update / _update_locked ---------------------------------------
@@ -740,21 +756,24 @@ MESSAGES: dict[str, dict[str, str]] = {
     "update_partial_notice": {
         "ja": "注意: 掲示板の一部を読めませんでした（他に自分の宣言があるかもしれません）",
         "en": (
-            "Note: part of the board could not be read (you may have another "
-            "declaration you cannot see)"
+            "Note: part of the board could not be read (other declarations of "
+            "yours may be in the unread portion)"
         ),
     },
     "update_multiple_own_declarations": {
         "ja": "自分の宣言が {count} 件あります。最も古いものを書き換えます: {job}",
-        "en": "You have {count} of your own declarations. Rewriting the oldest one: {job}",
+        "en": "You have {count} declarations of your own. Updating the oldest one: {job}",
     },
     "update_overwriting_foreign": {
         "ja": "警告: 他セッションの宣言を書き換えます: {session} / {job}",
-        "en": "Warning: overwriting another session's declaration: {session} / {job}",
+        "en": "Warning: updating another session's declaration: {session} / {job}",
     },
     "update_no_own_declaration": {
         "ja": "自分の宣言はありません（--force で他セッションのものを書き換えられます）",
-        "en": ("You have no declaration of your own (use --force to rewrite another session's)"),
+        "en": (
+            "You have no declaration of your own (use --force to update another "
+            "session's declaration)"
+        ),
     },
     "reason_update_command": {
         "ja": "update コマンド",
@@ -782,7 +801,7 @@ MESSAGES: dict[str, dict[str, str]] = {
     "reason_release_clean": {"ja": "release --clean", "en": "release --clean"},
     "unreadable_files_removed": {
         "ja": "読めないファイルを {count} 件消しました",
-        "en": "Removed {count} unreadable file(s)",
+        "en": "Unreadable files removed: {count}",
     },
     "no_unreadable_files": {
         "ja": "読めないファイルはありませんでした",
@@ -794,7 +813,9 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "warn_could_not_remove_count": {
         "ja": "警告: {count} 件を消せませんでした（他プロセスが読んでいる可能性）",
-        "en": "Warning: could not remove {count} file(s) (another process may be reading them)",
+        "en": (
+            "Warning: unreadable files not removed: {count} (another process may be reading them)"
+        ),
     },
     "release_requires_resource_or_flag": {
         "ja": "資源 ID を指定するか、--clean か --nonce を付けてください",
@@ -807,7 +828,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         ),
         "en": (
             "Part of the board could not be read. The release is unconfirmed "
-            "(a matching declaration may be hiding on the unread side)"
+            "(a matching declaration may be in the unread portion)"
         ),
     },
     "nonce_no_match": {
@@ -820,7 +841,7 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "nonce_ambiguous_matches": {
         "ja": "nonce '{prefix}' が {count} 件に一致します。もっと長い桁数を指定してください",
-        "en": "nonce '{prefix}' matches {count} declarations. Specify more digits",
+        "en": "nonce '{prefix}' matches {count} declarations. Specify a longer prefix",
     },
     "nonce_match_line": {
         "ja": "  nonce {nonce}  {resource}  {session} / {job}（since {since}）",
@@ -892,7 +913,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         ),
         "en": (
             "Part of the board could not be read. The forced release is unconfirmed "
-            "(a declaration for this resource may be hiding on the unread side)"
+            "(a declaration for this resource may be in the unread portion)"
         ),
     },
     "reason_release_forced_command": {
@@ -905,7 +926,7 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "force_released_notice": {
         "ja": "強制解放しました: {resource}（{count} 件）",
-        "en": "Forcibly released: {resource} ({count} declaration(s))",
+        "en": "Forcibly released: {resource} (declarations: {count})",
     },
     "warn_could_not_confirm_removal_count": {
         "ja": (
@@ -913,15 +934,15 @@ MESSAGES: dict[str, dict[str, str]] = {
             "（削除直後に掲示板の一部が読めなくなりました）"
         ),
         "en": (
-            "Warning: could not confirm whether {count} entry/entries were removed "
-            "(part of the board became unreadable right after deletion)"
+            "Warning: removals not confirmed: {count} (part of the board became "
+            "unreadable right after deletion)"
         ),
     },
     "warn_swapped_not_removed_count": {
         "ja": "警告: {count} 件は他セッションが取り直していたため消していません",
         "en": (
-            "Warning: {count} entry/entries were not removed because another session "
-            "had already re-claimed them"
+            "Warning: replacement declarations left untouched: {count} (other "
+            "sessions had already reclaimed the resource)"
         ),
     },
     "release_own_partial_unreadable": {
@@ -931,13 +952,14 @@ MESSAGES: dict[str, dict[str, str]] = {
         ),
         "en": (
             "Part of the board could not be read. The release is unconfirmed "
-            "(one of your own declarations may be hiding on the unread side)"
+            "(one of your own declarations may be in the unread portion)"
         ),
     },
     "release_own_ambiguous": {
         "ja": "自分の宣言が {count} 件あります。曖昧なので何も消しません",
         "en": (
-            "You have {count} of your own declarations. This is ambiguous, so nothing was removed"
+            "You have {count} declarations of your own. The target is ambiguous, "
+            "so nothing will be removed"
         ),
     },
     "nonce_job_since_line": {
@@ -966,7 +988,7 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "released_notice_count": {
         "ja": "解放しました: {resource}（{count} 件）",
-        "en": "Released: {resource} ({count} declaration(s))",
+        "en": "Released: {resource} (declarations: {count})",
     },
     "current_holder_line": {
         "ja": "  現在: {session} / {job}（since {since}）",
@@ -984,9 +1006,10 @@ MESSAGES: dict[str, dict[str, str]] = {
             "自由記述も可（'モデル次第' 等）。**判断には使わない**"
         ),
         "en": (
-            "How long you expect this to take. '30m', '2h', '1h30m' get an absolute "
-            "time computed and shown alongside. Free text is also fine (e.g. "
-            "'depends on the model'). **Not used for any decision**"
+            "Expected time to completion. For '30m', '2h', or '1h30m', the tool "
+            "calculates and displays an absolute time alongside it. Free-form text "
+            "is also accepted (e.g. 'depends on the model'). **Not used for any "
+            "decision**"
         ),
     },
     "help_found": {
@@ -1007,9 +1030,10 @@ MESSAGES: dict[str, dict[str, str]] = {
             "**許可を与える旗ではない**（与える保持者がいない）。本ツールは解釈しない"
         ),
         "en": (
-            "A handover note for whoever comes next (e.g. 'VRAM free up to 6GB "
-            "remaining', '15 cores in use'). **This is not a permission flag** "
-            "(there is no holder to grant permission). This tool does not interpret it"
+            "A handover note for whoever comes next (e.g. '6 GB of VRAM still "
+            "available', '15 cores in use'). **This is not a flag that grants "
+            "permission** (there is no holder who can grant it). This tool does not "
+            "interpret its contents"
         ),
     },
     "help_log": {"ja": "進捗が読めるログのパス", "en": "Path to a log where progress can be read"},
@@ -1026,7 +1050,10 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "parser_description": {
         "ja": "並行する Claude Code セッション間で有限資源の使用状況を共有する掲示板",
-        "en": "A board that shares finite-resource usage across concurrent Claude Code sessions",
+        "en": (
+            "A board for sharing the usage status of finite resources among "
+            "concurrent Claude Code sessions"
+        ),
     },
     "parser_epilog": {
         "ja": (
@@ -1058,10 +1085,11 @@ MESSAGES: dict[str, dict[str, str]] = {
             "答えることがあるため（issue #9）。"
         ),
         "en": (
-            "Shows every resource that has a declaration. It does not take a resource "
-            "ID — filtering by name can miss another session's declaration over a "
-            "spelling difference (case makes it a different resource) and wrongly "
-            "report free (issue #9)."
+            "Shows every resource that has a declaration. It does not take a "
+            "resource ID — filtering by name can miss another session's "
+            "declaration because of spelling variation (different letter case "
+            "means a different resource) and incorrectly report the resource as "
+            "free (issue #9)."
         ),
     },
     "help_json": {"ja": "JSON で出力する", "en": "Output as JSON"},
@@ -1077,7 +1105,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "en": (
             "Declares a resource. Write what you yourself observed in --observed. "
             "This tool does not interpret the content — it only records it on the "
-            "board as an observation."
+            "board as an observation data point."
         ),
     },
     "help_resource_id": {"ja": "資源 ID", "en": "Resource ID"},
@@ -1093,11 +1121,11 @@ MESSAGES: dict[str, dict[str, str]] = {
             "他セッションの宣言まで消すのは --force だけである。"
         ),
         "en": (
-            "Withdraws your own declaration. When you have two or more of your own, "
-            "it is ambiguous, so by default nothing is removed and the command is "
-            "refused (--all removes them all at once). --nonce lets you target "
-            "exactly one, without a resource ID. Only --force removes another "
-            "session's declaration."
+            "Withdraws your own declaration. If you have two or more declarations "
+            "of your own, the target is ambiguous, so by default the command "
+            "refuses to remove anything (--all removes them all). With --nonce, "
+            "you can target and remove exactly one declaration without a resource "
+            "ID. Only --force removes declarations from other sessions."
         ),
     },
     "help_resource_id_optional": {
@@ -1111,19 +1139,19 @@ MESSAGES: dict[str, dict[str, str]] = {
             "何も消さず候補を挙げて拒否する。他セッションの宣言を消すには --force を併用する"
         ),
         "en": (
-            "Target exactly one declaration by a nonce prefix match, instead of a "
-            "resource ID (the first 8 characters shown in rb status are enough). By "
-            "default this is narrowed to your own declarations, and if it does not "
-            "resolve to exactly one, nothing is removed and the candidates are "
-            "listed instead. Combine with --force to remove another session's "
-            "declaration"
+            "Target exactly one declaration by matching a nonce prefix, instead of "
+            "a resource ID (the first 8 characters shown in rb status are enough). "
+            "By default, matches are limited to your own declarations. If the "
+            "prefix does not identify exactly one declaration, nothing is removed "
+            "and the candidates are listed. Combine with --force to remove another "
+            "session's declaration"
         ),
     },
     "help_all": {
         "ja": "自分の宣言が複数あっても全部まとめて解放する（曖昧さの拒否を明示的に上書きする）",
         "en": (
-            "Release all of your own declarations at once even when there are "
-            "several (explicitly overrides the ambiguity refusal)"
+            "Release all of your own declarations even when there are several "
+            "(explicitly overrides the default refusal when the target is ambiguous)"
         ),
     },
     "help_force_release": {
@@ -1133,13 +1161,13 @@ MESSAGES: dict[str, dict[str, str]] = {
     "help_clean": {
         "ja": "読めないファイルを消す（どの資源のものか判別できないので資源は指定しない）",
         "en": (
-            "Remove unreadable files (no resource is specified, since it cannot be "
-            "told which resource they belong to)"
+            "Remove unreadable files (do not specify a resource, because the "
+            "resource for each file cannot be identified)"
         ),
     },
     "help_run": {
         "ja": "資源を宣言してコマンドを実行し、終了時に必ず解放する",
-        "en": "Declare a resource, run a command, and always release it when done",
+        "en": "Declare a resource, run a command, and always release the declaration on exit",
     },
     "description_run": {
         "ja": (
@@ -1156,7 +1184,7 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "help_update": {
         "ja": "自分の宣言を書き換える（見積もりや ETA を実態に合わせる）",
-        "en": "Rewrite your own declaration (bring the estimate or ETA in line with reality)",
+        "en": "Update your own declaration (bring the estimate or ETA in line with reality)",
     },
     "description_update": {
         "ja": (
@@ -1178,7 +1206,7 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "help_force_update": {
         "ja": "他者の宣言でも書き換える",
-        "en": "Rewrite even another session's declaration",
+        "en": "Update another session's declaration as well",
     },
     "help_wait": {
         "ja": "資源を宣言している者が減るまで待つ",
@@ -1204,7 +1232,9 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "help_timeout": {
         "ja": "待機の上限秒数（既定 {default}）。超えたら一度戻る",
-        "en": "Maximum wait time in seconds (default {default}). Returns once this is exceeded",
+        "en": (
+            "Maximum wait time in seconds (default {default}). Returns when the limit is exceeded"
+        ),
     },
     "help_history": {
         "ja": "過去の宣言を振り返る（見積もりの根拠にする）",
@@ -1240,7 +1270,7 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "nonce_empty_prefix": {
         "ja": "nonce が空です。前方一致させる値を指定してください",
-        "en": "The nonce is empty. Specify a value to prefix-match against",
+        "en": "The nonce prefix is empty. Specify a prefix to match",
     },
 }
 
