@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -283,6 +284,112 @@ def _pump(source: object, sink: object, limit: int) -> None:
             pass
 
 
+def _resolve_launch_target(argv: Sequence[str], env: Mapping[str, str]) -> str | None:
+    """``argv[0]`` を**呼び出し元の PATH**で解決し、``executable=`` へ渡す値を作る。
+
+    Windows の ``CreateProcess`` は PATH より先に System32 を探すため、素朴に
+    ``Popen`` へ ``["bash", ...]`` を渡すと、呼び出し元のシェルで通る ``bash`` とは
+    別の実体（WSL のランチャ等）に化けることがある（issue #23）。ここで解決した
+    実体は ``executable=`` にだけ渡し、``argv`` 自体は書き換えない――``argv[0]``
+    が保たれるので、``$0`` を見るプログラム（busybox 等）を壊さない。
+
+    解決に使う PATH は呼び出し側の ``os.environ`` ではなく**実際に子へ渡す環境**
+    （``child_environment()`` の結果）でなければならない。ズレると「解決した
+    実体と、子が見る PATH」が食い違う。POSIX では ``Popen`` 自身が同じ環境の
+    PATH で ``argv[0]`` を引くため、ここでの解決は実質的な変化を生まない。
+
+    コマンドの種類は見ない。``bash`` を特別扱いしない――**どんな名前でも同じ処理**。
+
+    Returns
+    -------
+    str | None
+        解決できた実体の絶対パス。次のいずれかでは解決せず ``None``（呼び出し側は
+        ``executable=None`` のまま、従来どおり ``argv`` だけで起動する）。
+
+        - ``argv`` が空、または ``argv[0]`` が空文字
+        - ``argv[0]`` が絶対パス、または区切り文字（``/`` や ``\\``）を含む
+          （利用者が実体を指定している。**明示は暗黙に勝つ**）
+        - ``shutil.which`` が見つけられない（**ここで止めない**。OS の答え
+          ―― ``exit=127`` 等 ―― に委ねる。fail-open）
+    """
+    if not argv or not argv[0]:
+        return None
+    name = argv[0]
+    if os.path.isabs(name) or "/" in name or "\\" in name:
+        return None
+    try:
+        return shutil.which(name, path=env.get("PATH"))
+    except Exception:  # noqa: BLE001 - 解決の失敗でジョブを止めない（fail-open）
+        return None
+
+
+def _actual_executable_path(pid: int) -> str | None:
+    """起動した子プロセスの実体の絶対パスを OS に訊く。
+
+    ``_resolve_launch_target`` で解決した値をそのままログに載せるのではなく、
+    **実際に起動できた実体**を OS に確かめて残す。解決を合わせたことが本当に
+    効いているかを、ログだけで確かめられるようにする（issue #23）。
+
+    Windows は ``QueryFullProcessImageNameW``、Linux は ``/proc/<pid>/exe`` を使う。
+    それ以外（macOS 等）では取りにいかない。**取得できない・対応していない環境でも
+    静かに ``None`` を返す**――ログの装飾のために起動処理やジョブを止めない
+    （fail-open）。
+    """
+    try:
+        if sys.platform == "win32":
+            return _actual_executable_path_windows(pid)
+        if sys.platform.startswith("linux"):
+            return os.readlink(f"/proc/{pid}/exe")
+    except Exception:  # noqa: BLE001 - ログの装飾のために起動処理を止めない
+        return None
+    return None
+
+
+def _actual_executable_path_windows(pid: int) -> str | None:
+    """Windows で ``QueryFullProcessImageNameW`` により実体の絶対パスを取る。
+
+    ``PROCESS_QUERY_LIMITED_INFORMATION``（``0x1000``）だけを要求する。フル
+    アクセスを要求すると、他ユーザーのプロセスや保護されたプロセスで
+    ``OpenProcess`` そのものが失敗しやすくなる――ここで欲しいのはパスだけである。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return None
+    try:
+        buf = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buf))
+        ok = kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
+        if not ok:
+            return None
+        return buf.value
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _log_actual_executable(stream: IO[bytes], pid: int) -> None:
+    """起動できた実体の絶対パスをログの見出しへ 1 行足す。
+
+    取得できなければ何もしない。**取得・書き込みのどちらで失敗しても
+    ジョブを止めない**（fail-open）。``_actual_executable_path`` 自身は内部で
+    例外を畳んでいるが、ここでも広く受けておく――``ctypes`` の呼び出しが
+    テストや未知の環境で予期しない例外を投げても、ログの装飾のために
+    起動済みの子プロセスを待たずに終わることは絶対に避ける。
+    """
+    try:
+        path = _actual_executable_path(pid)
+        if not path:
+            return
+        stream.write(f"    実体: {path}\n".encode("utf-8", errors="replace"))
+        stream.flush()
+    except Exception:  # noqa: BLE001 - ログの装飾のために起動処理を止めない
+        pass
+
+
 def default_spawn(argv: list[str], log_path: Path, env: Mapping[str, str]) -> int:
     """子プロセスを起動し、stdout/stderr をログへ落として終了を待つ。
 
@@ -328,13 +435,17 @@ def default_spawn(argv: list[str], log_path: Path, env: Mapping[str, str]) -> in
         # POSIX では新しいプロセスグループにして、中断時に子孫までシグナルを届かせる。
         # Windows は taskkill /T で木ごと落とすのでここでは何もしない。
         extra: dict[str, object] = {} if sys.platform == "win32" else {"start_new_session": True}
+        # argv[0] を呼び出し元の PATH（子へ渡す env のもの）で解決し、executable=
+        # にだけ渡す。argv は書き換えない（詳細は _resolve_launch_target）。
         process = subprocess.Popen(
             argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             env=dict(env),
+            executable=_resolve_launch_target(argv, env),
             **extra,  # type: ignore[arg-type]
         )
+        _log_actual_executable(stream, process.pid)
         pump = threading.Thread(
             target=_pump, args=(process.stdout, stream, MAX_LOG_BYTES), daemon=True
         )
@@ -369,7 +480,9 @@ def _spawn_without_log(argv: list[str], env: Mapping[str, str]) -> int:
     そのぶんが黙って消える。
     """
     extra: dict[str, object] = {} if sys.platform == "win32" else {"start_new_session": True}
-    process = subprocess.Popen(argv, env=dict(env), **extra)  # type: ignore[arg-type]
+    process = subprocess.Popen(  # type: ignore[arg-type]
+        argv, env=dict(env), executable=_resolve_launch_target(argv, env), **extra
+    )
     try:
         with _terminating_signals_raise():
             code = process.wait()
