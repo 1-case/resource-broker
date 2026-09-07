@@ -262,10 +262,11 @@ the hook's own work is lost in the noise. Every Bash call costs that.
 If you run one session at a time, you pay and get nothing. It pays off only when several
 sessions share one machine's resources and a collision costs you hours of rework.
 
-## Why it still matters once agents can talk to each other
+## Why it still matters now that agents can talk to each other
 
-If Claude Code sessions could message each other directly, would this board become obsolete?
-**I don't think so.**
+Claude Code sessions **can** message each other directly today (`ListAgents` and
+`SendMessage`; v2.1.224+ on macOS and Linux, v2.1.234+ on native Windows). So does this
+board become obsolete? **It did not.**
 
 - **Communication needs something to talk *about*.** Knowing who currently holds the GPU
   requires shared state somewhere. The board is that state; messages flow on top of it.
@@ -275,9 +276,40 @@ If Claude Code sessions could message each other directly, would this board beco
   without anyone asking. A conversation only exists for the two parties who had it.
 - **Humans can read it.** `rb status` is for people too.
 
-What changes when messaging arrives is how you *wait*: instead of `rb wait` polling for the
-holder set to shrink, you identify the holder from the board and ask them directly.
-**The board isn't replaced — it becomes what supplies the reason to reach out.**
+### It actually happened (2026-09-07)
+
+One GPU, shared between a session running a training job and a session that wanted to run
+inference. The order of events:
+
+1. The trainer declared the GPU, with the handover note "one at a time, no parallel runs"
+2. The other session **got the trainer's log path from the board**, read its progress, and
+   checked the GPU itself (8% utilization, 7.5GB free)
+3. Only then did it **send a direct message**, quoting the note and asking what it meant —
+   no parallel *seeds*, or no other processes at all?
+4. The trainer re-measured its own job (15% GPU), **rewrote** the note to "inference
+   alongside is welcome", and corrected its ETA from 90 minutes to 10 hours
+5. The other session declared alongside it with `--share`
+
+**The board supplied what was needed to ask a good question, the message carried the
+negotiation, and the board recorded the outcome.**
+
+### A conversation only exists for the two who had it (same night)
+
+The trainer had passed on a warning — "this GPU crashed and forced a reboot earlier today" —
+**only in the direct message.** It was not on the board. **A third session could not see it.**
+
+Once that was pointed out, the other session put it on the board — together with a separate
+failure it had found (a corrupted cache database on a shared drive), declaring **the failure
+itself as a resource**. This tool never asks what a resource is, so "a broken shared drive"
+posts exactly like "a GPU in use". The declaration carried an honest `未定` (undetermined)
+ETA with the reason, the warning about the GPU in its handover note, and the log evidence
+in its observation field.
+
+**A warning that lived in a private message became everyone's only once it reached the board.**
+
+What messaging changes is how you *wait*: instead of `rb wait` polling for the holder set to
+shrink, you identify the holder from the board and ask them directly.
+**The board isn't replaced — it became what supplies the reason to reach out.**
 
 ## Design notes
 
