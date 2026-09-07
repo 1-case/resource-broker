@@ -8,8 +8,8 @@
     {
       "name": "resource-broker",
       "source": "./",
-      "description": "Japanese-language tool. A bulletin board that keeps concurrent Claude Code sessions on one machine from fighting over finite resources: declare before you use, stay visible to everyone else. It never blocks a command, never inspects a resource, and never interprets a declaration. ／ 同じマシンで動く複数の Claude Code セッションが有限資源を取り合わないための掲示板。 The CLI output, hook notices and design docs are in Japanese; hooks can be silenced with RESOURCE_BROKER_DISABLE.",
-      "version": "0.4.0",
+      "description": "A bulletin board that keeps concurrent Claude Code sessions on one machine from fighting over finite resources: declare before you use, stay visible to everyone else. It never blocks a command, never inspects a resource, and never interprets a declaration. ／ 同じマシンで動く複数の Claude Code セッションが有限資源を取り合わないための掲示板。使う前に申告させ、他のセッションから見えるようにする。 CLI output and hook notices are bilingual (English/Japanese, auto-selected); the design doc stays Japanese-only. Hooks can be silenced with RESOURCE_BROKER_DISABLE.",
+      "version": "0.4.1",
       "author": {
         "name": "satorunnlg"
       },
@@ -24,5 +24,5 @@
       ]
     }
   ],
-  "description": "resource-broker 単体のマーケットプレイス。同じマシンで動く複数の Claude Code セッションが有限資源を取り合わないための掲示板を配る。"
+  "description": "resource-broker 単体のマーケットプレイス。同じマシンで動く複数の Claude Code セッションが有限資源を取り合わないための掲示板を配る。 ／ A single-plugin marketplace distributing resource-broker, a bulletin board that keeps concurrent Claude Code sessions on one machine from fighting over finite resources."
 }
