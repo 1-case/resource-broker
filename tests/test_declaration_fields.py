@@ -71,7 +71,7 @@ def test_duration_is_converted_by_the_machine(
     """期間表記は機械が絶対時刻に直す。
 
     「30 分後は何時か」を LLM に書かせない。JST と UTC の取り違えや単純な足し算の
-    誤りが実際に起きている（CLAUDE.md「Time Handling」）。
+    誤りが実際に起きている。
     """
     before = clock.now()
     claim(tmp_path, eta="1h30m")
@@ -639,7 +639,7 @@ def test_refusal_does_not_interpret_the_sharing_flag(
     """相乗り不可でも案内は同じ形で出す。**旗の中身で分岐しない。**
 
     可否は当事者が決めるものであり、本ツールは旗を運ぶだけである
-    （CLAUDE.md「Resource Agnosticism」）。中身を読んで案内を出し分けると、
+    （DESIGN.md「Sharing」）。中身を読んで案内を出し分けると、
     そこから「ツールが可否を判断する」への距離が一気に縮む。
     """
     hold(tmp_path, sharing="不可（VRAM を使い切る）")
@@ -656,7 +656,7 @@ def test_refusal_is_recorded_in_the_audit_log(tmp_path: Path) -> None:
     """はじいたことを監査ログに残す。
 
     残さないと「誰がいつ諦めたか」を後から追えない。判定したのに黙るのは、
-    監視が死んだのと区別が付かない（CLAUDE.md「Silence Is Not Success」）。
+    監視が死んだのと区別が付かない（DESIGN.md「Waiting」）。
     """
     hold(tmp_path, sharing="可")
 
@@ -695,7 +695,7 @@ def test_refusal_without_a_sharing_flag_still_points_somewhere(
 def test_a_declared_timestamp_cannot_override_the_machine_one() -> None:
     """申告に ``at`` を書いても、掲示板に載るのは**機械が刻んだ時刻**である。
 
-    「時刻はすべて機械生成」（DESIGN.md「Time Handling」）は、dict を組み立てる
+    「時刻はすべて機械生成」（DESIGN.md「Design Principles」）は、dict を組み立てる
     引数の順序 1 つで破れる。LLM が書いた時刻がそのまま載る経路を塞ぐ。
     """
     entry = build_entry(

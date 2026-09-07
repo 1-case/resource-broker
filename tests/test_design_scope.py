@@ -78,7 +78,13 @@ DESIGN = ROOT / "docs" / "DESIGN.md"
 #: `src/resource_broker/messages.py`（1 つの表に集約した文言と、フックから見えない
 #: 4 つ目の言語判定の写し）と `bin/rb` の起動前メッセージが英語固定である理由を
 #: 1 段落足したためである。今後も真であり続ける仕様であって経緯ではない。
-MAX_LINES = 699
+#:
+#: 700 へ上げたのは、issue #30 指摘 1（ロックの奪取・解放を捕獲型に寄せたら
+#: 固定名の即時再利用が仇になり、取り違え復元で生きたロックを壊しうる形へ
+#: 悪化した）の修正で、確認してから `unlink` する元の形へ戻した理由と、残る
+#: 確認・削除間の窓を Known Residuals に 1 行足したためである。今後も真であり
+#: 続ける仕様であって経緯ではない。
+MAX_LINES = 700
 
 #: 公開しない文書。**公開物からここへリンクすると参照切れになる。**
 #:
@@ -95,12 +101,37 @@ PRIVATE_DOCS = (
 
 #: 公開しているソース。ここから非公開文書を参照すると、読者は永遠に出典を辿れない
 #: （issue #10）。``docs/DESIGN.md`` だけを見ていたのが元の穴で、実際に破っていたのは
-#: この 2 ディレクトリだった。
+#: この 2 ディレクトリだった。**``bin/`` と ``tests/`` も対象に含める**——番人自身が
+#: 見る範囲を ``src/`` / ``hooks/`` の Python だけに絞っていたため、そこに残った
+#: 参照を見逃していた（issue #30 指摘 10）。``tests/test_design_scope.py`` 自身は
+#: 除く——``CLAUDE.md`` を検出対象の文字列として持つのは参照ではなく実装である。
 PUBLIC_SOURCE_FILES = sorted(
     str(path.relative_to(ROOT)).replace("\\", "/")
-    for folder in ("src", "hooks")
+    for folder in ("src", "hooks", "tests")
     for path in (ROOT / folder).rglob("*.py")
-    if "__pycache__" not in path.parts
+    if "__pycache__" not in path.parts and path.name != "test_design_scope.py"
+) + sorted(
+    str(path.relative_to(ROOT)).replace("\\", "/")
+    # **``glob`` ではなく ``rglob``。** ``bin/`` に将来サブディレクトリができても
+    # 走査から漏れない（issue #30 指摘 6）。
+    for path in (ROOT / "bin").rglob("*")
+    if path.is_file()
+)
+
+#: **対象集合そのものの番人。** ``PUBLIC_SOURCE_FILES`` を作る走査対象
+#: （``src`` / ``hooks`` / ``tests`` / ``bin``）を将来のタプルから 1 つでも
+#: 落とすと、対象パラメータが静かに消えるだけで
+#: ``test_public_source_does_not_point_at_unpublished_files`` を含む
+#: パラメータ化テストの全件が「対象が無いので通った」ことになり、走査対象が
+#: 減ったこと自体には誰も気づけない（issue #30 指摘 6）。各フォルダの代表パスが
+#: 必ず集合に含まれることを固定し、フォルダごと対象から落ちたら**ここが先に**
+#: 落ちるようにする。
+REPRESENTATIVE_PUBLIC_SOURCE_FILES = (
+    "bin/rb",
+    "bin/rb-hook",
+    "tests/test_cli.py",
+    "src/resource_broker/cli.py",
+    "hooks/sessionstart_notice.py",
 )
 
 #: ``DESIGN.md「見出し」`` 形式の引用。見出し名の途中で行が折り返されることがある
@@ -139,16 +170,36 @@ def test_design_does_not_point_at_unpublished_files(name: str) -> None:
 
 @pytest.mark.parametrize("name", PUBLIC_SOURCE_FILES)
 def test_public_source_does_not_point_at_unpublished_files(name: str) -> None:
-    """公開しているソース（``src/`` / ``hooks/``）が非公開の文書を参照していない。
+    """公開しているソース（``src/`` / ``hooks/`` / ``bin/`` / ``tests/``）が
+    非公開の文書を参照していない。
 
     上の検査が ``docs/DESIGN.md`` しか見ていなかった穴を塞ぐ。**公開物からここへ
     リンクすると参照切れになる**という原則は同じで、見る場所を広げただけである
-    （issue #10：``CLAUDE.md`` への参照が 12 ファイル・29 箇所に散っていた）。
+    （issue #10：``CLAUDE.md`` への参照が 12 ファイル・29 箇所に散っていた。
+    issue #30 指摘 10：``bin/`` と ``tests/`` がその後も対象外のままだった）。
     """
     text = (ROOT / name).read_text(encoding="utf-8")
 
     offenders = [doc for doc in PRIVATE_DOCS if doc in text]
     assert not offenders, f"{name} が非公開文書を参照している: {offenders}"
+
+
+@pytest.mark.parametrize("name", REPRESENTATIVE_PUBLIC_SOURCE_FILES)
+def test_public_source_files_includes_every_target_folder(name: str) -> None:
+    """``PUBLIC_SOURCE_FILES`` の走査対象フォルダを、将来のタプルから落とせなくする。
+
+    ``PUBLIC_SOURCE_FILES`` を作る走査対象フォルダのタプルや、その後の
+    ``bin`` 走査から 1 つでも列挙を外すと、対象パラメータが静かに
+    消えるだけで ``test_public_source_does_not_point_at_unpublished_files`` を
+    含むパラメータ化テストは「対象が無いので全部通った」ことになり、走査対象が
+    減ったこと自体に誰も気づけない——実際に issue #30 指摘 10 で ``bin/`` と
+    ``tests/`` が対象外のまま気づかれずに残っていた。各フォルダの代表パスが
+    必ず ``PUBLIC_SOURCE_FILES`` に含まれることをここで固定し、フォルダごと
+    対象から落ちたら**このテストが先に**落ちるようにする。
+    """
+    assert name in PUBLIC_SOURCE_FILES, (
+        f"{name} が PUBLIC_SOURCE_FILES に無い（走査対象フォルダが減っている）"
+    )
 
 
 def test_design_md_quotations_in_source_resolve() -> None:

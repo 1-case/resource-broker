@@ -938,9 +938,19 @@ def test_release_force_returns_exit_broken_when_some_removals_fail(
 ) -> None:
     """``--force`` の削除が一部 I/O で失敗したら、``EXIT_OK`` ではなく ``EXIT_BROKEN``。
 
-    以前は警告を出すだけで終了コードは ``EXIT_OK`` のままだった。
-    ``release --force && 次の手順`` のように使われれば、消えていない宣言が
-    残ったまま次へ進む——**終了コードで嘘をつかない**（cli.py 冒頭）。
+    以前は警告を出すだけで終了コードは ``EXIT_OK`` のままだった——**終了コードで
+    嘘をつかない**（cli.py 冒頭）。
+
+    値は ``EXIT_BROKEN``（3）であって ``EXIT_BUSY``（1）ではない。``os.rename``
+    の I/O 失敗は「資源が使用中と確認できた」結果ではなく、本ツール内部の故障
+    である——``claim`` の保存失敗・``update`` の置換失敗と同じ扱いに揃えた
+    （issue #30 指摘 3）。指定方法（資源名か個体か）で同じ「消せなかった」が
+    別の終了コードに分かれていた点（issue #30 指摘 5）も、``_exit_for_own_removal``
+    と ``_exit_for_forced_removal`` の両方を同じ分類にすることで揃っている。
+    「消せなかった」（``failed``）と「確認そのものができなかった」
+    （``unconfirmed``）はどちらも本ツール内部の事情なので同じ ``EXIT_BROKEN``
+    になり、掲示板を完全に読めた上で競合を確認できた「入れ替わった」
+    （``swapped`` → ``EXIT_BUSY``）とだけ区別する。
     """
     assert claim(tmp_path, "GPU0", "1 本目") == EXIT_OK
     assert claim(tmp_path, "GPU0", "2 本目", "--share") == EXIT_OK
@@ -974,6 +984,7 @@ def test_release_force_returns_exit_broken_when_some_removals_fail(
 
     assert code == EXIT_BROKEN
     assert code != EXIT_OK
+    assert code != EXIT_BUSY
     # **消せた分は本当に消えている。** 全滅させたのではなく、部分失敗であることを確かめる。
     assert len(Board(tmp_path).list_for(RESOURCE)) == 1
 
@@ -1101,9 +1112,10 @@ def test_an_internal_error_during_release_is_not_reported_as_success(
     """``release`` の内部エラーは ``EXIT_OK`` ではなく ``EXIT_BROKEN``。
 
     ``release`` は破壊的操作である。catch-all が 0 を返すと、宣言を 1 件も
-    消せていないのに「解放した」と読まれる——フックと非破壊コマンド
-    （status / claim / update / history）の catch-all は引き続き 0 のままで
-    よいが、``release`` は違う（issue #17 指摘 5）。
+    消せていないのに「解放した」と読まれる——フックと非破壊の**読み取り**
+    コマンド（status / history）の catch-all は引き続き 0 のままでよいが、
+    掲示板を書き換える ``release``（issue #17 指摘 5）と ``claim`` / ``update``
+    （issue #30 指摘 2）は違う。
     """
     assert claim(tmp_path, "GPU0", "対象") == EXIT_OK
 
@@ -1113,6 +1125,32 @@ def test_an_internal_error_during_release_is_not_reported_as_success(
     monkeypatch.setattr(cli, "_release_own", explode)
 
     assert run(tmp_path, "release", "GPU0") == EXIT_BROKEN
+
+
+@pytest.mark.parametrize("command", ["claim", "update"])
+def test_an_internal_error_during_claim_or_update_is_not_reported_as_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    """``claim`` / ``update`` の内部エラーも最外周から ``EXIT_BROKEN``。
+
+    従来はここで両コマンドとも ``EXIT_OK``（0）を返しており、宣言・更新前に
+    予期しない例外が飛んでも「操作は成功した」と読まれていた（issue #30 指摘 2）。
+    個別の既知失敗は既に ``_cmd_claim`` / ``_cmd_update`` の内部で ``EXIT_BROKEN``
+    を返しているが、ここで固定したいのは**その手前**——``main()`` の最外周
+    catch-all そのものの分岐である。したがって ``args.func`` として呼ばれる
+    ``_cmd_claim`` / ``_cmd_update`` 自体を丸ごと例外化し、catch-all に確実に
+    落とす。
+    """
+
+    def explode(_args: object) -> int:
+        raise RuntimeError(f"{command} の内部が壊れた")
+
+    monkeypatch.setattr(cli, f"_cmd_{command}", explode)
+
+    if command == "claim":
+        assert claim(tmp_path, "GPU0", "対象") == EXIT_BROKEN
+    else:
+        assert run(tmp_path, "update", "GPU0", "--job", "対象") == EXIT_BROKEN
 
 
 def test_release_exit_codes_match_the_command_by_outcome_table() -> None:
@@ -1158,3 +1196,56 @@ def test_release_exit_codes_match_the_command_by_outcome_table() -> None:
         tmp_path = Path(tmp)
         whole_board_unreadable(tmp_path)
         assert run(tmp_path, "release", "--clean") == EXIT_BROKEN
+
+
+def test_an_io_failure_while_removing_is_exit_broken_on_every_release_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**削除そのものの I/O 失敗**は、指定方法を問わずすべて ``EXIT_BROKEN``。
+
+    ``RemovalResult.FAILED``（``os.rename`` によるファイルの捕獲が共有違反等で
+    失敗し続けた）は「資源が使用中と確認できた」結果ではなく、本ツール内部の
+    故障である。以前はこれを一律 ``EXIT_BUSY`` へ寄せており、``claim`` の保存
+    失敗・``update`` の置換失敗を ``EXIT_BROKEN`` にしたのと意味が食い違って
+    いた（issue #30 指摘 3）。資源名 / ``--all`` / ``--force`` / ``--nonce`` /
+    ``--nonce --force`` の全経路に同じ I/O 失敗を注入し、すべてが ``EXIT_BROKEN``
+    になることを表形式で固定する。
+    """
+    import tempfile
+
+    original_rename = os.rename
+
+    def always_fail_to_capture(source: object, target: object, *args: object) -> None:
+        # ロックの取得・解放は巻き込まない（``.lock`` はそのまま本物の rename を
+        # 使わせる）——ここで壊したいのは**宣言ファイルの捕獲**だけである。
+        if str(source).endswith(".lock") or str(target).endswith(".lock"):
+            original_rename(source, target, *args)
+            return
+        raise PermissionError("共有違反（注入）")
+
+    scenarios: list[list[str]] = [
+        ["release", "GPU0"],
+        ["release", "GPU0", "--all"],
+        ["release", "GPU0", "--force"],
+        ["release", "--nonce", "PLACEHOLDER"],
+        ["release", "--nonce", "PLACEHOLDER", "--force"],
+    ]
+
+    results: list[tuple[list[str], int]] = []
+    for args in scenarios:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            assert claim(tmp_path, "GPU0", "対象") == EXIT_OK
+            nonce = Board(tmp_path).list_for(RESOURCE)[0].nonce
+            resolved = [nonce[:8] if a == "PLACEHOLDER" else a for a in args]
+
+            monkeypatch.setattr(os, "rename", always_fail_to_capture)
+            monkeypatch.setattr("resource_broker.board.UNLINK_DELAY_S", 0.0)
+            try:
+                code = run(tmp_path, *resolved)
+            finally:
+                monkeypatch.setattr(os, "rename", original_rename)
+            results.append((resolved, code))
+
+    for args, code in results:
+        assert code == EXIT_BROKEN, f"{args} は I/O 失敗を {code} で通した（3 を期待）"

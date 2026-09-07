@@ -343,6 +343,12 @@ def json_files(directory: Path) -> tuple[list[Path], bool]:
             # 宣言が「そもそも無かった」と同じ形になる。
             if entry.is_symlink():
                 unreadable = True
+                continue
+            # ``*.json`` という名前なのに通常ファイルでもリンクでもないノード
+            # （ディレクトリ・FIFO・デバイスファイル等）。以前は黙って読み飛ばして
+            # いた——``board.py`` の ``_json_files`` と同じ基準に揃える
+            # （issue #30 指摘 3。issue #18 指摘 9 と同種の穴）。
+            unreadable = True
     except FileNotFoundError:
         return [], False  # まだ誰も宣言していない。これは「空」であって「読めない」ではない
     except OSError:
@@ -445,12 +451,26 @@ def read_entries(root: Path) -> list[dict[str, object]]:
         except OSError:
             unreadable = True  # 読めないのは「壊れている」とは別の事実
             continue
+        except (UnicodeDecodeError, ValueError):
+            # 不正な UTF-8。I/O の失敗ではなく中身が壊れているが、どちらにせよ
+            # 完全には読めていない——``board.py`` と同じ基準に揃える
+            # （issue #30 指摘 3）。
+            unreadable = True
+            continue
         try:
             data = json.loads(text)
         except (json.JSONDecodeError, ValueError):
+            # 以前はここで数えず黙って飛ばしていた。壊れているファイルに、
+            # 探している宣言が無いとは証明できない（``board.py`` と揃える）。
+            unreadable = True
             continue
-        if isinstance(data, dict) and data.get("resource"):
-            collected.append(data)
+        resource = data.get("resource") if isinstance(data, dict) else None
+        if not isinstance(resource, str) or not resource:
+            # 必須フィールド（``resource``）が読めない。``board.py`` の
+            # ``Entry.from_dict`` が ``None`` を返す条件と同じ扱いにする。
+            unreadable = True
+            continue
+        collected.append(data)
 
     collected.sort(key=lambda item: str(item.get("since") or ""))
 

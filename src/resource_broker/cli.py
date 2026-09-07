@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from collections.abc import Sequence
@@ -84,7 +85,12 @@ _REMOVAL_EXIT: dict[RemovalResult, int] = {
     RemovalResult.REMOVED: EXIT_OK,
     RemovalResult.ABSENT: EXIT_OK,
     RemovalResult.NOT_OWNED: EXIT_BUSY,
-    RemovalResult.FAILED: EXIT_BUSY,
+    # **FAILED は「資源が使用中と確認できた」結果ではない。** os.rename 等の
+    # I/O が失敗しただけの、本ツール内部の故障である。`claim` の保存失敗・
+    # `update` の置換失敗と同じ性質なので、それらと同じ EXIT_BROKEN に寄せる
+    # ——以前は EXIT_BUSY に畳んでおり、同種の I/O 失敗が `release` だけ
+    # 「使用中」を意味することになっていた（issue #30 指摘 3）。
+    RemovalResult.FAILED: EXIT_BROKEN,
     RemovalResult.UNCONFIRMED: EXIT_BROKEN,
 }
 
@@ -97,14 +103,23 @@ def _exit_for_removal(result: RemovalResult) -> int:
 def _exit_for_own_removal(result: OwnRemoval) -> int:
     """:class:`OwnRemoval`（自分の宣言だけを対象にした削除）を終了コードへ写す。
 
-    優先順位は「確認できなかった」＞「入れ替わった／消せなかった」＞「消せた」
+    優先順位は「確認できなかった／内部の故障」＞「入れ替わった」＞「消せた」
     ＞「そもそも対象が無かった」＞「他人のものしか無かった」——1 件でも異常が
     あれば、たとえ他の 1 件が消せていても素直な成功としては返さない
     （呼び出し側が次の手順へ黙って進まないようにするため）。
+
+    **``unconfirmed`` と ``failed`` を同じ側（``EXIT_BROKEN``）にする。**
+    どちらも「資源が使用中と確認できた」結果ではなく、掲示板を書き換える
+    I/O 自体が失敗した／完了を確認できなかったという**本ツール内部の事情**
+    である。``claim`` の保存失敗・``update`` の置換失敗と同じ性質なので、
+    それらと同じ終了コードに揃える（issue #30 指摘 3）。**``swapped``（読んで
+    から消すまでに他セッションが取り直していた）だけが「使用中と確認できた」
+    ``EXIT_BUSY`` に値する**——掲示板は完全に読めており、消せなかったのは
+    競合相手がいたからである。
     """
-    if result.unconfirmed:
+    if result.unconfirmed or result.failed:
         return EXIT_BROKEN
-    if result.swapped or result.failed:
+    if result.swapped:
         return EXIT_BUSY
     if result.removed:
         return EXIT_OK
@@ -116,12 +131,21 @@ def _exit_for_own_removal(result: OwnRemoval) -> int:
 def _exit_for_forced_removal(result: ForcedRemoval) -> int:
     """:class:`ForcedRemoval`（``--force``）を終了コードへ写す。
 
-    優先順位は :func:`_exit_for_own_removal` と同じ考え方——1 件でも
-    「確認できなかった」「入れ替わった」「消せなかった」があれば、
-    他が消せていても素直な成功（``EXIT_OK``）としては返さない。
+    優先順位・値ともに :func:`_exit_for_own_removal` と**完全に同じ**にする。
+    以前はここだけ「入れ替わった」「消せなかった」も ``EXIT_BROKEN`` に畳んで
+    いた——資源名で指定した既定の解放（``_exit_for_own_removal``）では同じ
+    事象が ``EXIT_BUSY`` になるため、**同じ失敗が指定方法（資源名か個体か）
+    だけで違う終了コードに分裂していた**（issue #30 指摘 5）。「入れ替わった」
+    は掲示板を完全に読めた上で確認できている事象（``EXIT_BUSY``）だが、
+    「消せなかった」（``failed``。I/O の故障）は「確認そのものができなかった」
+    （``unconfirmed``）と同じ**本ツール内部の故障**であり、資源の競合とは
+    意味が違う（issue #30 指摘 3）。``_exit_for_own_removal`` と同じ分け方に
+    揃えることで、``--force`` の有無で同じ失敗の終了コードが分裂しない。
     """
-    if result.unconfirmed or result.swapped or result.failed:
+    if result.unconfirmed or result.failed:
         return EXIT_BROKEN
+    if result.swapped:
+        return EXIT_BUSY
     return EXIT_OK
 
 
@@ -221,22 +245,6 @@ def assess_detailed(
     return judged, listing
 
 
-def assess(
-    board: Board, resource_id: str, observation: Observation | None = None
-) -> list[tuple[Verdict, Entry]]:
-    """その資源の宣言を**1 件ずつ**判定する。古い順に返す。**完全性は捨てる**（表示用）。
-
-    **どれが先に取ったかで扱いを変えない。** 宣言は対等であり、生きているか幽霊かは
-    それぞれの ``since`` / ``boot`` / PID で決まる。役割を持たせていた頃は、
-    片方（主宣言）が消えるともう片方（相乗り）の意味が変わってしまい、走っている
-    作業がいるのに「空き」と答える経路になっていた。
-
-    破壊的な判断には :func:`assess_detailed` を使うこと。
-    """
-    judged, _ = assess_detailed(board, resource_id, observation)
-    return [(verdict, entry) for verdict, _, entry in judged]
-
-
 def live_declarations_detailed(
     board: Board, resource_id: str, observation: Observation | None = None
 ) -> tuple[list[Entry], BoardListing]:
@@ -253,26 +261,52 @@ def live_declarations(
     return entries
 
 
-def _known_resources(board: Board) -> list[str]:
-    """掲示板に載っている資源を列挙する。"""
-    return _known_resources_detailed(board)[0]
+def _status_snapshot(
+    board: Board,
+) -> tuple[list[str], dict[str, list[tuple[Verdict, Entry]]], bool]:
+    """``rb status`` 専用の、**掲示板を 1 度だけ読む**列挙と判定。
 
-
-def _known_resources_detailed(board: Board) -> tuple[list[str], bool]:
-    """掲示板に載っている資源と、**読めなかったものがあったか**を返す。
-
-    読めなかったことを畳まない。畳むと「掲示板は空です」と断定してしまい、
-    **実際には使われている資源を空きとして配る**（DESIGN.md「Ghost Detection」の
-    非対称性の裏返しであり、断定してよい側ではない）。
+    以前は資源の一覧を ``list_all_detailed()`` で作ったあと、資源ごとに
+    ``assess()``（内部で ``pairs_for_detailed`` が掲示板を丸ごと再列挙する）を
+    呼んで判定していた。**その 2 度目の列挙の完全性を捨てていた**——1 度目が
+    完全でも 2 度目が部分的にしか読めなければ、``partial: false`` のまま
+    ``occupied: false`` ／「宣言が無い」を返してしまう。``SessionStart`` は
+    この ``partial`` を信じるため、通常の運用経路で「空です」の誤報が
+    再現していた（issue #30 指摘 4）。掲示板を読むのは 1 回だけにし、その
+    同じスナップショットから資源のグループ化と生存判定の両方を作ることで、
+    「2 度目の完全性を集約し忘れる」という形のコード自体を無くす。
     """
     listing = board.list_all_detailed()
-    resources: list[str] = []
-    seen: set[str] = set()
-    for entry in listing.entries:
-        if entry.resource not in seen:
-            seen.add(entry.resource)
-            resources.append(entry.resource)
-    return resources, not listing.complete
+    now = clock.now()
+    boot = platform_info.boot_time()
+
+    order: list[str] = []
+    grouped: dict[str, list[tuple[Verdict, Path, Entry]]] = {}
+    for path, entry in listing.pairs:
+        verdict = liveness.judge(
+            has_entry=True,
+            since=entry.since_dt,
+            boot=boot,
+            observation=Observation(),
+            pid_alive=platform_info.pid_alive(entry.pid),
+            now=now,
+        )
+        if entry.resource not in grouped:
+            grouped[entry.resource] = []
+            order.append(entry.resource)
+        grouped[entry.resource].append((verdict, path, entry))
+
+    # **資源ごとに古い順へ並べ直す。** 元の列挙はパス順（``declarations_detailed``
+    # の走査順）であって ``since`` 順ではない——``pairs_for_detailed`` が資源で
+    # 絞ったあとに行っていた並べ替えと同じ基準（``since`` → パス）をここでも使う。
+    judged_by_resource = {
+        resource_id: [
+            (verdict, entry)
+            for verdict, _, entry in sorted(items, key=lambda item: (item[2].since, str(item[1])))
+        ]
+        for resource_id, items in grouped.items()
+    }
+    return order, judged_by_resource, not listing.complete
 
 
 @dataclass(frozen=True)
@@ -339,11 +373,11 @@ def _cmd_status(args: argparse.Namespace) -> int:
     いるのと同じであり、機能ごと消して全件表示だけにする。
     """
     board = Board(args.home)
-    targets, unreadable = _known_resources_detailed(board)
+    targets, judged_by_resource, unreadable = _status_snapshot(board)
 
     rows = []
     for resource_id in targets:
-        judged = assess(board, resource_id)
+        judged = judged_by_resource[resource_id]
         living = [e for verdict, e in judged if not liveness.is_free(verdict)]
         # **「空き」と「誰も使っていない」は同じ問いになった。** 役割が無いので、
         # 生きた宣言が 1 件でもあれば使用中、無ければ空きである。分けていた頃は
@@ -725,8 +759,12 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         return result.code
 
     if not result.declared:
+        # **走らなかった操作を成功と言わない。** 宣言は掲示板に残っていない
+        # ——他セッションからは見えず、`claim` は実質何もしていない。
+        # `release` / `wait` / `--clean` が内部の故障に割り当てている
+        # `EXIT_BROKEN` と同じ扱いに揃える（issue #30 指摘 2）。
         _warn_not_declared()
-        return result.code
+        return EXIT_BROKEN
 
     print(
         tr(
@@ -911,6 +949,11 @@ def _wait_advice() -> str:
     return tr("wait_advice")
 
 
+def _is_positive_finite(value: float) -> bool:
+    """0 より大きい有限の数か。``NaN`` は自分自身とも比較で偽になるのでここで弾ける。"""
+    return math.isfinite(value) and value > 0
+
+
 def _cmd_wait(args: argparse.Namespace) -> int:
     """資源が解放されるまで待つ。
 
@@ -918,6 +961,13 @@ def _cmd_wait(args: argparse.Namespace) -> int:
     過ぎたからといって待機をやめる根拠にはしない。
     打ち切るのは呼び出し側が指定した ``--timeout`` だけである。
     """
+    # **受け取る前に弾く。** 0・負数・NaN・Infinity は「ポーリングし続けて
+    # 一生戻らない」「即座に上限へ達する」といった壊れ方をする。既存の引数不備
+    # （``EXIT_USAGE``）と同じ扱いに揃える（issue #30 指摘 6）。
+    if not _is_positive_finite(args.interval) or not _is_positive_finite(args.timeout):
+        print(tr("wait_invalid_duration"), file=sys.stderr)
+        return EXIT_USAGE
+
     board = Board(args.home)
     resource_id = naming.normalize(args.resource)
 
@@ -1363,10 +1413,12 @@ def _update_locked(board: Board, resource_id: str, args: argparse.Namespace) -> 
     **「宣言が無い」と「確認できない」を混同しない。** 以前は ``list_for``
     （読めなかったものを黙って飛ばす）で数えていたため、不正な UTF-8 など
     掲示板の一部が読めない場合でも「0 件」と断定し ``EXIT_USAGE``（利用者の
-    入力ミス）を返していた。``update`` は fail-open なコマンドなので、
-    読めなかった側に自分の宣言が隠れているかもしれないなら、それは入力ミス
-    ではなく「確認できなかった」であり、作業は止めずに ``EXIT_OK`` で通す
-    （issue #18 指摘 8。今回の UTF-8 修正が作った退行）。
+    入力ミス）を返していた（issue #18 指摘 8）。読めなかった側に自分の宣言が
+    隠れているかもしれないなら、それは入力ミスではなく「確認できなかった」
+    である。**何も更新していない**以上、それを ``EXIT_OK``（成功）で通すのは
+    走らなかった操作を成功と言うことになる——`release` / `wait` / `--clean`
+    が内部の故障に割り当てている ``EXIT_BROKEN`` と同じ扱いに揃える
+    （issue #30 指摘 2）。
     """
     cwd = os.getcwd()
     session_id = platform_info.session_id()
@@ -1382,7 +1434,7 @@ def _update_locked(board: Board, resource_id: str, args: argparse.Namespace) -> 
                 resource=resource_id,
                 reason=tr("reason_board_partially_unreadable"),
             )
-            return EXIT_OK
+            return EXIT_BROKEN
         print(tr("no_declaration_found"), file=sys.stderr)
         return EXIT_USAGE
 
@@ -1444,9 +1496,12 @@ def _update_locked(board: Board, resource_id: str, args: argparse.Namespace) -> 
         return EXIT_BUSY
     if result is UpdateResult.FAILED:
         # 掲示板に書けないのは**インフラの故障**であり、資源の競合ではない。
-        # ここを 1 に倒すと、掲示板が壊れた瞬間に呼び出し側が「使用中」と読む。
+        # ここを 1（EXIT_BUSY）に倒すと、掲示板が壊れた瞬間に呼び出し側が
+        # 「使用中」と読む。かといって、**書き換えは実際には起きていない**
+        # ので EXIT_OK（成功）でもない——`release` / `wait` / `--clean` と
+        # 同じ ``EXIT_BROKEN`` で「完了できなかった」と伝える（issue #30 指摘 2）。
         print(tr("update_failed"), file=sys.stderr)
-        return EXIT_OK
+        return EXIT_BROKEN
 
     print(tr("updated_notice", resource=naming.display_default(entry.resource), job=entry.job))
     return EXIT_OK
@@ -1772,10 +1827,11 @@ def _release_forced(board: Board, resource_id: str) -> int:
     :meth:`Board.remove_selected` へ渡す——資源名だけで何件消えるか決まる
     公開入口はもう存在しない。
 
-    **消せなかった・確認できなかった・入れ替わっていたものがあれば
-    ``EXIT_BROKEN``。** 共有違反などの I/O 失敗で一部が消せなかった場合も、
-    以前は ``EXIT_OK`` を返していた——警告は出すが終了コードは「成功」のままで、
-    ``release --force && 次の手順`` は消えていない宣言を無視して進む。
+    **消せなかった・確認できなかったものがあれば ``EXIT_BROKEN``、入れ替わって
+    いたものがあれば ``EXIT_BUSY``。** 共有違反などの I/O 失敗で一部が消せなかった
+    場合も、以前は ``EXIT_OK`` を返していた——警告は出すが終了コードは「成功」の
+    ままで、``release --force && 次の手順`` は消えていない宣言を無視して進む。
+    分類の詳細は :func:`_exit_for_forced_removal` 参照（issue #30 指摘 3）。
     **終了コードで嘘をつかない**（cli.py 冒頭）。
     """
     listing = board.pairs_for_detailed(resource_id)
@@ -2237,9 +2293,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         if command == "release":
             # **release は破壊的操作である。** ここで 0 を返すと、宣言を 1 件も
             # 消せていないのに「解放した」と読まれる——catch-all も「終了コードで
-            # 嘘をつかない」（cli.py 冒頭）の対象である。フックと非破壊コマンド
-            # （status / claim / update / history）の catch-all は引き続き
-            # fail-open のまま 0 を返す（issue #17 指摘 5）。
+            # 嘘をつかない」（cli.py 冒頭）の対象である。フックと非破壊の読み取り
+            # コマンド（status / history）の catch-all は引き続き fail-open のまま
+            # 0 を返す（issue #17 指摘 5）。
+            return EXIT_BROKEN
+        if command in ("claim", "update"):
+            # **claim / update も書き込みそのものが失敗した扱いにする。** 個別の
+            # 既知失敗（宣言を保存できない・確認できない・置換できない）は
+            # 各 `_cmd_*` の内部で既に EXIT_BROKEN を返しているが、宣言・更新前に
+            # 予期しない例外が飛ぶとここへ落ちてくる。従来はここで 0 を返しており、
+            # 操作が 1 度も走っていないのに成功と読まれていた（issue #30 指摘 2）。
+            # status / history と違い、claim / update は「読むだけ」ではなく
+            # 掲示板を書き換える操作なので、fail-open のまま 0 を返してよい対象では
+            # ない（DESIGN.md「Exit Codes」表）。
             return EXIT_BROKEN
         return EXIT_OK
 

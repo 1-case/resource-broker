@@ -25,11 +25,21 @@ import locale
 import os
 import subprocess
 import sys
+import time
 import unicodedata
 from pathlib import Path
 
-#: ``rb status`` の待ち時間。超えたら黙って諦める。
+#: ``rb status`` 1 回あたりの待ち時間。超えたら黙って諦める。
 TIMEOUT_S = 5.0
+
+#: ``rb status`` の**全候補を合わせた**待ち時間の上限。
+#:
+#: 候補（:func:`rb_candidates`）は最大 3 つあり、単純に ``TIMEOUT_S`` を掛けると
+#: 15 秒——``hooks.json`` の外側の締切（SessionStart は 15 秒）とちょうど同じに
+#: なり、読み取り・整形に使う余裕がゼロになる（issue #30 指摘 7）。ここで
+#: 合計を頭打ちにし、外側の締切より確実に手前で諦める。実測の中央値は 216ms
+#: なので、**通常経路の速さはこの上限に触れない**。
+TOTAL_TIMEOUT_BUDGET_S = 13.0
 
 #: 自由記述フィールドのバイト長上限。
 #:
@@ -432,8 +442,25 @@ def rb_candidates() -> list[list[str]]:
 
 
 def fetch_status() -> list[dict[str, object]] | None:
-    """``rb status --json`` を呼んで資源の一覧を返す。取れなければ None。"""
+    """``rb status --json`` を呼んで資源の一覧を返す。取れなければ None。
+
+    候補を順に試すが、**全体で ``TOTAL_TIMEOUT_BUDGET_S`` を超えたら諦める**
+    ——候補ごとに ``TIMEOUT_S`` をフルに使うと、候補が複数あるとき合計が
+    外側の締切（``hooks.json``）に張り付き、以降の処理に余裕が残らない
+    （issue #30 指摘 7）。
+
+    **``payload["partial"]`` を捨てない。** ``rb status --json`` は「一部読めな
+    かった」をこの旗で返すのに、以前はここで ``resources`` だけを抜き出して
+    捨てていた——生きた宣言を読めなかった状況で「掲示板は空です」と全セッション
+    へ配りかねない、最も危険な向きの誤報だった（issue #30 指摘 3）。
+    :func:`read_entries_directly` が使う ``{"_unreadable": True}`` という同じ
+    印を足すことで、:func:`build_notice` の :func:`is_partial` がそのまま拾う。
+    """
+    deadline = time.monotonic() + TOTAL_TIMEOUT_BUDGET_S
     for command in rb_candidates():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
             completed = subprocess.run(
                 command,
@@ -441,7 +468,7 @@ def fetch_status() -> list[dict[str, object]] | None:
                 text=True,
                 encoding=ENCODING,
                 errors="replace",
-                timeout=TIMEOUT_S,
+                timeout=min(TIMEOUT_S, remaining),
                 check=False,
                 env=child_environment(),
             )
@@ -455,6 +482,8 @@ def fetch_status() -> list[dict[str, object]] | None:
             continue
         resources = payload.get("resources") if isinstance(payload, dict) else None
         if isinstance(resources, list):
+            if isinstance(payload, dict) and payload.get("partial"):
+                resources = [*resources, {"_unreadable": True}]
             return resources
     return None
 
@@ -487,6 +516,14 @@ def read_entries_directly() -> list[dict[str, object]] | None:
         ネットワークパスのいずれも空リストになる）、**「読めない」が「空」と同じ形で
         返ってくる**。``os.scandir`` は ``NotADirectoryError`` / ``PermissionError`` を
         そのまま投げるので、両者を区別できる。
+
+        **異常の数え方は ``board.py`` の :meth:`Board.declarations_detailed` と
+        揃える**（issue #30 指摘 3）。以前はここだけ基準が緩く、不正 JSON・不正
+        UTF-8・必須フィールド（``resource``）の欠落を黙って読み飛ばし、``*.json``
+        という名前のディレクトリ等（通常ファイルでもリンクでもないノード）も
+        異常扱いしていなかった——本体なら ``complete=False`` にする事象が、
+        ここでは「1 件も読めなかった」より軽く扱われ、生きた宣言を見落として
+        いても「空です」と言いかねなかった。
         """
         nonlocal unreadable
         try:
@@ -498,6 +535,12 @@ def read_entries_directly() -> list[dict[str, object]] | None:
                     names.append(entry.name)
                 elif entry.is_symlink():
                     # 壊れたリンク。``is_file()`` は False に畳むので、ここで数える。
+                    unreadable = True
+                else:
+                    # ``*.json`` という名前なのに通常ファイルでもリンクでもない
+                    # ノード（ディレクトリ・FIFO・デバイスファイル等）。以前は
+                    # 黙って読み飛ばしていた——``board.py`` の ``_json_files`` と
+                    # 同じ基準に揃える（issue #18 指摘 9 と同種の穴）。
                     unreadable = True
             names.sort()
         except FileNotFoundError:
@@ -514,12 +557,31 @@ def read_entries_directly() -> list[dict[str, object]] | None:
                 # 起きる。掲示板に 1 資源しか無ければ、これだけで「空です」になる。
                 unreadable = True
                 continue
+            except (UnicodeDecodeError, ValueError):
+                # **不正な UTF-8 は「読めない」ではなく「壊れている」側だが、
+                # どちらにせよ完全には読めていない。** ``board.py`` と同じく
+                # ここも見落とさず数える。
+                unreadable = True
+                continue
             try:
                 data = json.loads(text)
             except (json.JSONDecodeError, ValueError):
-                continue  # 壊れているのは「読めない」とは別の事実。飛ばす
-            if isinstance(data, dict):
-                found.append(data)
+                # 以前は「壊れているのは読めないとは別の事実」として飛ばしていたが、
+                # ``board.py`` はここも ``complete=False`` にする——読めなかった
+                # 側に探している宣言が無いとは証明できない。
+                unreadable = True
+                continue
+            if not isinstance(data, dict):
+                unreadable = True
+                continue
+            resource = data.get("resource")
+            if not isinstance(resource, str) or not resource:
+                # **必須フィールド（``resource``）が読めない。** ``board.py`` の
+                # ``Entry.from_dict`` が ``None`` を返す条件と同じ——この 1 件が
+                # どの資源のものか分からない以上、「完全に読めた」に含めない。
+                unreadable = True
+                continue
+            found.append(data)
         return found
 
     # **``board/joins/`` はもう走査しない。** 旧形式の相乗りを見失わないための

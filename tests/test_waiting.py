@@ -292,7 +292,7 @@ def test_eta_does_not_end_the_wait(tmp_path: Path) -> None:
     """ETA を過ぎても待機をやめない。
 
     掲示板の ETA は申告であって約束ではない。過ぎたからといって「終わったはず」と
-    みなすのは、まさに ETA を判断に使うことである（CLAUDE.md「Time Handling」）。
+    みなすのは、まさに ETA を判断に使うことである（DESIGN.md「Waiting」）。
     """
     board = Board(tmp_path)
     declare(board, eta="1s")
@@ -533,7 +533,7 @@ def test_cmd_wait_returns_exit_broken_for_an_unreadable_board(
 
     _make_board_unreadable(tmp_path)
 
-    code = main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0"])
+    code = main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0.000001"])
 
     assert code == cli.EXIT_BROKEN
     out = capsys.readouterr().out
@@ -588,7 +588,7 @@ def test_wait_tells_the_waiter_how_to_escape(
     hold_gpu(tmp_path)
     capsys.readouterr()
 
-    assert main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0"]) != 0
+    assert main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0.000001"]) != 0
     captured = capsys.readouterr()
     text = captured.out + captured.err
 
@@ -607,7 +607,7 @@ def test_wait_shows_how_long_the_holder_has_held(
     hold_gpu(tmp_path, minutes_ago=200)
     capsys.readouterr()
 
-    assert main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0"]) != 0
+    assert main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0.000001"]) != 0
     captured = capsys.readouterr()
 
     assert "3h20m 経過" in captured.out
@@ -621,7 +621,7 @@ def test_wait_timeout_names_the_holder(tmp_path: Path, capsys: pytest.CaptureFix
     hold_gpu(tmp_path, minutes_ago=200)
     capsys.readouterr()
 
-    assert main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0"]) != 0
+    assert main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0.000001"]) != 0
     err = capsys.readouterr().err
 
     assert "保持者: folnet" in err
@@ -679,7 +679,7 @@ def test_a_broken_wait_is_distinguishable_from_a_timeout(
 
     monkeypatch.undo()
     hold_gpu(tmp_path) if not Board(tmp_path).list_for(RESOURCE) else None
-    timed_out = main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0"])
+    timed_out = main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0.000001"])
 
     assert broken == cli.EXIT_BROKEN
     assert timed_out == cli.EXIT_BUSY
@@ -704,6 +704,34 @@ def test_exit_broken_keeps_its_original_value_after_the_rename() -> None:
         cli.EXIT_USAGE,
         cli.EXIT_INTERRUPTED,
     )
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "-0.5", "nan", "inf", "-inf", "infinity"])
+@pytest.mark.parametrize("flag", ["--interval", "--timeout"])
+def test_wait_rejects_non_positive_or_non_finite_durations(
+    tmp_path: Path, flag: str, bad: str
+) -> None:
+    """``rb wait`` は 0・負数・NaN・Infinity を受け取る前に弾く（issue #30 指摘 6）。
+
+    弾かずに通すと、``0``／負数は「即座に上限へ達する」（実害は小さいが意図しない
+    動作）、``NaN`` は ``elapsed >= timeout_s`` が常に偽になり**待機が終わらなくなる**、
+    ``Infinity`` も同様に上限が機能しなくなる。**エラーの出し方は既存の引数不備
+    （``EXIT_USAGE``）に揃える**——新しい終了コードは作らない。
+    """
+    from resource_broker import cli
+
+    code = main(["--home", str(tmp_path), "wait", "GPU0", flag, bad])
+
+    assert code == cli.EXIT_USAGE
+
+
+def test_wait_accepts_a_small_positive_finite_duration(tmp_path: Path) -> None:
+    """境界値（0 より大きい有限の値）は弾かない。"""
+    from resource_broker import cli
+
+    code = main(["--home", str(tmp_path), "wait", "GPU0", "--timeout", "0.000001"])
+
+    assert code != cli.EXIT_USAGE
 
 
 def test_a_reboot_ghost_does_not_keep_wait_running(

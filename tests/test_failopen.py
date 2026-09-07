@@ -2,7 +2,7 @@
 
 本ツールは他の全セッションの Bash 実行経路に割り込む。壊れたときにユーザーの
 作業を止めないことが最優先の要件であり、「注意する」だけでは守れない
-（CLAUDE.md「Fail-Open」「Testing Constraints」）。
+（DESIGN.md「Design Principles」）。
 
 ここでは「壊れた入力を与えても例外が外に出ず、判断材料なしとして扱われる」ことを
 網羅的に確認する。
@@ -21,7 +21,7 @@ import pytest
 
 from resource_broker import audit, clock, platform_info, runner
 from resource_broker.board import Board, Entry, build_entry
-from resource_broker.cli import main
+from resource_broker.cli import EXIT_BROKEN, main
 
 
 def _first(board: Board, resource_id: str) -> Entry | None:
@@ -222,7 +222,7 @@ def test_cli_returns_zero_on_internal_error(
 def test_claim_proceeds_when_the_session_could_not_investigate(tmp_path: Path) -> None:
     """調べようとして分からなかった場合でも宣言できる。
 
-    「情報がなくて判断できない」ときの既定は**通す**（CLAUDE.md「Fail-Open」）。
+    「情報がなくて判断できない」ときの既定は**通す**（DESIGN.md「Design Principles」）。
     調べられない資源を宣言不能にすると、掲示板そのものが使えなくなる。
     """
     code = main(
@@ -248,12 +248,16 @@ def test_claim_proceeds_when_the_session_could_not_investigate(tmp_path: Path) -
 def test_claim_proceeds_when_the_board_directory_is_unwritable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """掲示板が書けなくても、ユーザーの作業を止めない。**0 を返す。**
+    """掲示板が書けなくても、ユーザーの作業を止めない。**ただし成功とも言わない。**
 
-    宣言は残らないが、それは事故防止の失敗であって作業の停止理由ではない。
-    1 を返してよいのは「掲示板が正常に読めた上で使用中と判定できた」場合だけであり、
-    書けないことは**インフラの故障**である。ここを 1 に倒すと、掲示板が壊れた瞬間に
-    全セッションの資源アクセスが止まる（CLAUDE.md「Fail-Open」）。
+    fail-open が保証するのは「資源アクセスを止めない」ことであり、「宣言できなかった
+    claim を成功（``EXIT_OK``）と報告してよい」ではない（DESIGN.md「Exit Codes」）。
+    1（``EXIT_BUSY``）を返してよいのは「掲示板が正常に読めた上で使用中と判定できた」
+    場合だけであり、書けないのは**インフラの故障**なので、そこに倒すと「使用中」に
+    化ける。かわりに ``EXIT_BROKEN``（3）で「掲示板に残せず、完了しなかった」と正直に
+    返す——``release`` / ``wait`` / ``--clean`` に既に揃えてある扱いと同じである
+    （issue #30 指摘 2）。**プロセス自体は止めない**——例外を出して異常終了したり、
+    セッションの他の作業を巻き込んだりはしない。
 
     ただし「宣言しました」とは言わない。残っていない宣言を成功と報告すると、
     他セッションから見えないまま「宣言済みのつもり」の状態ができる。
@@ -281,7 +285,7 @@ def test_claim_proceeds_when_the_board_directory_is_unwritable(
     )
     captured = capsys.readouterr()
 
-    assert code == 0
+    assert code == EXIT_BROKEN
     assert "宣言しました" not in captured.out
     assert "掲示板に残せていません" in captured.err
     assert "他セッションからは見えません" in captured.err

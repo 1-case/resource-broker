@@ -653,6 +653,10 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ja": "{interval} 秒ごとに確認、上限 {timeout} 秒。Ctrl+C で中断できます",
         "en": "checking every {interval}s, up to {timeout}s. Press Ctrl+C to cancel",
     },
+    "wait_invalid_duration": {
+        "ja": "--interval / --timeout には 0 より大きい有限の秒数を指定してください",
+        "en": "--interval / --timeout must be a finite number of seconds greater than 0",
+    },
     "wait_interrupted": {
         "ja": "中断しました（宣言はそのままです）",
         "en": "Interrupted (the declaration is left as is)",
