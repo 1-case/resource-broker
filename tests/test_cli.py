@@ -360,6 +360,51 @@ def test_status_on_an_empty_board_is_not_flagged_as_partial(
     assert json.loads(capsys.readouterr().out)["partial"] is False
 
 
+def test_status_reads_the_board_only_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``rb status`` は掲示板を 1 回しか読まない。**2 度目の再走査を復活させない。**
+
+    以前は資源の一覧（``_known_resources_detailed``）と資源ごとの生存判定
+    （``assess`` が内部で呼ぶ ``pairs_for_detailed``）が、それぞれ独立に
+    掲示板全体を再走査していた。**1 度目が完全・2 度目が不完全**という状況
+    （削除直後の一瞬だけ他ファイルが読めない等のタイミング）では、2 度目の
+    完全性が捨てられ、``partial: false`` のまま「宣言が無い」を返して
+    いた——``SessionStart`` はこの ``partial`` を信じるため、実際には資源が
+    使用中でも「空です」と誤報していた（issue #30 指摘 4）。
+
+    ``Board.declarations_detailed``（資源の一覧・生存判定のどちらも最終的に
+    経由する走査そのもの）を数える側から差し替え、**1 回目は本物の（完全な）
+    結果、2 回目以降は「何も読めなかった」不完全な結果**を返すようにする。
+    掲示板を 1 度しか読まない実装であれば、2 回目の壊れた結果が使われる
+    ことはなく、呼び出し回数も 1 のままである。
+    """
+    assert claim(tmp_path, "GPU0", "対象") == 0
+    capsys.readouterr()
+
+    from resource_broker.board import BoardListing
+
+    original = Board.declarations_detailed
+    calls = {"n": 0}
+    broken = BoardListing(pairs=[], complete=False)
+
+    def counting(self: Board) -> BoardListing:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return original(self)
+        return broken  # 2 回目以降は「壊れて何も読めなかった」ことにする
+
+    monkeypatch.setattr(Board, "declarations_detailed", counting)
+
+    assert run(tmp_path, "status", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert calls["n"] == 1, "status が掲示板を複数回走査した（二度目の再走査が復活している）"
+    assert payload["partial"] is False
+    assert payload["resources"], "1 度目に読めた資源が消えている"
+    assert payload["resources"][0]["occupied"] is True
+
+
 def test_share_lets_you_declare_alongside(tmp_path: Path) -> None:
     """``--share`` を付ければ、既に宣言のある資源へ並んで宣言できる。
 

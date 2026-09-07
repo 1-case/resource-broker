@@ -181,6 +181,75 @@ def test_fetch_status_caps_the_total_time_across_all_candidates(
     assert elapsed < 5 * 0.1, "全候補ぶんの時間を使っている（予算が効いていない）"
 
 
+def test_the_production_budget_leaves_margin_before_the_outer_hook_deadline() -> None:
+    """本番の ``TOTAL_TIMEOUT_BUDGET_S`` が、``hooks.json`` の外側締切より
+    十分手前で終わることを固定する。
+
+    上のテストは本番の ``13.0`` を ``0.05`` に上書きして検証するため、
+    ``TOTAL_TIMEOUT_BUDGET_S`` が再び 15 秒（``hooks.json`` の SessionStart の
+    外側締切と同じ値）へ戻っても通ってしまう（issue #30 指摘 5）。ここでは
+    上書きせず、**本番の値と ``hooks.json`` の値を両方読んで**突き合わせる。
+    """
+    hooks_json = Path(__file__).resolve().parent.parent / "hooks" / "hooks.json"
+    config = json.loads(hooks_json.read_text(encoding="utf-8"))
+    outer_deadline = config["hooks"]["SessionStart"][0]["hooks"][0]["timeout"]
+
+    module = load_hook_module()
+
+    assert module.TOTAL_TIMEOUT_BUDGET_S < outer_deadline, (
+        f"予算（{module.TOTAL_TIMEOUT_BUDGET_S}）が外側締切（{outer_deadline}）以上"
+    )
+    # **十分な余裕**を明示で要求する。1 秒未満の差では「読み取り・整形に使う
+    # 余裕がゼロ」という元の指摘の実質が戻ってしまう。
+    margin = outer_deadline - module.TOTAL_TIMEOUT_BUDGET_S
+    assert margin >= 2.0, f"外側締切までの余裕が {margin} 秒しかない"
+
+
+def test_fetch_status_budget_is_enforced_with_a_fake_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """偽時計で、**本番の予算のまま**各候補への ``timeout`` 引数と総経過時間を
+    直接検査する。
+
+    上のテスト（``test_fetch_status_caps_the_total_time_across_all_candidates``）は
+    予算を ``0.05`` に差し替えて実時間で検証するため、検出できるのは「予算切れで
+    候補を打ち切る」という分岐の有無だけである。ここでは ``time.monotonic`` を
+    差し替えて実時間を消費せず、**``TOTAL_TIMEOUT_BUDGET_S``（13.0）を書き換え
+    ないまま**、(1) 各呼び出しへ渡る ``timeout`` が残り予算を超えないこと、
+    (2) 総経過時間が予算ちょうどで打ち切られること、の両方を固定する。
+    """
+    module = load_hook_module()
+    monkeypatch.setattr(module, "rb_candidates", lambda: [["fake"]] * 10)
+
+    fake_time = {"t": 1_000_000.0}
+    monkeypatch.setattr(module.time, "monotonic", lambda: fake_time["t"])
+
+    observed_timeouts: list[float] = []
+
+    def fake_run(*_args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        timeout = kwargs["timeout"]
+        observed_timeouts.append(timeout)
+        fake_time["t"] += timeout  # 1 回ごとに timeout いっぱい時間を使ったことにする
+        raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module.fetch_status()
+
+    assert result is None
+    assert observed_timeouts, "1 回も試していない"
+    # **どの呼び出しも、本番の総予算そのものを超えない。**
+    assert all(t <= module.TOTAL_TIMEOUT_BUDGET_S for t in observed_timeouts)
+    total_used = sum(observed_timeouts)
+    # **総経過時間は本番の予算ちょうどで頭打ちになる。** 最後の 1 回は
+    # 「残り予算」に切り詰められるので、単純合計は予算をわずかにも超えない。
+    assert total_used <= module.TOTAL_TIMEOUT_BUDGET_S + 1e-9
+    # **予算のほとんどを使い切っている。** 0.05 のような小さい値へ上書きして
+    # いないので、本番の 13 秒が「戻っても通る」検出力の欠如を再現しない
+    # ——最後の 1 回未満の端数を除けば、ほぼ 13 秒ぶん試している。
+    assert total_used >= module.TOTAL_TIMEOUT_BUDGET_S - module.TIMEOUT_S
+
+
 def test_the_usage_example_can_actually_be_typed() -> None:
     """使用例に必須オプションが全て含まれる。
 

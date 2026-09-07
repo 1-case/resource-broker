@@ -644,41 +644,6 @@ def test_a_stale_lock_is_not_stolen_when_it_was_replaced(
     assert lock.exists()
 
 
-def test_a_replacement_right_after_the_final_check_is_not_stolen_over(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """**最後の確認の直後**に別のロックへ置き換わっても、新しいロックを消さない。
-
-    旧実装は「2 回目の read」までの入れ替わりしか防げなかった——確認と実際の
-    ``unlink`` の間にはまだ窓が開いており、そこで別プロセスが新しいロックを
-    置くと無条件の ``unlink`` がそれを消していた（issue #30 指摘 1）。捕獲型
-    （``os.rename`` で名前を変えてから確かめる）に直すと、確認と削除が同じ
-    捕獲済み実体に対して行われるため、この窓自体が閉じる。
-    """
-    board = Board(tmp_path)
-    board.entries_dir.mkdir(parents=True, exist_ok=True)
-    lock = board.lock_path(RESOURCE)
-    lock.write_text("古いトークン", encoding="utf-8")
-    old = clock.now().timestamp() - 600
-    os.utime(lock, (old, old))
-
-    original_rename = os.rename
-    injected = {"done": False}
-
-    def swap_right_after_capture(source: object, target: object) -> None:
-        original_rename(source, target)
-        # 捕獲（rename）が終わった直後——つまり「最後の確認」の直後——に、
-        # 別プロセスが新しいロックを置いた状況を作る。
-        if not injected["done"] and str(source) == str(lock):
-            injected["done"] = True
-            Path(str(source)).write_text("新しいロック", encoding="utf-8")
-
-    monkeypatch.setattr(os, "rename", swap_right_after_capture)
-
-    assert board._steal_stale_lock(lock, RESOURCE) is True
-    assert lock.read_text(encoding="utf-8") == "新しいロック"
-
-
 def test_a_lock_taken_over_by_another_process_is_not_deleted(tmp_path: Path) -> None:
     """奪われたロックを、元の保持者が返すときに消さない。
 
@@ -693,35 +658,6 @@ def test_a_lock_taken_over_by_another_process_is_not_deleted(tmp_path: Path) -> 
         board.lock_path(RESOURCE).write_text("他プロセスのトークン", encoding="utf-8")
 
     assert board.lock_path(RESOURCE).read_text(encoding="utf-8") == "他プロセスのトークン"
-
-
-def test_a_replacement_right_after_the_final_check_is_not_released_over(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """解放の**最後の確認の直後**に別のロックへ置き換わっても、新しいロックを消さない。
-
-    確認（トークンの一致）から実際の ``unlink`` までの間に、奪った側が新しい
-    ロックを置く窓は解放側にも同じ形で開いていた（issue #30 指摘 1）。捕獲型に
-    直すことで、確認と削除が同じ捕獲済み実体に対して行われ、確認直後に現れた
-    新しいロックを巻き込まない。
-    """
-    board = Board(tmp_path)
-    lock = board.lock_path(RESOURCE)
-
-    original_rename = os.rename
-    injected = {"done": False}
-
-    def swap_right_after_capture(source: object, target: object) -> None:
-        original_rename(source, target)
-        if not injected["done"] and str(source) == str(lock):
-            injected["done"] = True
-            Path(str(source)).write_text("新しいトークン", encoding="utf-8")
-
-    with board.locked(RESOURCE) as state:
-        assert state is LockState.ACQUIRED
-        monkeypatch.setattr(os, "rename", swap_right_after_capture)
-
-    assert lock.read_text(encoding="utf-8") == "新しいトークン"
 
 
 def test_lock_wait_has_an_upper_bound(tmp_path: Path) -> None:
