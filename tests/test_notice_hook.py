@@ -448,7 +448,13 @@ def test_broken_regex_is_skipped(tmp_path: Path) -> None:
 
 
 def test_corrupt_board_is_tolerated(tmp_path: Path) -> None:
-    """掲示板が壊れていても注意は出せる。"""
+    """掲示板が壊れていても注意は出せる。**「宣言はありません」と断定しない**
+    （issue #30 指摘 3）。
+
+    以前はここで JSON の破損を黙って読み飛ばしていたため、実際には読めなかった
+    だけなのに「掲示板に GPU0 の宣言はありません」と、他セッションの生きた
+    宣言を見落としたまま言い切っていた——最も危険な向きの誤報である。
+    """
     write_guard(tmp_path, [RULE])
     entries = tmp_path / "board"
     entries.mkdir(parents=True, exist_ok=True)
@@ -457,7 +463,81 @@ def test_corrupt_board_is_tolerated(tmp_path: Path) -> None:
     result = run_hook(tmp_path, bash("python scripts/run_e059.py"))
 
     assert result.returncode == ALLOW
-    assert "GPU0" in notice_of(result)
+    notice = notice_of(result)
+    assert "GPU0" in notice
+    assert "宣言はありません" not in notice, "破損を『空』に読み替えている"
+    assert "確認できませんでした" in notice
+
+
+def test_a_live_declaration_is_not_hidden_when_something_else_is_broken(
+    tmp_path: Path,
+) -> None:
+    """正常な宣言と破損したファイルが同居していても、**正常な方を見落とさない**。
+
+    見つかった宣言は出しつつ、「これで全部とは限らない」という注意も添える
+    （issue #30 指摘 3）。
+    """
+    write_guard(tmp_path, [RULE])
+    board = Board(tmp_path)
+    board.entries_dir.mkdir(parents=True, exist_ok=True)
+    assert board.declare(
+        build_entry(normalize("GPU0"), job="E059 学習", cwd=UNRELATED_CWD, session="theirs")
+    )
+    (board.entries_dir / "壊れた.json").write_text("{壊れている", encoding="utf-8")
+
+    result = run_hook(tmp_path, bash("python scripts/run_e059.py"))
+
+    assert result.returncode == ALLOW
+    notice = notice_of(result)
+    assert "E059 学習" in notice, "正常な宣言まで見落としている"
+    assert "宣言はありません" not in notice
+    assert "これで全部とは限りません" in notice
+
+
+def test_invalid_utf8_does_not_silence_the_notice(tmp_path: Path) -> None:
+    """不正な UTF-8 のファイルがあっても、**フック全体が無言にならない**
+    （issue #30 指摘 3）。
+
+    ``str.read_text`` は ``UnicodeDecodeError``（``OSError`` の派生ではない）を
+    送出する。これを ``OSError`` としてしか捕まえていないと、フックの外側の
+    ``except Exception`` まで例外が突き抜けて**注意文を一切出さずに終わる**
+    ——「空です」より悪い、完全な沈黙である。
+    """
+    write_guard(tmp_path, [RULE])
+    board = Board(tmp_path)
+    board.entries_dir.mkdir(parents=True, exist_ok=True)
+    (board.entries_dir / "不正utf8.json").write_bytes(b"\xff\xfe\x00broken")
+
+    result = run_hook(tmp_path, bash("python scripts/run_e059.py"))
+
+    assert result.returncode == ALLOW
+    notice = notice_of(result)
+    assert notice, "沈黙している(注意文が空)"
+    assert "宣言はありません" not in notice
+    assert "確認できませんでした" in notice
+
+
+def test_a_directory_named_like_a_declaration_is_treated_as_unreadable(
+    tmp_path: Path,
+) -> None:
+    """``*.json`` という名前のディレクトリを異常として数える（issue #30 指摘 3。
+    issue #18 指摘 9 と同種の穴）。
+
+    以前は ``is_file()`` も ``is_symlink()`` も偽になるこのノードを黙って
+    読み飛ばしていた——``board.py`` の ``_json_files`` とは異なる、緩い基準
+    だった。
+    """
+    write_guard(tmp_path, [RULE])
+    entries = tmp_path / "board"
+    entries.mkdir(parents=True, exist_ok=True)
+    (entries / "見た目だけ宣言.json").mkdir()
+
+    result = run_hook(tmp_path, bash("python scripts/run_e059.py"))
+
+    assert result.returncode == ALLOW
+    notice = notice_of(result)
+    assert "宣言はありません" not in notice
+    assert "確認できませんでした" in notice
 
 
 def test_notice_is_utf8(tmp_path: Path) -> None:

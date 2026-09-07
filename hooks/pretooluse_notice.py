@@ -275,6 +275,19 @@ MESSAGES: dict[str, dict[str, str]] = {
             "no one is using it)."
         ),
     },
+    "unconfirmed_for_resource": {
+        "ja": (
+            "  掲示板の一部が読めなかったため、{target} の宣言があるかどうか確認できませんでした。"
+        ),
+        "en": (
+            "  Part of the board could not be read, so whether {target} has a "
+            "declaration could not be confirmed."
+        ),
+    },
+    "partial_warning": {
+        "ja": "  注意: 掲示板の一部を読めませんでした。これで全部とは限りません。",
+        "en": "  Note: part of the board could not be read. This may not be the full list.",
+    },
     "no_resource_named": {
         "ja": "  判定表にどの資源かが書かれていません。自分で特定すること。",
         "en": "  The guard table does not identify the resource. You must identify it yourself.",
@@ -347,6 +360,12 @@ def json_files(directory: Path) -> tuple[list[Path], bool]:
             # 宣言が「そもそも無かった」と同じ形になる。
             if entry.is_symlink():
                 unreadable = True
+                continue
+            # ``*.json`` という名前なのに通常ファイルでもリンクでもないノード
+            # （ディレクトリ・FIFO・デバイスファイル等）。以前は黙って読み飛ばして
+            # いた——``board.py`` の ``_json_files`` と同じ基準に揃える
+            # （issue #30 指摘 3。issue #18 指摘 9 と同種の穴）。
+            unreadable = True
     except FileNotFoundError:
         return [], False  # まだ誰も宣言していない。これは「空」であって「読めない」ではない
     except OSError:
@@ -503,17 +522,23 @@ def owned_by(declared_cwd: str, cwd: str) -> bool:
     return child == parent or child.startswith(parent.rstrip(os.sep) + os.sep)
 
 
-def declarations_for(root: Path, resource: str | None) -> list[dict[str, object]]:
-    """その資源の宣言を返す。**全て対等に扱う。**
+def declarations_for(root: Path, resource: str | None) -> tuple[list[dict[str, object]], bool]:
+    """その資源の宣言と、**掲示板を完全に読めたか**を返す。
 
     資源が特定されていない判定行では**無関係な宣言を返さない**。以前は掲示板の先頭 1 件を
     返しており、GPU を使うコマンドの直前に COM3 の宣言が「現状」として出ていた。
     その場に置いた具体的事実が嘘だと、以後の注意文全体が読まれなくなる。
 
     **判定はしない。** 幽霊かどうかは読む側が ``rb status`` で確かめる。
+
+    **完全性は本体（``board.py`` の ``declarations_detailed``）と同じ基準で見る**
+    （issue #30 指摘 3）。以前はここで ``json_files`` の完全性フラグを捨て、
+    個々のファイルの読み込み・JSON 解析の失敗も黙って飛ばしていた——他セッションの
+    生きた宣言が読めなかっただけで「宣言はありません」と誤報しうる、最も危険な
+    向きの欠陥だった。
     """
     if resource is None:
-        return []
+        return [], False
 
     # **``board/joins/`` はもう走査しない。** 旧形式の相乗りを見失わないための
     # 経路だったが、監査ログで宣言の寿命を実測すると中央値 5.4 分・最長 2.1 時間
@@ -522,19 +547,34 @@ def declarations_for(root: Path, resource: str | None) -> list[dict[str, object]
     board = root / "board"
     found: list[dict[str, object]] = []
     try:
-        paths, _ = json_files(board)
+        paths, unreadable = json_files(board)
     except OSError:
-        return found
+        return found, True
     for path in paths:
         try:
-            entry = json.loads(path.read_text(encoding=ENCODING))
-        except (OSError, json.JSONDecodeError, ValueError):
+            text = path.read_text(encoding=ENCODING)
+        except OSError:
+            unreadable = True
             continue
-        if not isinstance(entry, dict) or not entry.get("resource"):
+        except (UnicodeDecodeError, ValueError):
+            unreadable = True
             continue
-        if bare_resource(str(entry["resource"])) == bare_resource(resource):
+        try:
+            entry = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            # 以前はここで数えず黙って飛ばしていた。壊れているファイルに、
+            # 探している宣言が無いとは証明できない（``board.py`` と揃える）。
+            unreadable = True
+            continue
+        resource_field = entry.get("resource") if isinstance(entry, dict) else None
+        if not isinstance(resource_field, str) or not resource_field:
+            # 必須フィールド（``resource``）が読めない。``Entry.from_dict`` が
+            # ``None`` を返す条件と同じ扱いにする。
+            unreadable = True
+            continue
+        if bare_resource(resource_field) == bare_resource(resource):
             found.append(entry)
-    return found
+    return found, unreadable
 
 
 def session_id() -> str:
@@ -606,7 +646,11 @@ def describe(entry: dict[str, object], lang: str) -> list[str]:
 
 
 def build_notice(
-    rule: dict[str, object], entries: list[dict[str, object]], lang: str | None = None
+    rule: dict[str, object],
+    entries: list[dict[str, object]],
+    lang: str | None = None,
+    *,
+    unreadable: bool = False,
 ) -> str:
     """注意文を組み立てる。短く、具体的に。
 
@@ -616,6 +660,11 @@ def build_notice(
 
     ``lang`` を省くと :func:`detect_language` で決める（テストの直接呼び出しを
     互換に保つため）。
+
+    ``unreadable`` は**掲示板の一部を読めなかったか**（issue #30 指摘 3）。
+    ``entries`` が空でもそれは「読めた範囲に無かった」だけであり、**読めなかった
+    宣言があるのに「宣言はありません」と言い切ってはならない**——最も危険な
+    向きの誤報である。
     """
     lang = lang or detect_language()
     resource = rule.get("resource")
@@ -626,7 +675,10 @@ def build_notice(
 
     if not entries:
         if resource:
-            lines.append(tr("no_declaration_for_resource", lang, target=target))
+            if unreadable:
+                lines.append(tr("unconfirmed_for_resource", lang, target=target))
+            else:
+                lines.append(tr("no_declaration_for_resource", lang, target=target))
         else:
             lines.append(tr("no_resource_named", lang))
     else:
@@ -635,6 +687,9 @@ def build_notice(
         for entry in entries:
             rows.extend(describe(entry, lang))
         lines.extend(fit(rows, MAX_NOTICE_BYTES, lang))
+        if unreadable:
+            # **見つかった分はデータとして正しくても、これで全部とは限らない。**
+            lines.append(tr("partial_warning", lang))
 
     lines.append(tr("footer", lang))
     return "\n".join(lines)
@@ -699,7 +754,7 @@ def notice_for(payload: dict[str, object]) -> str | None:
         return None
 
     resource = rule.get("resource")
-    entries = declarations_for(root, str(resource) if resource else None)
+    entries, unreadable = declarations_for(root, str(resource) if resource else None)
 
     # 既に自分が宣言している資源には出さない。宣言済みの相手に毎回「宣言しろ」と言うのは
     # ノイズであり、ノイズは無視を招く。
@@ -707,7 +762,7 @@ def notice_for(payload: dict[str, object]) -> str | None:
     if declared_by_me(entries, cwd):
         return None
 
-    return build_notice(rule, entries, detect_language())
+    return build_notice(rule, entries, detect_language(), unreadable=unreadable)
 
 
 def main() -> int:

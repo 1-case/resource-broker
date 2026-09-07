@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from types import ModuleType
@@ -42,8 +43,11 @@ HOOK_FILES = [
 #: 4 実装すべての名前（比較の出力をどれが失敗したか分かる形にするため）。
 IMPLEMENTATIONS = [*HOOK_FILES, "resource_broker.messages"]
 
-#: ``{名前}`` 形式の書式指定子だけを拾う。
-PLACEHOLDER = re.compile(r"\{(\w+)\}")
+#: ``{名前}`` 形式の書式指定子を拾う。``!r`` / ``!s`` / ``!a`` の変換指定と
+#: ``:.2f`` のような書式指定（``{ratio:.2f}`` 等）も**名前ごと**捕まえる
+#: ——以前は素の ``\{(\w+)\}`` だったため、これらを伴う指定子は正規表現に
+#: 一致せず、比較の対象からまるごと落ちていた（issue #30 指摘 9）。
+PLACEHOLDER = re.compile(r"\{(\w+)(?:![rsa])?(?::[^{}]*)?\}")
 
 
 def load_hook_module(name: str) -> ModuleType:
@@ -55,9 +59,16 @@ def load_hook_module(name: str) -> ModuleType:
     return module
 
 
-def placeholders(text: str) -> frozenset[str]:
-    """テンプレート中の ``{名前}`` の集合。"""
-    return frozenset(PLACEHOLDER.findall(text))
+def placeholders(text: str) -> Counter[str]:
+    """テンプレート中の ``{名前}`` の**名前と出現回数**。
+
+    以前は ``frozenset`` を返していたため、``{name}`` が ``ja`` に 2 回・``en``
+    に 1 回しか無くても同じ集合（``{"name"}``）に潰れ、一致と判定していた
+    ——「名前と個数を比較する」という本テストモジュールの docstring 自体が
+    守られていなかった（issue #30 指摘 9）。``Counter`` は名前ごとの出現回数を
+    保つので、``==`` 比較が個数のずれも検出する。
+    """
+    return Counter(PLACEHOLDER.findall(text))
 
 
 # --- 番人 1: resource_broker.messages 単体（test_hook_i18n.py と同じ基準） -----------
@@ -100,6 +111,31 @@ def test_format_placeholders_match_between_japanese_and_english() -> None:
         if ja_names != en_names:
             offenders.append(f"{key} ja={sorted(ja_names)} en={sorted(en_names)}")
     assert not offenders, "書式指定子が ja/en でずれている:\n" + "\n".join(offenders)
+
+
+def test_placeholders_distinguishes_repeated_names_from_a_single_occurrence() -> None:
+    """``{name}`` が 2 回と 1 回は**一致しない**（issue #30 指摘 9）。
+
+    以前は ``frozenset`` を返していたため、名前の集合としては同じ
+    （``{"name"}``）に潰れて一致と判定されていた——「番人の要」を名乗る検査が
+    自分の docstring（「名前と個数を比較する」）を守っていなかった。
+    """
+    assert placeholders("{name} は {name} です") != placeholders("{name} です")
+
+
+def test_placeholders_captures_names_behind_conversion_and_format_spec() -> None:
+    """``!r`` / ``:spec`` を伴う指定子も名前を拾う（issue #30 指摘 9）。
+
+    以前の正規表現 ``\\{(\\w+)\\}`` は ``{name!r}`` や ``{ratio:.2f}`` に一致
+    しなかった。両言語が同じ書式で**別の名前**を使っていても、双方が
+    「1 件も見つからない」という同じ空集合になり、一致と誤判定していた
+    ——実在するメッセージ（``eta_actual_ratio``）が ``{ratio:.2f}`` を使っている。
+    """
+    assert placeholders("{name!r}") == Counter({"name": 1})
+    assert placeholders("{ratio:.2f} 倍") == Counter({"ratio": 1})
+    # 同じ書式でも名前が違えば区別できる（以前は両方とも空集合になり見分けが
+    # つかなかった）。
+    assert placeholders("{name!r}") != placeholders("{other!r}")
 
 
 def test_tr_falls_back_to_japanese_when_english_is_missing() -> None:

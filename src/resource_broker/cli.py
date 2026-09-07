@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from collections.abc import Sequence
@@ -116,12 +117,19 @@ def _exit_for_own_removal(result: OwnRemoval) -> int:
 def _exit_for_forced_removal(result: ForcedRemoval) -> int:
     """:class:`ForcedRemoval`（``--force``）を終了コードへ写す。
 
-    優先順位は :func:`_exit_for_own_removal` と同じ考え方——1 件でも
-    「確認できなかった」「入れ替わった」「消せなかった」があれば、
-    他が消せていても素直な成功（``EXIT_OK``）としては返さない。
+    優先順位・値ともに :func:`_exit_for_own_removal` と**完全に同じ**にする。
+    以前はここだけ「入れ替わった」「消せなかった」も ``EXIT_BROKEN`` に畳んで
+    いた——資源名で指定した既定の解放（``_exit_for_own_removal``）では同じ
+    事象が ``EXIT_BUSY`` になるため、**同じ失敗が指定方法（資源名か個体か）
+    だけで違う終了コードに分裂していた**（issue #30 指摘 5）。「消せなかった」
+    「入れ替わった」は掲示板を完全に読めた上で確認できている事象であり、
+    「確認そのものができなかった」（``unconfirmed``）とは別である——それだけが
+    ``EXIT_BROKEN`` に値する。
     """
-    if result.unconfirmed or result.swapped or result.failed:
+    if result.unconfirmed:
         return EXIT_BROKEN
+    if result.swapped or result.failed:
+        return EXIT_BUSY
     return EXIT_OK
 
 
@@ -725,8 +733,12 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         return result.code
 
     if not result.declared:
+        # **走らなかった操作を成功と言わない。** 宣言は掲示板に残っていない
+        # ——他セッションからは見えず、`claim` は実質何もしていない。
+        # `release` / `wait` / `--clean` が内部の故障に割り当てている
+        # `EXIT_BROKEN` と同じ扱いに揃える（issue #30 指摘 2）。
         _warn_not_declared()
-        return result.code
+        return EXIT_BROKEN
 
     print(
         tr(
@@ -911,6 +923,11 @@ def _wait_advice() -> str:
     return tr("wait_advice")
 
 
+def _is_positive_finite(value: float) -> bool:
+    """0 より大きい有限の数か。``NaN`` は自分自身とも比較で偽になるのでここで弾ける。"""
+    return math.isfinite(value) and value > 0
+
+
 def _cmd_wait(args: argparse.Namespace) -> int:
     """資源が解放されるまで待つ。
 
@@ -918,6 +935,13 @@ def _cmd_wait(args: argparse.Namespace) -> int:
     過ぎたからといって待機をやめる根拠にはしない。
     打ち切るのは呼び出し側が指定した ``--timeout`` だけである。
     """
+    # **受け取る前に弾く。** 0・負数・NaN・Infinity は「ポーリングし続けて
+    # 一生戻らない」「即座に上限へ達する」といった壊れ方をする。既存の引数不備
+    # （``EXIT_USAGE``）と同じ扱いに揃える（issue #30 指摘 6）。
+    if not _is_positive_finite(args.interval) or not _is_positive_finite(args.timeout):
+        print(tr("wait_invalid_duration"), file=sys.stderr)
+        return EXIT_USAGE
+
     board = Board(args.home)
     resource_id = naming.normalize(args.resource)
 
@@ -1363,10 +1387,12 @@ def _update_locked(board: Board, resource_id: str, args: argparse.Namespace) -> 
     **「宣言が無い」と「確認できない」を混同しない。** 以前は ``list_for``
     （読めなかったものを黙って飛ばす）で数えていたため、不正な UTF-8 など
     掲示板の一部が読めない場合でも「0 件」と断定し ``EXIT_USAGE``（利用者の
-    入力ミス）を返していた。``update`` は fail-open なコマンドなので、
-    読めなかった側に自分の宣言が隠れているかもしれないなら、それは入力ミス
-    ではなく「確認できなかった」であり、作業は止めずに ``EXIT_OK`` で通す
-    （issue #18 指摘 8。今回の UTF-8 修正が作った退行）。
+    入力ミス）を返していた（issue #18 指摘 8）。読めなかった側に自分の宣言が
+    隠れているかもしれないなら、それは入力ミスではなく「確認できなかった」
+    である。**何も更新していない**以上、それを ``EXIT_OK``（成功）で通すのは
+    走らなかった操作を成功と言うことになる——`release` / `wait` / `--clean`
+    が内部の故障に割り当てている ``EXIT_BROKEN`` と同じ扱いに揃える
+    （issue #30 指摘 2）。
     """
     cwd = os.getcwd()
     session_id = platform_info.session_id()
@@ -1382,7 +1408,7 @@ def _update_locked(board: Board, resource_id: str, args: argparse.Namespace) -> 
                 resource=resource_id,
                 reason=tr("reason_board_partially_unreadable"),
             )
-            return EXIT_OK
+            return EXIT_BROKEN
         print(tr("no_declaration_found"), file=sys.stderr)
         return EXIT_USAGE
 
@@ -1444,9 +1470,12 @@ def _update_locked(board: Board, resource_id: str, args: argparse.Namespace) -> 
         return EXIT_BUSY
     if result is UpdateResult.FAILED:
         # 掲示板に書けないのは**インフラの故障**であり、資源の競合ではない。
-        # ここを 1 に倒すと、掲示板が壊れた瞬間に呼び出し側が「使用中」と読む。
+        # ここを 1（EXIT_BUSY）に倒すと、掲示板が壊れた瞬間に呼び出し側が
+        # 「使用中」と読む。かといって、**書き換えは実際には起きていない**
+        # ので EXIT_OK（成功）でもない——`release` / `wait` / `--clean` と
+        # 同じ ``EXIT_BROKEN`` で「完了できなかった」と伝える（issue #30 指摘 2）。
         print(tr("update_failed"), file=sys.stderr)
-        return EXIT_OK
+        return EXIT_BROKEN
 
     print(tr("updated_notice", resource=naming.display_default(entry.resource), job=entry.job))
     return EXIT_OK

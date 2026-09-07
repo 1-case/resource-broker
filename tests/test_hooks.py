@@ -1,7 +1,7 @@
 """フックの守護テスト。
 
 フックは**他の全セッションの起動経路に割り込む**。壊れたときにセッションの起動を
-妨げてはならない（CLAUDE.md「Fail-Open」）。「注意する」だけでは守れないので、
+妨げてはならない（DESIGN.md「Design Principles」）。「注意する」だけでは守れないので、
 壊れた出力・``rb`` の不在・異常終了のいずれでも exit 0 になることをテストで固定する。
 
 フックは素の ``python`` で単体実行される想定なので、テストも**サブプロセスとして**
@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -141,6 +142,43 @@ def required_options(command: str) -> set[str]:
     assert subparsers, "サブコマンドが見つからない"
     sub = subparsers[0].choices[command]
     return {a.option_strings[0] for a in sub._actions if a.required and a.option_strings}
+
+
+def test_fetch_status_caps_the_total_time_across_all_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``rb status`` の全候補を合わせた待ち時間に上限がある（issue #30 指摘 7）。
+
+    候補ごとに ``TIMEOUT_S`` をフルに使うと、候補が複数（最大 3 つ）あるとき
+    合計が ``hooks.json`` の外側の締切（SessionStart は 15 秒）に張り付き、
+    以降の処理に余裕が残らない。**全体の予算が尽きたら、残りの候補は試さない**
+    ことを固定する。
+    """
+    module = load_hook_module()
+
+    # 予算を小さくして、実際に長時間スリープさせずに検証する。
+    monkeypatch.setattr(module, "TOTAL_TIMEOUT_BUDGET_S", 0.05)
+    monkeypatch.setattr(module, "TIMEOUT_S", 0.1)
+    # 候補を多め（5 つ）にして、「予算切れで打ち切る」が候補数に依存しないことを見る。
+    monkeypatch.setattr(module, "rb_candidates", lambda: [["fake"]] * 5)
+
+    attempts = {"n": 0}
+
+    def hanging_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        attempts["n"] += 1
+        time.sleep(0.03)  # 1 回あたり実時間を少し使う（ハングを模す）
+        raise subprocess.TimeoutExpired(cmd="fake", timeout=_kwargs.get("timeout", 0.1))
+
+    monkeypatch.setattr(module.subprocess, "run", hanging_run)
+
+    started = time.monotonic()
+    result = module.fetch_status()
+    elapsed = time.monotonic() - started
+
+    assert result is None
+    # 全部試していたら 5 回・0.15 秒超になる。予算切れで途中で打ち切っているはず。
+    assert attempts["n"] < 5, "予算が尽きても候補を試し続けている"
+    assert elapsed < 5 * 0.1, "全候補ぶんの時間を使っている（予算が効いていない）"
 
 
 def test_the_usage_example_can_actually_be_typed() -> None:
@@ -523,7 +561,14 @@ def test_the_board_can_be_read_without_rb(tmp_path: Path, monkeypatch: pytest.Mo
 def test_reading_the_board_directly_survives_corruption(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """壊れたファイルがあっても飛ばして読む（例外を出さない）。"""
+    """壊れたファイルがあっても飛ばして読む（例外を出さない）。
+
+    **ただし黙って読み飛ばすのではなく、不完全だったことを残す**
+    （issue #30 指摘 3）。以前はここで数えていなかったため、壊れたファイルの
+    向こうに他セッションの生きた宣言が隠れていても「これで全部だ」と読まれた
+    ——``board.py`` の ``declarations_detailed`` は JSON の破損も
+    ``complete=False`` にするので、ここも基準を揃える。
+    """
     declare(tmp_path, "GPU0", job="E059 eval")
     (tmp_path / "board" / "壊れている.json").write_text("{ これは JSON ではない", encoding="utf-8")
     module = load_hook_module()
@@ -531,7 +576,102 @@ def test_reading_the_board_directly_survives_corruption(
     rows = module.read_entries_directly()
 
     assert rows is not None
-    assert len(rows) == 1  # 壊れた 1 件は飛ばし、正常な 1 件は読めている
+    # 壊れた 1 件は資源としては読めないが、正常な 1 件は読めている。
+    assert len(rows) == 2
+    assert any(row.get("resource") == normalize("GPU0") for row in rows)
+    assert any(row.get("_unreadable") for row in rows), "破損を『完全に読めた』に含めている"
+
+
+def test_reading_the_board_directly_flags_invalid_utf8(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """不正な UTF-8 のファイルも「読めなかった」として数える（issue #30 指摘 3）。
+
+    以前は ``UnicodeDecodeError``（``OSError`` の派生ではない）を捕まえておらず、
+    ``read_entries_directly`` の外まで例外が突き抜けて ``main()`` の
+    ``except Exception`` に飲まれ、**注意文を一切出さずに終わっていた**
+    ——「空です」より悪い完全な沈黙である。
+    """
+    declare(tmp_path, "GPU0", job="E059 eval")
+    (tmp_path / "board" / "不正utf8.json").write_bytes(b"\xff\xfe\x00broken")
+    module = load_hook_module()
+    monkeypatch.setenv("RESOURCE_BROKER_HOME", str(tmp_path))
+
+    rows = module.read_entries_directly()
+
+    assert rows is not None, "例外が外まで抜けている"
+    assert any(row.get("resource") == normalize("GPU0") for row in rows)
+    assert any(row.get("_unreadable") for row in rows)
+
+
+def test_reading_the_board_directly_flags_a_missing_resource_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``resource`` が読めない宣言は「完全に読めた」に含めない（issue #30 指摘 3）。
+
+    ``board.py`` の ``Entry.from_dict`` が ``None`` を返す条件と揃える——以前は
+    ``data.get("resource")`` が偽値でなければ無条件で採用し、欠落を数えなかった。
+    """
+    declare(tmp_path, "GPU0", job="E059 eval")
+    (tmp_path / "board" / "資源名なし.json").write_text(
+        json.dumps({"holder": {"job": "名無し"}}), encoding="utf-8"
+    )
+    module = load_hook_module()
+    monkeypatch.setenv("RESOURCE_BROKER_HOME", str(tmp_path))
+
+    rows = module.read_entries_directly()
+
+    assert rows is not None
+    assert any(row.get("resource") == normalize("GPU0") for row in rows)
+    assert any(row.get("_unreadable") for row in rows)
+
+
+def test_reading_the_board_directly_flags_a_directory_named_like_a_declaration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``*.json`` という名前のディレクトリを異常として数える（issue #30 指摘 3。
+    issue #18 指摘 9 と同種の穴）。
+
+    ``is_file()`` も ``is_symlink()`` も偽になるこのノードを、以前は黙って
+    読み飛ばしていた——``board.py`` の ``_json_files`` とは異なる緩い基準だった。
+    """
+    declare(tmp_path, "GPU0", job="E059 eval")
+    (tmp_path / "board" / "見た目だけ宣言.json").mkdir()
+    module = load_hook_module()
+    monkeypatch.setenv("RESOURCE_BROKER_HOME", str(tmp_path))
+
+    rows = module.read_entries_directly()
+
+    assert rows is not None
+    assert any(row.get("resource") == normalize("GPU0") for row in rows)
+    assert any(row.get("_unreadable") for row in rows)
+
+
+def test_fetch_status_propagates_the_top_level_partial_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``rb status --json`` の ``partial`` を捨てない（issue #30 指摘 3）。
+
+    ``SessionStart`` は ``rb status --json`` を呼ぶのに、以前は ``resources`` だけ
+    抜き出して ``partial`` を捨てていた——生きた宣言を読めなかった状況で
+    「掲示板は空です」と全セッションへ配りかねない、最も危険な向きの誤報だった。
+    """
+    module = load_hook_module()
+
+    def fake_run(*_args: object, **_kwargs: object) -> object:
+        class Completed:
+            returncode = 0
+            stdout = json.dumps({"resources": [], "partial": True})
+
+        return Completed()
+
+    monkeypatch.setattr(module, "rb_candidates", lambda: [["fake"]])
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    resources = module.fetch_status()
+
+    assert resources is not None
+    assert any(module.is_partial(r) for r in resources), "partial を伝えていない"
 
 
 def make_fake_rb(directory: Path, payload: str, code: int = 0) -> str:
@@ -565,7 +705,7 @@ def test_failing_rb_still_delivers_the_board(tmp_path: Path) -> None:
 
     以前はここで黙っていた。だが**このフックは唯一「使い方」を配る場所**であり、
     黙るとそれが丸ごと消える。しかも fail-open なので誰も気づかない
-    （CLAUDE.md「Silence Is Not Success」）。実際、WSL 上のプラグイン導入で
+    （DESIGN.md「Hook Spec」）。実際、WSL 上のプラグイン導入で
     ``rb`` が解決できず、このフックだけが何も出さない状態を実測した。
     """
     declare(tmp_path, "GPU0", job="E059 eval")

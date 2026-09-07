@@ -93,7 +93,7 @@ def test_self_reported_busy_blocks_the_claim(
 ) -> None:
     """自分の調査で使用中だったなら、掲示板が空でも宣言しない。
 
-    実測「使用中」は単独で確定する（CLAUDE.md「Liveness Judgment」）。
+    実測「使用中」は単独で確定する（DESIGN.md「Ghost Detection」）。
     未宣言の使用者がいる状況で場所取りだけしても衝突は防げない。
     """
     assert (
@@ -314,7 +314,7 @@ def test_wait_names_the_resource_it_is_waiting_for(
     claim(tmp_path, "GPU0", "E017 A/B 学習")
     capsys.readouterr()
 
-    assert run(tmp_path, "wait", "GPU0", "--timeout", "0") != 0
+    assert run(tmp_path, "wait", "GPU0", "--timeout", "0.000001") != 0
     out = capsys.readouterr().out
 
     assert "GPU0" in out

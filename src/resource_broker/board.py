@@ -817,10 +817,13 @@ class Board:
     def _steal_stale_lock(self, path: Path, resource_id: str) -> bool:
         """放置されたロックを奪う。奪ったら True。
 
-        **他人の新しいロックを消さない。** 年齢を見てから ``unlink`` するまでの間に、
-        別プロセスが古いロックを消して自分のロックを作ることがある。その隙に消すと、
-        生きているロックを消して排他が崩れる。ロックファイルには取得ごとに一意な
-        トークンが入っているので、**読んだときと同じ内容である**ことを確かめてから消す。
+        **他人の新しいロックを消さない。** 年齢を見てからトークンを再確認するだけでは
+        足りない——**再確認と ``unlink`` の間**に、別プロセスが古いロックを消して
+        自分のロックを作ることがある。その窓で消すと生きているロックを消して排他が
+        崩れる。宣言の削除（:meth:`_capture_and_remove`）と同じ「**名前を変えて
+        捕まえてから確かめる**」形（CAS）をロックにも使う——``os.rename`` で捕まえられる
+        のは 1 人だけなので、捕まえたあとに読む中身は「確認した瞬間の実体」そのもの
+        であり、確認と削除の間に別プロセスが割り込む余地が無い。
         """
         first = self._read_lock_token(path)
         if first is None:
@@ -831,9 +834,15 @@ class Board:
             return False
         if age < LOCK_STALE_S:
             return False
-        if self._read_lock_token(path) != first:
-            return False  # 入れ替わっている。他人の新しいロックである
-        result, _ = _unlink_with_retry(path)
+        tombstone = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.taken")
+        moved, _ = _rename_with_retry(path, tombstone)
+        if moved is not MoveResult.MOVED:
+            return False  # 既に無い、または捕まえられなかった
+        if self._read_lock_token(tombstone) != first:
+            # 捕まえた中身が読んだときと違う。他人の新しいロックなので戻す。
+            self._restore_lock(tombstone, path, resource_id)
+            return False
+        result, _ = _unlink_with_retry(tombstone)
         if result is not RemovalResult.REMOVED:
             return False
         self.audit("lock_stolen", resource=resource_id, age_s=round(age, 1))
@@ -842,8 +851,12 @@ class Board:
     def _release_lock(self, path: Path, token: str, resource_id: str) -> None:
         """自分が取ったロックだけを返す。**自分が書いたトークンと一致するときだけ**消す。
 
-        保持が ``LOCK_STALE_S`` を超えると他プロセスに奪われる。奪われたあとに無条件で
-        ``unlink`` すると、**他人のロックを消す**ことになる。
+        保持が ``LOCK_STALE_S`` を超えると他プロセスに奪われる。確認してから
+        ``unlink`` するまでの間に、奪った側が新しいロックを置くことがある——無条件の
+        ``unlink`` はもちろん、「確認してから消す」だけでも**確認と削除の間**にこの窓が
+        開く。:meth:`_steal_stale_lock` と同じ捕獲型（``os.rename`` で名前を変えて
+        から中身を確かめる）にすることで、捕まえた実体だけを見て消すため、確認後に
+        現れた新しいロックを巻き込まない。
 
         **空は「自分のものではない」に倒す。** ``locked`` は ``os.open`` と
         ``os.write(token)`` の間、ロックファイルが空である。奪われた旧保持者がその窓で
@@ -857,7 +870,44 @@ class Board:
         if current != token:
             self.audit("lock_release_skipped", resource=resource_id)
             return
-        _unlink_with_retry(path)
+        tombstone = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.taken")
+        moved, _ = _rename_with_retry(path, tombstone)
+        if moved is not MoveResult.MOVED:
+            return  # 既に無い、または捕まえられなかった。触るものが無い
+        if self._read_lock_token(tombstone) != token:
+            # 捕まえた中身が確認したときと違う。他人の新しいロックなので戻す。
+            self._restore_lock(tombstone, path, resource_id)
+            return
+        _unlink_with_retry(tombstone)
+
+    def _restore_lock(self, tombstone: Path, path: Path, resource_id: str) -> None:
+        """捕まえたロックを元の名前へ戻す。
+
+        戻せるのは、その間に誰も新しいロックを置いていないときだけである。``os.link``
+        は宛先があると**必ず失敗する**ので、既に新しいロックがあれば捕まえた側
+        （読んだ時点で用済みと分かった古いロック）を破棄してよい。
+
+        Notes
+        -----
+        戻す先も戻す手段も無いときは、ロックは消えたままになる。**ロックは性能最適化
+        であって安全性の主防御ではない**（正しさは nonce の CAS が担保する）ため、
+        この残余は事故に繋がらない——DESIGN.md「Per-Resource Lock」参照。
+        """
+        try:
+            os.link(tombstone, path)
+        except FileExistsError:
+            _unlink_with_retry(tombstone)
+            return
+        except OSError:
+            moved, _ = _rename_with_retry(tombstone, path)
+            if moved is MoveResult.MOVED:
+                return
+            if moved is MoveResult.BLOCKED:
+                _unlink_with_retry(tombstone)
+                return
+            self.audit("lock_restore_failed", resource=resource_id)
+            return
+        _unlink_with_retry(tombstone)
 
     def declarations(self) -> list[tuple[Path, Entry]]:
         """掲示板にある**全ての宣言**を読む。読めなかったものは飛ばす。

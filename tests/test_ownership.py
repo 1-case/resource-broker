@@ -28,7 +28,7 @@ from resource_broker.board import (
     UpdateResult,
     build_entry,
 )
-from resource_broker.cli import main
+from resource_broker.cli import EXIT_BROKEN, main
 from resource_broker.naming import normalize
 
 
@@ -176,8 +176,13 @@ def test_update_is_fail_open_when_an_unrelated_file_is_unreadable(
     以前は ``list_for``（読めなかったものを黙って飛ばす）で数えていたため、
     対象の資源に宣言が無いことと「掲示板の一部が不正 UTF-8 で読めない」ことを
     区別できず、常に ``宣言が見つかりませんでした`` ＋ ``EXIT_USAGE``（利用者の
-    入力ミス）を返していた。``update`` は fail-open なコマンドなので、確認できて
-    いないなら ``EXIT_OK`` で通す（更新はしない）。
+    入力ミス）を返していた。
+
+    **ただし「確認できなかった」は「成功」ではない。** 何も更新していない以上
+    ``EXIT_OK`` で通すのは走らなかった操作を成功と言うことになる——``release`` /
+    ``wait`` / ``--clean`` に揃えた ``EXIT_BROKEN`` を返す（issue #30 指摘 2）。
+    **プロセスは止まらず、掲示板を書き換えないまま安全に終わる**——fail-open が
+    保証するのはそこまでである。
     """
     board = Board(tmp_path)
     board.entries_dir.mkdir(parents=True, exist_ok=True)
@@ -188,7 +193,7 @@ def test_update_is_fail_open_when_an_unrelated_file_is_unreadable(
 
     code = run(tmp_path, "update", "GPU0", "--eta", "5m")
 
-    assert code == 0, "fail-open が壊れている（EXIT_USAGE を返している）"
+    assert code == EXIT_BROKEN, "入力ミス（EXIT_USAGE）にも成功（EXIT_OK）にも倒れていない"
     assert "確認できませんでした" in capsys.readouterr().err
 
 
@@ -226,6 +231,28 @@ def test_update_rewrites_my_own_declaration(
     declaration = row["declarations"][0]
     assert declaration["usage"]["peak"] == "VRAM 2GB"
     assert declaration["sharing"] == "可"
+
+
+def test_update_reports_a_failed_replace_as_broken_not_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """置換の I/O 失敗を成功（``EXIT_OK``）で返さない。
+
+    以前は「掲示板が壊れた瞬間に呼び出し側が『使用中』と読む」ことを避けるために
+    ``EXIT_OK`` を返していたが、**書き換えは実際には起きていない**ので成功でもない。
+    `release` / `wait` / `--clean` と同じ ``EXIT_BROKEN`` を返す（issue #30 指摘 2）。
+    """
+    claim(tmp_path)
+    capsys.readouterr()
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError("共有違反")
+
+    monkeypatch.setattr(os, "replace", refuse)
+    monkeypatch.setattr("resource_broker.board.UNLINK_DELAY_S", 0.0)
+
+    assert run(tmp_path, "update", "GPU0", "--eta", "5m") == EXIT_BROKEN
+    assert "更新できませんでした" in capsys.readouterr().err
 
 
 def test_update_does_not_clobber_a_newer_declaration(tmp_path: Path) -> None:
@@ -396,8 +423,8 @@ def test_remove_reports_failure_apart_from_absence(
     ``os.rename``（CAS の「捕まえる」段）が ``PermissionError`` を返すことが
     実際にある。**削除を塞ぐのは捕まえる段であって、捕まえたあとの tombstone
     の後始末ではない**——tombstone だけが消せなくても、掲示板からは既に
-    見えなくなっているので「消せた」として扱ってよい（DESIGN.md「Known
-    Residuals」の tombstone 回収経路）。
+    見えなくなっているので「消せた」として扱ってよい
+    （DESIGN.md「Known Residuals」の tombstone 回収経路）。
     """
     board = Board(tmp_path)
     mine = build_entry(RESOURCE, job="私のジョブ", cwd=MINE, session="mine", session_id="mine")
@@ -425,6 +452,14 @@ def test_rename_is_retried_before_giving_up(
     attempts = {"n": 0}
 
     def flaky(*args: object, **kwargs: object) -> None:
+        # ロックの解放も捕獲型（``os.rename``）になったため、ここで数えたいのは
+        # **宣言側**の捕獲だけに絞る——さもないとロック解放の rename も同じ
+        # カウンタを消費し、テストの意図（宣言の捕獲は 3 回目で成功する）と
+        # 無関係にリトライ回数がずれる。
+        source = str(args[0]) if args else ""
+        if source.endswith(".lock"):
+            original(*args, **kwargs)  # type: ignore[arg-type]
+            return
         attempts["n"] += 1
         if attempts["n"] < 3:
             raise PermissionError("共有違反")
@@ -450,7 +485,7 @@ def test_a_contended_lock_is_not_reported_as_a_busy_resource(
     2 つの嘘をつく。他セッションが ``release`` している最中——**資源が今まさに空こうとして
     いる瞬間**に「使用中」と答え、ロックを持ったままプロセスが死ねば ``LOCK_STALE_S``
     のあいだ**全セッションの取得が「使用中」で止まる**。本ツールの故障を資源の競合として
-    報告する形であり、CLAUDE.md「Fail-Open」が名指しで禁じている。
+    報告する形であり、DESIGN.md「Exit Codes」が名指しで禁じている。
 
     排他は落ちない。正しさは nonce の CAS と ``try_claim`` の ``O_EXCL`` が担保しており、
     本当に競っていれば ``try_claim`` が負けて**真の busy** が返る
@@ -512,7 +547,7 @@ def test_lock_infrastructure_failure_is_not_contention(
 ) -> None:
     """ロックが作れないことを「競合」と報告しない。
 
-    **インフラの故障と資源の競合を混同しない**（CLAUDE.md「Fail-Open」）。
+    **インフラの故障と資源の競合を混同しない**（DESIGN.md「Per-Resource Lock」）。
     区別しないと、掲示板が壊れた瞬間に全セッションの取得が「使用中」で止まる。
 
     共有違反は時間切れになるまでやり直すため、待ち時間を短くして呼ぶ。
@@ -609,6 +644,41 @@ def test_a_stale_lock_is_not_stolen_when_it_was_replaced(
     assert lock.exists()
 
 
+def test_a_replacement_right_after_the_final_check_is_not_stolen_over(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**最後の確認の直後**に別のロックへ置き換わっても、新しいロックを消さない。
+
+    旧実装は「2 回目の read」までの入れ替わりしか防げなかった——確認と実際の
+    ``unlink`` の間にはまだ窓が開いており、そこで別プロセスが新しいロックを
+    置くと無条件の ``unlink`` がそれを消していた（issue #30 指摘 1）。捕獲型
+    （``os.rename`` で名前を変えてから確かめる）に直すと、確認と削除が同じ
+    捕獲済み実体に対して行われるため、この窓自体が閉じる。
+    """
+    board = Board(tmp_path)
+    board.entries_dir.mkdir(parents=True, exist_ok=True)
+    lock = board.lock_path(RESOURCE)
+    lock.write_text("古いトークン", encoding="utf-8")
+    old = clock.now().timestamp() - 600
+    os.utime(lock, (old, old))
+
+    original_rename = os.rename
+    injected = {"done": False}
+
+    def swap_right_after_capture(source: object, target: object) -> None:
+        original_rename(source, target)
+        # 捕獲（rename）が終わった直後——つまり「最後の確認」の直後——に、
+        # 別プロセスが新しいロックを置いた状況を作る。
+        if not injected["done"] and str(source) == str(lock):
+            injected["done"] = True
+            Path(str(source)).write_text("新しいロック", encoding="utf-8")
+
+    monkeypatch.setattr(os, "rename", swap_right_after_capture)
+
+    assert board._steal_stale_lock(lock, RESOURCE) is True
+    assert lock.read_text(encoding="utf-8") == "新しいロック"
+
+
 def test_a_lock_taken_over_by_another_process_is_not_deleted(tmp_path: Path) -> None:
     """奪われたロックを、元の保持者が返すときに消さない。
 
@@ -623,6 +693,35 @@ def test_a_lock_taken_over_by_another_process_is_not_deleted(tmp_path: Path) -> 
         board.lock_path(RESOURCE).write_text("他プロセスのトークン", encoding="utf-8")
 
     assert board.lock_path(RESOURCE).read_text(encoding="utf-8") == "他プロセスのトークン"
+
+
+def test_a_replacement_right_after_the_final_check_is_not_released_over(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """解放の**最後の確認の直後**に別のロックへ置き換わっても、新しいロックを消さない。
+
+    確認（トークンの一致）から実際の ``unlink`` までの間に、奪った側が新しい
+    ロックを置く窓は解放側にも同じ形で開いていた（issue #30 指摘 1）。捕獲型に
+    直すことで、確認と削除が同じ捕獲済み実体に対して行われ、確認直後に現れた
+    新しいロックを巻き込まない。
+    """
+    board = Board(tmp_path)
+    lock = board.lock_path(RESOURCE)
+
+    original_rename = os.rename
+    injected = {"done": False}
+
+    def swap_right_after_capture(source: object, target: object) -> None:
+        original_rename(source, target)
+        if not injected["done"] and str(source) == str(lock):
+            injected["done"] = True
+            Path(str(source)).write_text("新しいトークン", encoding="utf-8")
+
+    with board.locked(RESOURCE) as state:
+        assert state is LockState.ACQUIRED
+        monkeypatch.setattr(os, "rename", swap_right_after_capture)
+
+    assert lock.read_text(encoding="utf-8") == "新しいトークン"
 
 
 def test_lock_wait_has_an_upper_bound(tmp_path: Path) -> None:
@@ -1027,7 +1126,7 @@ def test_future_since_is_uncertain_and_needs_force(tmp_path: Path) -> None:
     UNCERTAIN は `FREE_VERDICTS` に**入っていない**（掲示板が正常に読めた上で裏が
     取れないだけなので fail-safe に倒す）。ここに判定則を足して自動で退かせるのは、
     「実測が空きでも宣言を退けない」という非対称性を崩す方向なのでやらない
-    （CLAUDE.md「Liveness Judgment」）。したがって残る道は `--force` だけである。
+    （DESIGN.md「Future Declaration Timestamps」）。したがって残る道は `--force` だけである。
     """
     from resource_broker import liveness
     from resource_broker.liveness import Observation, Verdict

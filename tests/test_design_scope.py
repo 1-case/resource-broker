@@ -95,12 +95,19 @@ PRIVATE_DOCS = (
 
 #: 公開しているソース。ここから非公開文書を参照すると、読者は永遠に出典を辿れない
 #: （issue #10）。``docs/DESIGN.md`` だけを見ていたのが元の穴で、実際に破っていたのは
-#: この 2 ディレクトリだった。
+#: この 2 ディレクトリだった。**``bin/`` と ``tests/`` も対象に含める**——番人自身が
+#: 見る範囲を ``src/`` / ``hooks/`` の Python だけに絞っていたため、そこに残った
+#: 参照を見逃していた（issue #30 指摘 10）。``tests/test_design_scope.py`` 自身は
+#: 除く——``CLAUDE.md`` を検出対象の文字列として持つのは参照ではなく実装である。
 PUBLIC_SOURCE_FILES = sorted(
     str(path.relative_to(ROOT)).replace("\\", "/")
-    for folder in ("src", "hooks")
+    for folder in ("src", "hooks", "tests")
     for path in (ROOT / folder).rglob("*.py")
-    if "__pycache__" not in path.parts
+    if "__pycache__" not in path.parts and path.name != "test_design_scope.py"
+) + sorted(
+    str(path.relative_to(ROOT)).replace("\\", "/")
+    for path in (ROOT / "bin").glob("*")
+    if path.is_file()
 )
 
 #: ``DESIGN.md「見出し」`` 形式の引用。見出し名の途中で行が折り返されることがある
@@ -139,11 +146,13 @@ def test_design_does_not_point_at_unpublished_files(name: str) -> None:
 
 @pytest.mark.parametrize("name", PUBLIC_SOURCE_FILES)
 def test_public_source_does_not_point_at_unpublished_files(name: str) -> None:
-    """公開しているソース（``src/`` / ``hooks/``）が非公開の文書を参照していない。
+    """公開しているソース（``src/`` / ``hooks/`` / ``bin/`` / ``tests/``）が
+    非公開の文書を参照していない。
 
     上の検査が ``docs/DESIGN.md`` しか見ていなかった穴を塞ぐ。**公開物からここへ
     リンクすると参照切れになる**という原則は同じで、見る場所を広げただけである
-    （issue #10：``CLAUDE.md`` への参照が 12 ファイル・29 箇所に散っていた）。
+    （issue #10：``CLAUDE.md`` への参照が 12 ファイル・29 箇所に散っていた。
+    issue #30 指摘 10：``bin/`` と ``tests/`` がその後も対象外のままだった）。
     """
     text = (ROOT / name).read_text(encoding="utf-8")
 

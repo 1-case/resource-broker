@@ -277,6 +277,79 @@ def test_corrupt_entry_is_skipped(tmp_path: Path, payload: str) -> None:
     assert "正常なエントリ" in text
 
 
+@pytest.mark.parametrize("payload", ["", "{", "null", "[]", '{"resource": null}', "\x00\x01"])
+def test_corrupt_entry_is_not_reported_as_a_clean_board(tmp_path: Path, payload: str) -> None:
+    """壊れたエントリの存在を「宣言なし」と混同しない（issue #30 指摘 3）。
+
+    正常な宣言が 1 件も無い状況で壊れたファイルだけがあると、以前は黙って
+    ``[rb] 宣言なし。`` と言い切っていた——読めなかった側に他セッションの生きた
+    宣言が隠れていないとは証明できない。
+    """
+    entries = tmp_path / "board"
+    entries.mkdir(parents=True, exist_ok=True)
+    (entries / "壊れた.json").write_text(payload, encoding="utf-8")
+
+    text = run_hook(tmp_path).decode("utf-8")
+
+    assert "宣言なし" not in text
+    assert "読めませんでした" in text
+
+
+def test_invalid_utf8_does_not_silence_the_reminder(tmp_path: Path) -> None:
+    """不正な UTF-8 のファイルがあっても、**毎プロンプトの注入が沈黙しない**
+    （issue #30 指摘 3）。
+
+    ``UnicodeDecodeError``（``OSError`` の派生ではない）を捕まえ損ねると、
+    フック全体の ``except Exception`` まで抜けて何も注入しなくなる——
+    「宣言なし」より悪い完全な沈黙である。
+    """
+    entries = tmp_path / "board"
+    entries.mkdir(parents=True, exist_ok=True)
+    (entries / "不正utf8.json").write_bytes(b"\xff\xfe\x00broken")
+    declare(tmp_path, "GPU0", job="正常なエントリ")
+
+    text = run_hook(tmp_path).decode("utf-8")
+
+    assert text.strip(), "沈黙している（出力が空）"
+    assert "正常なエントリ" in text
+    assert "読めませんでした" in text or "全部とは限らない" in text
+
+
+def test_a_missing_resource_field_is_not_reported_as_a_clean_board(tmp_path: Path) -> None:
+    """``resource`` フィールドが読めない宣言は「完全に読めた」に含めない
+    （issue #30 指摘 3）。
+
+    以前は ``data.get("resource")`` が偽値でなければ無条件で採用していたが、
+    欠落・空文字・非文字列は数えていなかった。
+    """
+    entries = tmp_path / "board"
+    entries.mkdir(parents=True, exist_ok=True)
+    (entries / "資源名なし.json").write_text(
+        json.dumps({"holder": {"job": "名無し"}}), encoding="utf-8"
+    )
+    declare(tmp_path, "GPU0", job="正常なエントリ")
+
+    text = run_hook(tmp_path).decode("utf-8")
+
+    assert "正常なエントリ" in text
+    assert "全部とは限らない" in text
+
+
+def test_a_directory_named_like_a_declaration_does_not_look_clean(tmp_path: Path) -> None:
+    """``*.json`` という名前のディレクトリを異常として数える（issue #30 指摘 3。
+    issue #18 指摘 9 と同種の穴）。
+    """
+    entries = tmp_path / "board"
+    entries.mkdir(parents=True, exist_ok=True)
+    (entries / "見た目だけ宣言.json").mkdir()
+    declare(tmp_path, "GPU0", job="正常なエントリ")
+
+    text = run_hook(tmp_path).decode("utf-8")
+
+    assert "正常なエントリ" in text
+    assert "全部とは限らない" in text
+
+
 def test_does_not_depend_on_rb_being_installed(tmp_path: Path) -> None:
     """``rb`` が PATH に無くても動く。
 

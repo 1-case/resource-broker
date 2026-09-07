@@ -933,14 +933,19 @@ def test_release_force_refuses_when_the_whole_board_is_unreadable(
     assert "未確認" in capsys.readouterr().err
 
 
-def test_release_force_returns_exit_broken_when_some_removals_fail(
+def test_release_force_returns_exit_busy_when_some_removals_fail(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``--force`` の削除が一部 I/O で失敗したら、``EXIT_OK`` ではなく ``EXIT_BROKEN``。
+    """``--force`` の削除が一部 I/O で失敗したら、``EXIT_OK`` ではなく ``EXIT_BUSY``。
 
-    以前は警告を出すだけで終了コードは ``EXIT_OK`` のままだった。
-    ``release --force && 次の手順`` のように使われれば、消えていない宣言が
-    残ったまま次へ進む——**終了コードで嘘をつかない**（cli.py 冒頭）。
+    以前は警告を出すだけで終了コードは ``EXIT_OK`` のままだった——**終了コードで
+    嘘をつかない**（cli.py 冒頭）。
+
+    値は ``EXIT_BUSY``（1）であって ``EXIT_BROKEN``（3）ではない。指定方法が
+    資源名か個体（``--nonce``）かで同じ「消せなかった」が別の終了コードに分かれて
+    いたのを、``_exit_for_own_removal`` と同じ扱いに揃えた（issue #30 指摘 5）。
+    「消せなかった」は掲示板を完全に読めた上で確認できている事象であり、
+    「確認そのものができなかった」（``UNCONFIRMED`` → ``EXIT_BROKEN``）とは別である。
     """
     assert claim(tmp_path, "GPU0", "1 本目") == EXIT_OK
     assert claim(tmp_path, "GPU0", "2 本目", "--share") == EXIT_OK
@@ -972,7 +977,7 @@ def test_release_force_returns_exit_broken_when_some_removals_fail(
 
     code = run(tmp_path, "release", "GPU0", "--force")
 
-    assert code == EXIT_BROKEN
+    assert code == EXIT_BUSY
     assert code != EXIT_OK
     # **消せた分は本当に消えている。** 全滅させたのではなく、部分失敗であることを確かめる。
     assert len(Board(tmp_path).list_for(RESOURCE)) == 1

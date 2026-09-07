@@ -5,7 +5,7 @@
 したがってここで最も重く守るのは「どう終わってもエントリが残らない」ことである。
 
 実プロセスを起動するテストは ``sys.executable`` の短命なコマンドだけに限る。
-資源には一切触れない（CLAUDE.md「Testing Constraints」）。
+資源には一切触れない。
 """
 
 from __future__ import annotations
@@ -310,7 +310,7 @@ def test_log_is_capped_and_says_so(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     fail-open で資源を取り合う**。
 
     黙って捨ててはならない。読む側が「ここでジョブが止まった」と読む
-    （CLAUDE.md「Silence Is Not Success」）。
+    （DESIGN.md「Wrapper Spec」）。
     """
     monkeypatch.setattr(runner, "MAX_LOG_BYTES", 2000)
     log = tmp_path / "job.log"
@@ -398,8 +398,7 @@ def test_pruning_failures_are_ignored(tmp_path: Path, monkeypatch: pytest.Monkey
 class FakeProcess:
     """終了を待つ子プロセスの代役。
 
-    実プロセスを起動せずに「どの順で止めにいったか」を検証する
-    （CLAUDE.md「Testing Constraints」）。
+    実プロセスを起動せずに「どの順で止めにいったか」を検証する。
 
     Parameters
     ----------
@@ -826,7 +825,7 @@ def test_the_release_record_carries_the_exit_code(tmp_path: Path) -> None:
 
     残さないと、走らずに即死したジョブと完走したジョブが監査ログ上で同じ 1 行になる。
     実運用で「ETA 2h30m の宣言が 6 秒で解放される」事象を後から追ったとき、
-    失敗だったのか短く済んだのかを区別できなかった（CLAUDE.md「Silence Is Not Success」）。
+    失敗だったのか短く済んだのかを区別できなかった（DESIGN.md「History」）。
     """
     assert rb_run(tmp_path, sys.executable, "-c", "raise SystemExit(3)") == 3
 
