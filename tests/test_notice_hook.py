@@ -481,7 +481,17 @@ def test_a_live_declaration_is_not_hidden_when_something_else_is_broken(
     board = Board(tmp_path)
     board.entries_dir.mkdir(parents=True, exist_ok=True)
     assert board.declare(
-        build_entry(normalize("GPU0"), job="E059 学習", cwd=UNRELATED_CWD, session="theirs")
+        build_entry(
+            normalize("GPU0"),
+            job="E059 学習",
+            cwd=UNRELATED_CWD,
+            session="theirs",
+            # **セッション ID を明示する。** 省くとテストプロセスの環境
+            # （``RESOURCE_BROKER_SESSION_ID``）を拾うため、それが空の環境（CI）では
+            # cwd での照合に落ち、``UNRELATED_CWD`` が一致して「自分の宣言」と
+            # みなされ通知が消える——手元でだけ通る検査になっていた。
+            session_id="別のセッション",
+        )
     )
     (board.entries_dir / "壊れた.json").write_text("{壊れている", encoding="utf-8")
 
